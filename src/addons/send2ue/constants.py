@@ -81,5 +81,4 @@ class PathModes(Enum):
 
 class RegexPresets:
     INVALID_NAME_CHARACTERS = r"[^-+\w]+"
-    INVALID_SOCKET_CHARACTERS = r"[^-+.\w]+"
 

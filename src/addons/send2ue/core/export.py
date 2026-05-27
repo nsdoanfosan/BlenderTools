@@ -193,12 +193,12 @@ def get_asset_sockets(asset_name, properties):
     if mesh_object:
         for child in mesh_object.children:
             if child.type == 'EMPTY' and child.name.startswith(f'{PreFixToken.SOCKET.value}_'):
-                name = utilities.get_socket_name(child.name)
+                name = utilities.get_asset_name(child.name.replace(f'{PreFixToken.SOCKET.value}_', '').split('.',1)[0], properties)
                 relative_location = utilities.convert_blender_to_unreal_location(
                     child.matrix_local.translation
                 )
                 relative_rotation = utilities.convert_blender_rotation_to_unreal_rotation(
-                    child.rotation_euler
+                    child.matrix_world.to_euler()
                 )
                 socket_data[name] = {
                     'relative_location': relative_location,

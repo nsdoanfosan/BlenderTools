@@ -158,7 +158,7 @@ def get_texture_images(mesh_object):
         if material_slot.material:
             if material_slot.material.node_tree:
                 for node in material_slot.material.node_tree.nodes:
-                    if node.type == 'TEX_IMAGE':
+                    if node.type == 'TEX_IMAGE' and node.image:
                         images.append(node.image)
 
     return images

@@ -8,7 +8,8 @@ from send2ue.core.utilities import (
     convert_blender_rotation_to_unreal_rotation,
     convert_blender_to_unreal_location,
     get_armature_modifier_rig_object,
-    get_asset_name
+    get_asset_name,
+    _iter_action_fcurves
 )
 from send2ue.dependencies.unreal import UnrealRemoteCalls as UnrealCalls
 from send2ue.dependencies.rpc.factory import make_remote
@@ -139,12 +140,12 @@ class InstanceAssetsExtension(ExtensionBase):
                 if scene_object.parent and scene_object.parent.type == 'EMPTY':
                     unique_name = scene_object.parent.name
                     location = list(scene_object.parent.matrix_world.translation)
-                    rotation = scene_object.parent.rotation_euler
+                    rotation = scene_object.parent.matrix_world.to_euler()
                     scale = scene_object.parent.scale[:]
                 else:
                     unique_name = scene_object.name
                     location = list(scene_object.matrix_world.translation)
-                    rotation = scene_object.rotation_euler
+                    rotation = scene_object.matrix_world.to_euler()
                     scale = scene_object.scale[:]
 
             # anim sequences use the transforms of the first frame of the action
@@ -152,7 +153,7 @@ class InstanceAssetsExtension(ExtensionBase):
                 # the transforms default to the armature object location
                 scene_object = bpy.data.objects.get(asset_data['_armature_object_name'])
                 location = list(scene_object.matrix_world.translation)
-                rotation = scene_object.rotation_euler
+                rotation = scene_object.matrix_world.to_euler()
                 scale = scene_object.scale[:]
 
                 action = bpy.data.actions.get(asset_data['_action_name'])
@@ -160,7 +161,7 @@ class InstanceAssetsExtension(ExtensionBase):
 
                 # otherwise the if location is in the action curves, that first frame determines
                 # the actors location in the level
-                for fcurve in action.fcurves:
+                for fcurve in _iter_action_fcurves(action):
                     for keyframe in fcurve.keyframe_points:
                         if fcurve.data_path == 'location':
                             # only get the value from the start frame

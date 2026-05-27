@@ -9,12 +9,12 @@ from .ui import header_menu, addon_preferences, file_browser, dialog
 from .core import formatting, validations, settings, utilities, export, ingest, extension, io
 
 bl_info = {
-    "name": "Send to Unreal",
-    "author": "Epic Games Inc (now a community fork)",
-    "version": (2, 6, 8),
+    "name": "Send to Unreal (Kelit b5)",
+    "author": "Epic Games Inc, poly-hammer community fork; Blender 5.x patches by Kelit",
+    "version": (2, 6, 7),
     "blender": (3, 6, 0),
     "location": "Header > Pipeline > Send to Unreal",
-    "description": "Sends an asset to the first open Unreal Editor instance on your machine.",
+    "description": "Sends an asset to the first open Unreal Editor instance on your machine. Kelit b5 build: adds slotted-action (Blender 5.0+) compatibility on top of Kelit personal fixes.",
     "warning": "",
     "wiki_url": "https://poly-hammer.github.io/BlenderTools/send2ue",
     "category": "Pipeline",

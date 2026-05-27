@@ -15,6 +15,61 @@ from ..dependencies import unreal
 from ..constants import BlenderTypes, UnrealTypes, ToolInfo, PreFixToken, PathModes, RegexPresets
 from mathutils import Vector, Quaternion
 
+# ---------------------------------------------------------------------------
+# Blender 5.0+ compatibility helpers for slotted Actions.
+# In Blender 5.0 the legacy action.fcurves / action.groups API was removed.
+# F-Curves now live on the "channelbag" of an action slot.
+# These helpers fall back to the legacy API on Blender < 5 so the same code
+# path works across versions.
+# ---------------------------------------------------------------------------
+def _iter_action_fcurves(action):
+    """
+    Iterate over all F-Curves of an Action in a forward-compatible way.
+
+    On Blender 5.0+ this iterates the F-Curves of every channelbag attached
+    to every layer/strip/slot of the action. On older versions it falls back
+    to action.fcurves directly.
+
+    :param bpy.types.Action action: The action to read F-Curves from.
+    :return generator: A generator yielding fcurves.
+    """
+    if action is None:
+        return
+    if bpy.app.version[0] >= 5:
+        try:
+            for layer in action.layers:
+                for strip in layer.strips:
+                    for channelbag in strip.channelbags:
+                        for fcurve in channelbag.fcurves:
+                            yield fcurve
+            return
+        except AttributeError:
+            pass
+    for fcurve in action.fcurves:
+        yield fcurve
+
+
+def _remove_action_fcurve(action, fcurve):
+    """
+    Remove an F-Curve from an Action in a forward-compatible way.
+
+    :param bpy.types.Action action: The action that owns the F-Curve.
+    :param fcurve: The F-Curve to remove.
+    """
+    if bpy.app.version[0] >= 5:
+        try:
+            for layer in action.layers:
+                for strip in layer.strips:
+                    for channelbag in strip.channelbags:
+                        if fcurve in list(channelbag.fcurves):
+                            channelbag.fcurves.remove(fcurve)
+                            return
+            return
+        except AttributeError:
+            pass
+    action.fcurves.remove(fcurve)
+
+
 
 def track_progress(message='', attribute=''):
     """
@@ -215,7 +270,7 @@ def get_custom_property_fcurve_data(action_name):
     action = bpy.data.actions.get(action_name)
     frame_rate = bpy.context.scene.render.fps
     if action:
-        for fcurve in action.fcurves:
+        for fcurve in _iter_action_fcurves(action):
             if fcurve.data_path.startswith('["') and fcurve.data_path.endswith('"]'):
                 name = fcurve.data_path.strip('["').strip('"]')
                 data[name] = [[(point.co[0] - 1) / frame_rate, point.co[1]] for point in fcurve.keyframe_points]
@@ -435,18 +490,6 @@ def get_asset_name(asset_name, properties, lod=False):
             asset_name = asset_name.split(result.groups()[0])[0]
 
     return asset_name
-
-def get_socket_name(asset_name):
-    """
-    Takes a given asset name and removes the prefix SOCKET_ and other non-alpha numeric characters
-    that unreal won't except, and allows the same socket name on multiple objects to export correctly.
-
-    :param str asset_name: The original name of the socket asset to export.
-    :return str: The formatted name of the socket asset to export.
-    """
-    socket_name = re.sub(rf"{RegexPresets.INVALID_SOCKET_CHARACTERS}|\.\d+$|{PreFixToken.SOCKET.value}_", "", asset_name)
-
-    return socket_name
 
 
 def get_parent_collection(scene_object, collection):
@@ -904,9 +947,9 @@ def remove_object_scale_keyframes(actions):
     :param list actions: A list of action objects.
     """
     for action in actions:
-        for fcurve in action.fcurves:
-            if fcurve.data_path == 'scale':
-                action.fcurves.remove(fcurve)
+        scale_fcurves = [fc for fc in _iter_action_fcurves(action) if fc.data_path == 'scale']
+        for fcurve in scale_fcurves:
+            _remove_action_fcurve(action, fcurve)
 
 
 def remove_from_disk(path, directory=False):
@@ -1452,7 +1495,7 @@ def round_keyframes(actions):
     :param list actions: A list of action objects.
     """
     for action in actions:
-        for fcurve in action.fcurves:
+        for fcurve in _iter_action_fcurves(action):
             for keyframe_point in fcurve.keyframe_points:
                 keyframe_point.co[0] = round(keyframe_point.co[0])
 
@@ -1562,7 +1605,7 @@ def scale_object_actions(unordered_objects, actions, scale_factor):
             # iterate over any imported actions first this time...
             for action in actions:
                 # iterate through the location curves
-                for fcurve in [fcurve for fcurve in action.fcurves if fcurve.data_path.endswith('location')]:
+                for fcurve in [fcurve for fcurve in _iter_action_fcurves(action) if fcurve.data_path.endswith('location')]:
                     # the location fcurve of the object
                     if fcurve.data_path == 'location':
                         for keyframe_point in fcurve.keyframe_points:

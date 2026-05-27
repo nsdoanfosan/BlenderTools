@@ -30,21 +30,30 @@ class RPCFactory:
         self.default_imports = default_imports or []
 
     @staticmethod
-    def _get_docstring(code, function_name):
+    def _get_docstring(code, function_name, function=None):
         """
         Gets the docstring value from the functions code.
 
+        Kelit_b5 patch: Python 3.13 (Blender 5.x) refuses to parse some legitimate
+        method sources fed through exec() here (e.g. due to stricter rules around
+        ternary "if" expressions in certain edge cases). The original implementation
+        re-exec'd the source just to grab the docstring; we now read it directly
+        from the function object when available, falling back to a regex parse of
+        the source as a last resort.
+
         :param list code: A list of code lines.
         :param str function_name: The name of the function.
+        :param callable function: The function object (optional, fast path).
         :returns: The docstring text.
         :rtype: str
         """
-        # run the function code
-        exec('\n'.join(code))
-        # get the function from the locals
-        function_instance = locals().copy().get(function_name)
-        # get the doc strings from the function
-        return function_instance.__doc__
+        if function is not None and getattr(function, "__doc__", None) is not None:
+            return function.__doc__
+        # Fallback: pull the first triple-quoted block out of the source without exec.
+        import re
+        source = '\n'.join(code)
+        match = re.search(r'(?P<q>\"{3}|\'{3})(?P<body>.*?)(?P=q)', source, re.DOTALL)
+        return match.group('body') if match else None
 
     @staticmethod
     def _save_execution_history(code, function, args):
@@ -147,17 +156,20 @@ class RPCFactory:
         code = [line for line in code if not line.startswith(('@', '#'))]
 
         # get the docstring from the code
-        doc_string = self._get_docstring(code, function.__name__)
+        doc_string = self._get_docstring(code, function.__name__, function=function)
 
         # get import code and insert them inside the function
         import_code = self._get_callstack_references(code, function)
         code.insert(1, import_code)
 
-        # remove the doc string
-        if doc_string:
-            code = '\n'.join(code).replace(doc_string, '')
-            code = [line for line in code.split('\n') if not all([char == '"' or char == "'" for char in line.strip()])]
-
+        # Kelit_b5 patch: keep the docstring as-is.
+        # The original implementation tried to strip the docstring via str.replace,
+        # but __doc__'s indentation often does not match the dedented source, so the
+        # replace silently failed and left the docstring TEXT (without its triple
+        # quotes) inside the function body. Python 3.13 then parsed those words
+        # as code and raised 'expected else after if expression'.
+        # Docstrings are valid Python anyway -- leaving them in is harmless.
+        _ = doc_string  # keep the call to _get_docstring for backwards compatibility
         return code
 
     def _register(self, function):
