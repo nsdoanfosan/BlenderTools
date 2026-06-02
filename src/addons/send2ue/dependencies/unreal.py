@@ -821,6 +821,8 @@ class UnrealImportAsset(Unreal):
         Sets the FBX import options.
         """
         self.set_import_task_options()
+        # Avoid third-party FBX factories intercepting send2ue imports.
+        self._import_task.set_editor_property('factory', unreal.FbxFactory())
 
         import_materials_and_textures = self._property_data.get('import_materials_and_textures', {}).get('value', True)
 
