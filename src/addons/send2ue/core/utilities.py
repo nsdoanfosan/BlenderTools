@@ -1157,6 +1157,47 @@ def addon_enabled(*args):
     setup_project()
 
 
+def sync_unreal_mesh_folder_path(*args):
+    """
+    Derives the unreal mesh folder path from the .blend file's on-disk location so it always
+    mirrors the folder structure. The anchor folder maps to /Game/Meshes, e.g.
+    ...\\Forestportfolio\\00_common\\prop\\foo.blend -> /Game/Meshes/00_common/prop/
+
+    Runs on file load (via setup_project) and after save, so a "Save As" into a new folder
+    updates the path too. Files outside the anchor folder are left untouched.
+
+    :param args: This soaks up the extra arguments for the app handler.
+    """
+    file_path = bpy.data.filepath.replace('\\', '/')
+    if not file_path:
+        return
+
+    # locate the anchor folder (case-insensitive) and require it to sit on a path boundary
+    anchor = 'Forestportfolio/'
+    anchor_index = file_path.lower().find(anchor.lower())
+    if anchor_index == -1:
+        return
+    if anchor_index != 0 and file_path[anchor_index - 1] != '/':
+        return
+
+    # everything after the anchor, minus the file name; empty when the file sits directly
+    # in the anchor folder (avoids turning the file name into a folder)
+    remainder = file_path[anchor_index + len(anchor):]
+    relative_folder = remainder.rsplit('/', 1)[0] if '/' in remainder else ''
+
+    unreal_path = '/Game/Meshes/'
+    if relative_folder:
+        unreal_path += f'{relative_folder}/'
+
+    for scene in bpy.data.scenes:
+        scene_properties = getattr(scene, ToolInfo.NAME.value, None)
+        if scene_properties:
+            try:
+                scene_properties.unreal_mesh_folder_path = unreal_path
+            except Exception as error:
+                print(f'send2ue: could not set unreal_mesh_folder_path: {error}')
+
+
 def setup_project(*args):
     """
     This is run when the integration launches, and on new file load events.
@@ -1174,19 +1215,8 @@ def setup_project(*args):
     if not properties:
         bpy.app.timers.register(setup_project, first_interval=0.1)
 
-    # auto-derive the unreal mesh folder path from the .blend file's on-disk location so it
-    # always mirrors the folder structure. the anchor folder maps to /Game/Meshes, e.g.
-    # ...\Forestportfolio\00_common\prop\foo.blend -> /Game/Meshes/00_common/prop/
-    if properties and bpy.data.filepath:
-        anchor = 'Forestportfolio/'
-        file_path = bpy.data.filepath.replace('\\', '/')
-        if anchor in file_path:
-            relative_folder = file_path.split(anchor, 1)[-1].rsplit('/', 1)[0]
-            unreal_path = f'/Game/Meshes/{relative_folder}/'
-            for scene in bpy.data.scenes:
-                scene_properties = getattr(scene, ToolInfo.NAME.value, None)
-                if scene_properties:
-                    scene_properties.unreal_mesh_folder_path = unreal_path
+    # keep the unreal mesh folder path in sync with the .blend file's on-disk location
+    sync_unreal_mesh_folder_path()
 
     # ensure the extension draws are created
     bpy.ops.send2ue.reload_extensions()

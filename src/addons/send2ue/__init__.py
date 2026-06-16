@@ -69,6 +69,9 @@ def register():
     # add an event handler that will run on new file loads
     bpy.app.handlers.load_post.append(bpy.app.handlers.persistent(utilities.setup_project))
 
+    # keep the unreal mesh folder path in sync after a save (e.g. "Save As" to a new folder)
+    bpy.app.handlers.save_post.append(bpy.app.handlers.persistent(utilities.sync_unreal_mesh_folder_path))
+
     # add a function to the event timer that will fire after the addon is enabled
     bpy.app.timers.register(utilities.addon_enabled, first_interval=0.1)
 
@@ -80,6 +83,8 @@ def unregister():
     # remove event handlers
     if utilities.setup_project in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(utilities.setup_project)
+    if utilities.sync_unreal_mesh_folder_path in bpy.app.handlers.save_post:
+        bpy.app.handlers.save_post.remove(utilities.sync_unreal_mesh_folder_path)
 
     try:
         # remove the pipeline menu
