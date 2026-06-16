@@ -1189,13 +1189,24 @@ def sync_unreal_mesh_folder_path(*args):
     if relative_folder:
         unreal_path += f'{relative_folder}/'
 
-    for scene in bpy.data.scenes:
-        scene_properties = getattr(scene, ToolInfo.NAME.value, None)
-        if scene_properties:
-            try:
+    # disable path validation while assigning so we don't trigger an Unreal RPC round-trip
+    # (a folder-exists check) on every save - same approach send2ue uses in set_active_template
+    window_manager_properties = getattr(bpy.context.window_manager, ToolInfo.NAME.value, None)
+    previous_validation = getattr(window_manager_properties, 'path_validation', None)
+    if window_manager_properties:
+        window_manager_properties.path_validation = False
+    try:
+        for scene in bpy.data.scenes:
+            scene_properties = getattr(scene, ToolInfo.NAME.value, None)
+            # only assign when the value actually changes, so repeated saves of the same file
+            # don't re-run the update callback at all
+            if scene_properties and scene_properties.unreal_mesh_folder_path != unreal_path:
                 scene_properties.unreal_mesh_folder_path = unreal_path
-            except Exception as error:
-                print(f'send2ue: could not set unreal_mesh_folder_path: {error}')
+    except Exception as error:
+        print(f'send2ue: could not set unreal_mesh_folder_path: {error}')
+    finally:
+        if window_manager_properties and previous_validation is not None:
+            window_manager_properties.path_validation = previous_validation
 
 
 def setup_project(*args):
