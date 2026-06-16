@@ -1258,7 +1258,8 @@ def select_all_children(scene_object, object_type, exclude_postfix_tokens=False)
                 if any(child_object.name.startswith(f'{token.value}_') for token in PreFixToken):
                     continue
 
-            child_object.select_set(True)
+            if any(view_layer_object == child_object for view_layer_object in bpy.context.view_layer.objects):
+                child_object.select_set(True)
             if child_object.children:
                 select_all_children(child_object, object_type, exclude_postfix_tokens)
 
