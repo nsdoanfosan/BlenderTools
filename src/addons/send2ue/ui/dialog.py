@@ -64,6 +64,7 @@ class Send2UnrealDialog(bpy.types.Panel):
         self.draw_property(properties, layout, 'use_object_origin')
         self.draw_property(properties, layout, 'export_object_name_as_root')
         self.draw_property(properties, layout, 'export_custom_root_name', enabled=not properties.export_object_name_as_root)
+        self.draw_property(properties, layout, 'skip_animation_export')
 
         #  animation settings box
         self.draw_expanding_section(

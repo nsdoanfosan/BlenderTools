@@ -5,7 +5,7 @@ import bpy
 import queue
 import threading
 from .constants import ToolInfo, ExtensionTasks
-from .core import export, utilities, settings, validations, extension
+from .core import export, utilities, settings, validations, extension, hair_tool_export, armature_modifier_fix
 from .ui import file_browser, dialog, addon_preferences
 from .dependencies import unreal
 from .dependencies.rpc import blender_server
@@ -160,7 +160,22 @@ class Send2Ue(bpy.types.Operator):
         # run the pre export extensions
         extension.run_extension_tasks(ExtensionTasks.PRE_OPERATION.value)
 
+        # Convert live Hair Tool systems to export-only mesh copies. These temporary
+        # objects carry a single RSAO color layer and optional head-bone skinning.
+        hair_tool_export.prepare()
+
+        # Give meshes that live inside an armature but lack an armature modifier a
+        # temporary binding, so they export with valid skin weights instead of
+        # crashing Unreal's importer.
+        armature_modifier_fix.prepare()
+
     def post_operation(self):
+        # Remove the temporary armature bindings added for un-skinned child meshes.
+        armature_modifier_fix.cleanup()
+
+        # Remove export-only Hair Tool meshes before restoring the user's context.
+        hair_tool_export.cleanup()
+
         # run the post export extensions
         extension.run_extension_tasks(ExtensionTasks.POST_OPERATION.value)
 
@@ -403,4 +418,3 @@ def unregister():
     for operator_class in operator_classes:
         if utilities.get_operator_class_by_bl_idname(operator_class.bl_idname):
             bpy.utils.unregister_class(operator_class)
-

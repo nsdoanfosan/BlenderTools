@@ -4,7 +4,7 @@ import json
 import math
 import os
 import bpy
-from . import utilities, validations, settings, ingest, extension, io
+from . import utilities, validations, settings, ingest, extension, io, hair_tool_export
 from ..constants import BlenderTypes, UnrealTypes, FileTypes, PreFixToken, ToolInfo, ExtensionTasks
 
 
@@ -173,6 +173,17 @@ def export_file(properties, lod=0, file_type=FileTypes.FBX):
         prefix = settings.get_generated_prefix(f'blender-export_method-{file_type}', group_name)
         for attribute_name in group_data.keys():
             export_settings[attribute_name] = settings.get_property_by_path(prefix, attribute_name, properties)
+
+    # when skipping animation export, force the fbx exporter to not bake any animation so the
+    # skeletal mesh fbx is not slowed down by baking the rig's (potentially very long) nla strips
+    if file_type == FileTypes.FBX and properties.skip_animation_export:
+        export_settings['bake_anim'] = False
+
+    # Hair Tool export meshes are generated temporarily and must always carry
+    # FBX smoothing groups so Unreal can preserve their evaluated normals.
+    mesh_object = bpy.data.objects.get(asset_data.get('_mesh_object_name', ''))
+    if file_type == FileTypes.FBX and mesh_object and mesh_object.get(hair_tool_export.TEMP_PROPERTY):
+        export_settings['mesh_smooth_type'] = 'FACE'
 
     if file_type == FileTypes.FBX:
         export_fbx_file(file_path, export_settings)
@@ -357,6 +368,10 @@ def create_animation_data(rig_objects, properties):
     """
     animation_data = {}
 
+    # when animation export is skipped, do not export any actions as animation fbx files
+    if properties.skip_animation_export:
+        return animation_data
+
     if properties.import_animations:
         # get the asset data for the skeletal animations
         for rig_object in rig_objects:
@@ -415,7 +430,8 @@ def create_mesh_data(mesh_objects, rig_objects, properties):
     # get the asset data for the scene objects
     for mesh_object in mesh_objects:
         already_exported = False
-        asset_name = utilities.get_asset_name(mesh_object.name, properties)
+        source_name = hair_tool_export.get_asset_source_name(mesh_object)
+        asset_name = utilities.get_asset_name(source_name, properties)
 
         # only export meshes that are lod 0
         if properties.import_lods and utilities.get_lod_index(mesh_object.name, properties) != 0:
@@ -431,7 +447,7 @@ def create_mesh_data(mesh_objects, rig_objects, properties):
         if not already_exported:
             asset_type = utilities.get_mesh_unreal_type(mesh_object)
             # get file path
-            file_path = get_file_path(mesh_object.name, properties, asset_type, lod=False)
+            file_path = get_file_path(source_name, properties, asset_type, lod=False)
             # export the object
             asset_id = utilities.get_asset_id(file_path)
             export_mesh(asset_id, mesh_object, properties)
@@ -511,6 +527,14 @@ def create_asset_data(properties):
     mesh_objects = utilities.get_from_collection(BlenderTypes.MESH)
     rig_objects = utilities.get_from_collection(BlenderTypes.SKELETON)
     hair_objects = utilities.get_hair_objects(properties)
+    hair_objects = [
+        hair_object
+        for hair_object in hair_objects
+        if not (
+            isinstance(hair_object, bpy.types.Object)
+            and hair_tool_export.is_prepared_source(hair_object)
+        )
+    ]
 
     # filter the rigs and meshes based on the extension filter methods
     rig_objects, mesh_objects, hair_objects = extension.run_extension_filters(

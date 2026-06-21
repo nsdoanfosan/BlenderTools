@@ -282,6 +282,16 @@ def get_scene_property_class():
                 "disk. The file names will match either the name of the curves object or that of the particle system."
             )
         ) # type: ignore
+        skip_animation_export: bpy.props.BoolProperty(
+            name="Skip animation export",
+            default=False,
+            description=(
+                "When enabled, no animation is exported at all. This skips exporting each action as its own "
+                "animation FBX, AND forces the skeletal mesh FBX to be exported without baking the rig's NLA "
+                "strips (bake_anim off). Use this when animation is handled in a separate pipeline, to avoid the "
+                "very slow export caused by long animation data being baked into the FBX files"
+            )
+        ) # type: ignore
         export_all_actions: bpy.props.BoolProperty(
             name="Export all actions",
             default=True,
