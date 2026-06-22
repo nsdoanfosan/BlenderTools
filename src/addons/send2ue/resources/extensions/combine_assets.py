@@ -145,7 +145,8 @@ class CombineAssetsExtension(ExtensionBase):
                 utilities.select_all_children(
                     mesh_object.parent,
                     BlenderTypes.MESH,
-                    exclude_postfix_tokens=True
+                    exclude_postfix_tokens=True,
+                    required_collection=bpy.data.collections.get('Export'),
                 )
                 # rename the asset to match the empty if this is a static mesh export
                 if mesh_object.parent.type == 'EMPTY':

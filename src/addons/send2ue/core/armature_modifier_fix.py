@@ -8,26 +8,27 @@ from ..constants import BlenderTypes
 STATE_KEY = 'send2ue_armature_modifier_fix_state'
 
 
-def _get_parent_rig_object(mesh_object, rig_objects):
+def get_top_parent_rig_object(scene_object, rig_objects):
     """
-    Gets the armature this mesh is parented to (directly or up the parent chain),
-    but only if that armature is one of the rigs that will be exported.
+    Gets the highest exported armature in an object's parent chain.
 
     A mesh that lives "inside" an armature like this but has no armature modifier
     still gets bundled into the skeletal mesh export by ``set_parent_rig_selection``.
     Without skin binding the resulting fbx makes Unreal's importer crash, so we
     need to detect this case and give it a valid binding before export.
 
-    :param object mesh_object: A object of type mesh.
+    :param object scene_object: A Blender object.
     :param list rig_objects: The armature objects that are being exported.
-    :return object: The parent armature object, or None.
+    :return object: The highest parent armature object, or None.
     """
-    parent = mesh_object.parent
+    rig_objects = set(rig_objects)
+    top_rig_object = None
+    parent = scene_object.parent
     while parent:
         if parent.type == BlenderTypes.SKELETON and parent in rig_objects:
-            return parent
+            top_rig_object = parent
         parent = parent.parent
-    return None
+    return top_rig_object
 
 
 def _get_bind_bone_name(mesh_object, rig_object):
@@ -90,7 +91,7 @@ def prepare():
             if any(modifier.type == 'ARMATURE' for modifier in mesh_object.modifiers):
                 continue
 
-            rig_object = _get_parent_rig_object(mesh_object, rig_objects)
+            rig_object = get_top_parent_rig_object(mesh_object, rig_objects)
             if not rig_object:
                 continue
 

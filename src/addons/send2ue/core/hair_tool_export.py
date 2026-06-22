@@ -1,6 +1,8 @@
 # Copyright Epic Games, Inc. All Rights Reserved.
 
 import bpy
+from . import armature_modifier_fix, utilities
+from ..constants import BlenderTypes
 
 
 STATE_KEY = 'send2ue_hair_tool_export_state'
@@ -11,7 +13,7 @@ RSAO_NAME = 'RSAO'
 
 def is_hair_tool_object(scene_object):
     """Return whether an object is a live Hair Tool geometry-nodes system."""
-    if not scene_object or scene_object.type != 'CURVES':
+    if not scene_object or scene_object.type not in {'CURVES', 'MESH'}:
         return False
 
     node_group_names = {
@@ -20,7 +22,7 @@ def is_hair_tool_object(scene_object):
         if modifier.type == 'NODES' and modifier.node_group
     }
     return (
-        'Hair_System_Setup' in node_group_names
+        any(name.startswith('Hair_System_Setup') for name in node_group_names)
         and any(name.startswith('Hair_System_Profile') for name in node_group_names)
     )
 
@@ -30,17 +32,34 @@ def is_prepared_source(scene_object):
     return scene_object.name in state.get('source_names', set())
 
 
+def _get_hair_tool_input_object(scene_object):
+    """Return the upstream Hair Tool object referenced by Hair System Setup."""
+    for modifier in scene_object.modifiers:
+        if (
+            modifier.type != 'NODES'
+            or not modifier.node_group
+            or not modifier.node_group.name.startswith('Hair_System_Setup')
+        ):
+            continue
+        try:
+            input_object = modifier.get('Input_3')
+        except (KeyError, TypeError):
+            input_object = None
+        if isinstance(input_object, bpy.types.Object):
+            return input_object
+    return None
+
+
 def _get_armature(scene_object):
     for modifier in scene_object.modifiers:
         if modifier.type == 'ARMATURE' and modifier.object and modifier.object.type == 'ARMATURE':
             return modifier.object
 
-    parent = scene_object.parent
-    while parent:
-        if parent.type == 'ARMATURE':
-            return parent
-        parent = parent.parent
-    return None
+    exported_rig_objects = utilities.get_from_collection(BlenderTypes.SKELETON)
+    return armature_modifier_fix.get_top_parent_rig_object(
+        scene_object,
+        exported_rig_objects,
+    )
 
 
 def _get_head_bone_name(armature_object):
@@ -118,6 +137,39 @@ def _pack_rsao(mesh):
     mesh.color_attributes.render_color_index = mesh.color_attributes.find(RSAO_NAME)
 
 
+def _evaluate_combined_ao(scene_object, state):
+    """Evaluate Hair Tool AO once, after all systems for an asset are joined."""
+    node_group = bpy.data.node_groups.get('HT_Mesh_AO')
+    if not node_group:
+        raise RuntimeError(
+            'Hair Tool node group "HT_Mesh_AO" was not found. '
+            'Load the Hair Tool AO node group before exporting.'
+        )
+
+    modifier = scene_object.modifiers.new(name='__S2U_HAIR_AO', type='NODES')
+    modifier.node_group = node_group
+    if 'Input_7' in modifier:
+        modifier['Input_7'] = 'AO'
+
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    depsgraph.update()
+    evaluated_object = scene_object.evaluated_get(depsgraph)
+    evaluated_mesh = bpy.data.meshes.new_from_object(evaluated_object)
+
+    old_mesh = scene_object.data
+    scene_object.data = evaluated_mesh
+    scene_object.modifiers.remove(modifier)
+    if old_mesh.users == 0:
+        bpy.data.meshes.remove(old_mesh)
+
+    if not evaluated_mesh.attributes.get('AO'):
+        raise RuntimeError(
+            f'Hair Tool AO evaluation produced no "AO" attribute for "{scene_object.name}".'
+        )
+
+    state['temporary_mesh_names'].add(evaluated_mesh.name)
+
+
 def _write_uv_layer(mesh, source_attribute_name, target_uv_name):
     source_attribute = mesh.attributes.get(source_attribute_name)
     if (
@@ -167,8 +219,9 @@ def _evaluated_mesh_objects(source_object, state):
 
         instance_matrix = instance.matrix_world.copy()
         mesh = bpy.data.meshes.new_from_object(instance.object)
-        _write_hair_tool_uvs(mesh)
-        _pack_rsao(mesh)
+        if not mesh.vertices or not mesh.polygons:
+            bpy.data.meshes.remove(mesh)
+            continue
 
         mesh_object = bpy.data.objects.new(
             f'__S2U_HAIR_PART_{source_object.name}',
@@ -202,6 +255,20 @@ def _link_to_export_collection(scene_object, export_collection):
     export_collection.objects.link(scene_object)
 
 
+def _asset_group_key(scene_object):
+    """Group a Hair Tool system by its nearest exported Empty ancestor."""
+    export_collection = bpy.data.collections.get('Export')
+    exported_objects = set(export_collection.all_objects) if export_collection else set()
+
+    parent = scene_object.parent
+    while parent:
+        if parent.type == 'EMPTY' and parent in exported_objects:
+            return parent
+        parent = parent.parent
+
+    return scene_object.parent or scene_object
+
+
 def prepare():
     """Create export-only mesh copies for Hair Tool systems in the Export collection."""
     cleanup()
@@ -210,34 +277,86 @@ def prepare():
     if not export_collection:
         return
 
-    source_objects = [
+    source_candidates = [
         scene_object
         for scene_object in export_collection.all_objects
-        if is_hair_tool_object(scene_object)
+        if (
+            export_collection in scene_object.users_collection
+            and is_hair_tool_object(scene_object)
+        )
+    ]
+    # If an enabled final Hair Tool output consumes another enabled Hair Tool
+    # object, export only the downstream output. The upstream Surface/Curve is
+    # construction data, not an additional hair result.
+    upstream_sources = {
+        input_object
+        for input_object in (
+            _get_hair_tool_input_object(scene_object)
+            for scene_object in source_candidates
+        )
+        if input_object in source_candidates
+    }
+    source_objects = [
+        scene_object
+        for scene_object in source_candidates
+        if scene_object not in upstream_sources
     ]
     state = {
         'source_names': {scene_object.name for scene_object in source_objects},
         'temporary_object_names': set(),
+        'temporary_mesh_names': set(),
     }
     bpy.app.driver_namespace[STATE_KEY] = state
 
     try:
+        grouped_sources = {}
         for source_object in source_objects:
-            parts = _evaluated_mesh_objects(source_object, state)
-            if not parts:
-                raise RuntimeError(
-                    f'Hair Tool object "{source_object.name}" produced no evaluated mesh geometry.'
-                )
+            grouped_sources.setdefault(_asset_group_key(source_object), []).append(source_object)
 
+        for asset_parent, asset_sources in grouped_sources.items():
+            parts = []
+            for source_object in asset_sources:
+                source_parts = _evaluated_mesh_objects(source_object, state)
+                parts.extend(source_parts)
+
+            if not parts:
+                continue
+
+            # Joining before AO is intentional: nearby cards and all Hair Tool
+            # systems in the final asset must occlude each other.
             temporary_object = _join_objects(parts)
-            temporary_object.name = f'{source_object.name}__S2U_HAIR'
-            temporary_object.data.name = f'{source_object.data.name}__S2U_HAIR'
-            temporary_object[SOURCE_NAME_PROPERTY] = source_object.name
+            asset_name = asset_parent.name if asset_parent != asset_sources[0] else asset_sources[0].name
+            temporary_object.name = f'{asset_name}__S2U_HAIR'
+            temporary_object.data.name = f'{asset_name}__S2U_HAIR'
+            temporary_object[SOURCE_NAME_PROPERTY] = asset_sources[0].name
             temporary_object[TEMP_PROPERTY] = True
             _link_to_export_collection(temporary_object, export_collection)
             state['temporary_object_names'].add(temporary_object.name)
 
-            armature_object = _get_armature(source_object)
+            # Keep the export copy in the same hierarchy as the source asset.
+            if asset_parent != asset_sources[0]:
+                world_matrix = temporary_object.matrix_world.copy()
+                temporary_object.parent = asset_parent
+                temporary_object.parent_type = 'OBJECT'
+                temporary_object.matrix_parent_inverse = (
+                    asset_parent.matrix_world.inverted()
+                )
+                temporary_object.matrix_world = world_matrix
+
+            _evaluate_combined_ao(temporary_object, state)
+            _write_hair_tool_uvs(temporary_object.data)
+            _pack_rsao(temporary_object.data)
+
+            armatures = {
+                armature
+                for armature in (_get_armature(source) for source in asset_sources)
+                if armature
+            }
+            if len(armatures) > 1:
+                raise RuntimeError(
+                    f'Hair Tool asset "{asset_name}" is bound to multiple armatures.'
+                )
+            armature_object = next(iter(armatures), None)
             if armature_object:
                 head_bone_name = _get_head_bone_name(armature_object)
                 vertex_group = temporary_object.vertex_groups.new(name=head_bone_name)
@@ -269,6 +388,11 @@ def cleanup():
             continue
         mesh = scene_object.data if scene_object.type == 'MESH' else None
         bpy.data.objects.remove(scene_object, do_unlink=True)
+        if mesh and mesh.users == 0:
+            bpy.data.meshes.remove(mesh)
+
+    for mesh_name in state.get('temporary_mesh_names', set()):
+        mesh = bpy.data.meshes.get(mesh_name)
         if mesh and mesh.users == 0:
             bpy.data.meshes.remove(mesh)
 

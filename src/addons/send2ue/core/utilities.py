@@ -401,7 +401,18 @@ def get_hair_objects(properties):
         modifiers = get_particle_system_modifiers(mesh_object)
         hair_objects.extend([modifier.particle_system for modifier in modifiers])
 
-    hair_objects.extend(get_from_collection(BlenderTypes.CURVES))
+    # Live Hair Tool curve systems are converted to temporary mesh objects by
+    # hair_tool_export before validation. Do not also collect their source
+    # curves as Alembic Grooms. Ordinary curve Groom objects remain unchanged.
+    from . import hair_tool_export
+    hair_objects.extend([
+        curves_object
+        for curves_object in get_from_collection(BlenderTypes.CURVES)
+        if (
+            not hair_tool_export.is_hair_tool_object(curves_object)
+            and not hair_tool_export.is_prepared_source(curves_object)
+        )
+    ])
     return hair_objects
 
 
@@ -445,8 +456,19 @@ def get_from_collection(object_type):
     if export_collection and not collection_objects:
         # get all the objects in the collection
         for collection_object in export_collection.all_objects: # type: ignore
+            # Export is an explicit activation collection. Objects that only
+            # appear through nested working collections or parent hierarchy
+            # are not enabled for export.
+            if export_collection not in collection_object.users_collection:
+                continue
             # if the object is the correct type
             if collection_object.type == object_type:
+                # Live Hair Tool sources are replaced by one export-only,
+                # parent-level combined mesh during pre-operation.
+                if object_type == BlenderTypes.MESH:
+                    from . import hair_tool_export
+                    if hair_tool_export.is_prepared_source(collection_object):
+                        continue
                 # if the object is visible
                 if collection_object.visible_get():
                     # ensure the object doesn't end with one of the post fix tokens
@@ -1298,25 +1320,52 @@ def report_path_error_message(layout, send2ue_property, report_text):
         row.label(text=report_text)
 
 
-def select_all_children(scene_object, object_type, exclude_postfix_tokens=False):
+def select_all_children(
+    scene_object,
+    object_type,
+    exclude_postfix_tokens=False,
+    required_collection=None,
+):
     """
     Selects all of an objects children.
 
     :param object scene_object: A object.
     :param str object_type: The type of object to select.
     :param bool exclude_postfix_tokens: Whether or not to exclude objects that have a postfix token.
+    :param object required_collection: Only select objects directly linked to this collection.
     """
+    if required_collection is None:
+        required_collection = bpy.data.collections.get(ToolInfo.EXPORT_COLLECTION.value)
+
     children = scene_object.children or get_meshes_using_armature_modifier(scene_object)
     for child_object in children:
         if child_object.type == object_type:
-            if exclude_postfix_tokens:
-                if any(child_object.name.startswith(f'{token.value}_') for token in PreFixToken):
-                    continue
-
-            if any(view_layer_object == child_object for view_layer_object in bpy.context.view_layer.objects):
+            from . import hair_tool_export
+            if hair_tool_export.is_prepared_source(child_object):
+                pass
+            elif required_collection and required_collection not in child_object.users_collection:
+                pass
+            elif exclude_postfix_tokens and any(
+                child_object.name.startswith(f'{token.value}_')
+                for token in PreFixToken
+            ):
+                pass
+            elif any(
+                view_layer_object == child_object
+                for view_layer_object in bpy.context.view_layer.objects
+            ):
                 child_object.select_set(True)
-            if child_object.children:
-                select_all_children(child_object, object_type, exclude_postfix_tokens)
+
+        # Parent hierarchy can contain non-export Surface/Guide meshes and
+        # curves. Traverse through them, but only select explicitly enabled
+        # objects that satisfy required_collection above.
+        if child_object.children:
+            select_all_children(
+                child_object,
+                object_type,
+                exclude_postfix_tokens,
+                required_collection,
+            )
 
 
 def apply_all_mesh_modifiers(scene_object):
@@ -1765,6 +1814,7 @@ def unpack_textures():
     :return list: A dictionary of image names and file paths that where unpacked.
     """
     unpacked_files = {}
+    processed_images = set()
 
     # go through each material
     for material in bpy.data.materials:
@@ -1774,13 +1824,25 @@ def unpack_textures():
                 # check for packed textures
                 if node.type == 'TEX_IMAGE':
                     image = node.image
-                    if image:
+                    if image and image.name not in processed_images:
+                        processed_images.add(image.name)
                         if image.source == 'FILE':
                             if image.packed_file:
+                                # Linked image datablocks are read-only in the
+                                # current blend file and Blender raises
+                                # "Image is not editable" when unpack is called.
+                                if image.library:
+                                    continue
                                 # if the unpacked image does not exist on disk
                                 if not os.path.exists(image.filepath_from_user()):
                                     # unpack the image
-                                    image.unpack()
+                                    try:
+                                        image.unpack()
+                                    except RuntimeError:
+                                        # Other read-only image datablocks can
+                                        # exist without a library pointer. They
+                                        # must not block the entire export.
+                                        continue
                                     unpacked_files[image.name] = image.filepath_from_user()
 
     return unpacked_files
