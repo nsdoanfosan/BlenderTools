@@ -13,6 +13,14 @@ A repository of blender addons that improve the game development workflow betwee
 This is now maintained by [@JoshQuake](https://github.com/JoshQuake) and volunteers from the community and is not affiliated with Epic Games. 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/E1E3VWL1V)
 
+> **This fork:** the PARK send2ue customizations are part of a Blender → Substance
+> Painter → Unreal pipeline. Its shared conventions (the `Export` collection,
+> naming prefixes, Unreal path anchors) are the contract documented in the
+> `substance-tools` repo:
+> [`docs/pipeline_contract.md`](https://github.com/nsdoanfosan/substance-tools/blob/main/docs/pipeline_contract.md)
+> and `pipeline_contract.json`. Treat that as the source of truth before
+> changing pipeline-facing names.
+
 
 ## Send to Unreal
 
