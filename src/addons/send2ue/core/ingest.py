@@ -10,6 +10,21 @@ from ..dependencies.rpc.factory import make_remote
 UnrealRemoteCalls = make_remote(UnrealCalls)
 
 
+def _property_data_for_asset(asset_data, property_data):
+    if "_import_materials_and_textures" not in asset_data:
+        return property_data
+
+    adjusted = dict(property_data)
+    option_data = adjusted.get("import_materials_and_textures")
+    if isinstance(option_data, dict):
+        option_data = dict(option_data)
+    else:
+        option_data = {}
+    option_data["value"] = bool(asset_data["_import_materials_and_textures"])
+    adjusted["import_materials_and_textures"] = option_data
+    return adjusted
+
+
 @track_progress(message='Importing asset "{attribute}"...', attribute='file_path')
 def import_asset(asset_id, property_data):
     """
@@ -26,7 +41,11 @@ def import_asset(asset_id, property_data):
 
     if not asset_data.get('skip'):
         file_path = asset_data.get('file_path')
-        UnrealRemoteCalls.import_asset(file_path, asset_data, property_data)
+        UnrealRemoteCalls.import_asset(
+            file_path,
+            asset_data,
+            _property_data_for_asset(asset_data, property_data),
+        )
 
         # import fcurves
         if asset_data.get('fcurve_file_path'):

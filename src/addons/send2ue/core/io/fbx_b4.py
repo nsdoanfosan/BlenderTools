@@ -6,6 +6,7 @@ from mathutils import Vector
 from importlib.machinery import SourceFileLoader
 
 SCALE_FACTOR = 100
+TEXTURELESS_FBX_EXPORT_FLAG = "send2ue_material_pipeline_textureless_fbx_export"
 
 
 def export(**keywords):
@@ -66,6 +67,41 @@ def export(**keywords):
     convert_rad_to_deg_iter = units_convertor_iter("radian", "degree")
 
     from io_scene_fbx.export_fbx_bin import fbx_data_element_custom_properties
+
+    def fbx_data_from_scene_without_textures(scene, depsgraph, settings):
+        scene_data = original_fbx_data_from_scene(scene, depsgraph, settings)
+        if not bpy.app.driver_namespace.get(TEXTURELESS_FBX_EXPORT_FLAG):
+            return scene_data
+
+        templates = dict(scene_data.templates)
+        templates_users = scene_data.templates_users
+        for template_key in (b"TextureFile", b"Video"):
+            template = templates.pop(template_key, None)
+            if template is not None:
+                templates_users -= template.nbr_users
+
+        texture_ids = {
+            get_fbx_uuid_from_key(texture_key)
+            for texture_key, _fbx_prop in scene_data.data_textures.values()
+        }
+        video_ids = {
+            get_fbx_uuid_from_key(video_key)
+            for video_key, _texture_keys in scene_data.data_videos.values()
+        }
+        removed_ids = texture_ids | video_ids
+        connections = [
+            connection
+            for connection in scene_data.connections
+            if connection[1] not in removed_ids and connection[2] not in removed_ids
+        ]
+
+        return scene_data._replace(
+            templates=templates,
+            templates_users=templates_users,
+            connections=connections,
+            data_textures={},
+            data_videos={},
+        )
 
     def fbx_animations_do(scene_data, ref_id, f_start, f_end, start_zero, objects=None, force_keep=False):
         """
@@ -622,12 +658,14 @@ def export(**keywords):
 
     # save a copy of the original export bin
     original_fbx_animations_do = export_fbx_bin.fbx_animations_do
+    original_fbx_data_from_scene = export_fbx_bin.fbx_data_from_scene
     original_fbx_data_armature_elements = export_fbx_bin.fbx_data_armature_elements
     original_fbx_data_object_elements = export_fbx_bin.fbx_data_object_elements
     original_fbx_data_bindpose_element = export_fbx_bin.fbx_data_bindpose_element
 
     # here is where we patch in our tweaked functions
     export_fbx_bin.fbx_animations_do = fbx_animations_do
+    export_fbx_bin.fbx_data_from_scene = fbx_data_from_scene_without_textures
     export_fbx_bin.fbx_data_armature_elements = fbx_data_armature_elements
     export_fbx_bin.fbx_data_object_elements = fbx_data_object_elements
     export_fbx_bin.fbx_data_bindpose_element = fbx_data_bindpose_element
@@ -644,6 +682,7 @@ def export(**keywords):
         # now re-patch back the export bin module so that the existing fbx addon still has its original code
         # https://github.com/EpicGamesExt/BlenderTools/issues/598
         export_fbx_bin.fbx_animations_do = original_fbx_animations_do
+        export_fbx_bin.fbx_data_from_scene = original_fbx_data_from_scene
         export_fbx_bin.fbx_data_armature_elements = original_fbx_data_armature_elements
         export_fbx_bin.fbx_data_object_elements = original_fbx_data_object_elements
         export_fbx_bin.fbx_data_bindpose_element = original_fbx_data_bindpose_element

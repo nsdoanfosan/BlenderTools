@@ -250,14 +250,16 @@ def export_mesh(asset_id, mesh_object, properties, lod=0):
     # Note: this is a weird work around for morph targets not exporting when
     # particle systems are on the mesh. Making them not visible fixes this bug
     existing_display_options = utilities.disable_particles(mesh_object)
-    # export selection to a file
-    export_file(properties, lod)
-    # restore the particle system display options
-    utilities.restore_particles(mesh_object, existing_display_options)
+    try:
+        # export selection to a file
+        export_file(properties, lod)
+    finally:
+        # restore the particle system display options
+        utilities.restore_particles(mesh_object, existing_display_options)
 
-    # run the post mesh export extensions
-    if lod == 0:
-        extension.run_extension_tasks(ExtensionTasks.POST_MESH_EXPORT.value)
+        # run the post mesh export extensions
+        if lod == 0:
+            extension.run_extension_tasks(ExtensionTasks.POST_MESH_EXPORT.value)
 
 
 @utilities.track_progress(message='Exporting animation "{attribute}"...', attribute='file_path')

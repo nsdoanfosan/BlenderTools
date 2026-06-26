@@ -22,6 +22,7 @@ _NODE_PING_SECONDS = 1                                  # Number of seconds to w
 _NODE_TIMEOUT_SECONDS = 5                               # Number of seconds to wait before timing out a remote node that was discovered via UDP and has stopped sending "pong" responses
 
 DEFAULT_RECEIVE_BUFFER_SIZE = 8192                      # The default receive buffer size
+MAX_COMMAND_RESPONSE_SIZE = 64 * 1024 * 1024            # Guard against unbounded command response reads
 
 # Execution modes (these must match the names given to LexToString for EPythonCommandExecutionMode in IPythonScriptPlugin.h)
 MODE_EXEC_FILE = 'ExecuteFile'                          # Execute the Python command as a file. This allows you to execute either a literal Python script containing multiple statements, or a file with optional arguments
@@ -463,11 +464,24 @@ class _RemoteExecutionCommandConnection(object):
         Returns:
             The message that was received.
         '''
-        data = self._command_channel_socket.recv(DEFAULT_RECEIVE_BUFFER_SIZE)
-        if data:
+        data = b''
+        while len(data) <= MAX_COMMAND_RESPONSE_SIZE:
+            chunk = self._command_channel_socket.recv(DEFAULT_RECEIVE_BUFFER_SIZE)
+            if not chunk:
+                break
+
+            data += chunk
+            try:
+                json_str = data.decode('utf-8')
+                _json.loads(json_str)
+            except (UnicodeDecodeError, _json.JSONDecodeError):
+                continue
+
             message = _RemoteExecutionMessage(None, None)
-            if message.from_json_bytes(data) and message.passes_receive_filter(self._node_id) and message.type_ == expected_type:
+            if message.from_json(json_str) and message.passes_receive_filter(self._node_id) and message.type_ == expected_type:
                 return message
+            break
+
         raise RuntimeError('Remote party failed to send a valid response!')
 
     def _init_command_listen_socket(self):

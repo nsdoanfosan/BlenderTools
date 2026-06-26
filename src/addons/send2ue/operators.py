@@ -54,13 +54,11 @@ class Send2Ue(bpy.types.Operator):
                 try:
                     function, args, kwargs, message, asset_id, attribute = self.execution_queue.get()
                     step = self.max_step - self.execution_queue.qsize()
-                    context.window_manager.send2ue.progress = abs(((step / self.max_step) * 100) - 1)
+                    context.window_manager.send2ue.progress = min((step / self.max_step) * 100, 99)
                     utilities.refresh_all_areas()
 
                     # set the current asset id
                     context.window_manager.send2ue.asset_id = asset_id
-                    # run the function
-                    function(*args, **kwargs)
 
                     # get the description
                     file_name = context.window_manager.send2ue.asset_data[asset_id].get(attribute)
@@ -68,6 +66,9 @@ class Send2Ue(bpy.types.Operator):
                         attribute=utilities.get_asset_name_from_file_name(file_name)
                     )
                     bpy.context.workspace.status_text_set_internal(description)
+
+                    # run the function
+                    function(*args, **kwargs)
                 except Exception as error:
                     self.escape_operation(context)
                     raise error

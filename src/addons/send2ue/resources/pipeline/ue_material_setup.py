@@ -17,6 +17,7 @@ process_mesh(asset_path) 를 RPC 로 호출한다. 수동 실행도 가능.
 import json
 import os
 import re
+import time
 import unreal
 
 # ─── 설정 ────────────────────────────────────────────────────────────────────
@@ -59,6 +60,8 @@ JSON_SEARCH_ROOTS    = [
 # /Game/Meshes/<rel> 은 디스크의 JSON_SEARCH_ROOTS[0]/<rel> 에 1:1 대응(send2ue 자동경로 규칙).
 # 이를 이용해 mesh_path 로부터 해당 프롭 폴더만 좁혀 JSON 을 찾는다 → 3만개 트리 전체 walk 회피.
 GAME_MESHES_PREFIX   = "/Game/Meshes/"
+DELETE_IMPORTED_SOURCE_MATERIALS = False
+DELETE_IMPORTED_SOURCE_TEXTURES = False
 
 # Shared surface-layer texture parameter names (JSON 의 param 과 동일해야 연결됨)
 KNOWN_PARAMS = {"Albedo", "Extra", "Normal", "Height", "Transmission", "Emissive"}
@@ -800,29 +803,74 @@ def _material_instance_base_name(mat_name: str) -> str:
 
 
 def _source_asset_names(data: dict):
+    cleanup = data.get("cleanup")
+    if isinstance(cleanup, dict):
+        material_names = _unique_string_list(cleanup.get("source_material_names", []))
+        texture_names = _unique_string_list(cleanup.get("source_texture_names", []))
+        if material_names or texture_names:
+            return material_names, texture_names
+
     material_names = []
     texture_names = []
+    seen_material_names = set()
+    seen_texture_names = set()
+
+    def append_unique(target: list, seen: set, name: str):
+        key = name.casefold()
+        if name and key not in seen:
+            seen.add(key)
+            target.append(name)
+
+    def add_material_names(name: str):
+        append_unique(material_names, seen_material_names, name)
+        base_name = _material_instance_base_name(name)
+        append_unique(material_names, seen_material_names, base_name)
+        for prefix in ("LayerBlend_", "Prop_", "Coat_"):
+            if base_name.startswith(prefix):
+                append_unique(material_names, seen_material_names, base_name[len(prefix):])
 
     def add_texture_names(tex: dict):
-        asset_name = str(tex.get("asset_name", ""))
-        if asset_name:
-            texture_names.append(asset_name)
         file_path = str(tex.get("file", ""))
         if file_path:
             source_name = os.path.splitext(os.path.basename(file_path))[0]
-            if source_name:
-                texture_names.append(source_name)
+            append_unique(texture_names, seen_texture_names, source_name)
+        else:
+            asset_name = str(tex.get("asset_name", ""))
+            append_unique(texture_names, seen_texture_names, asset_name)
 
     for entry in data.get("materials", []):
-        mat_name = str(entry.get("name", ""))
-        if mat_name:
-            material_names.append(mat_name)
+        add_material_names(str(entry.get("name", "")))
+        add_material_names(str(entry.get("slot_name", "")))
         for tex in entry.get("textures", []):
             add_texture_names(tex)
         for layer in entry.get("layers", []):
             for tex in layer.get("textures", []):
                 add_texture_names(tex)
     return material_names, texture_names
+
+
+def _unique_string_list(values) -> list:
+    unique = []
+    seen = set()
+    if not isinstance(values, list):
+        return unique
+    for value in values:
+        name = str(value or "")
+        key = name.casefold()
+        if name and key not in seen:
+            seen.add(key)
+            unique.append(name)
+    return unique
+
+
+def _asset_paths_by_name(folder_path: str) -> dict:
+    assets = unreal.EditorAssetLibrary.list_assets(folder_path, recursive=False, include_folder=False)
+    paths_by_name = {}
+    for asset_path in (str(path) for path in assets):
+        package_path = asset_path.split(".", 1)[0]
+        asset_name = package_path.rsplit("/", 1)[-1]
+        paths_by_name[asset_name.casefold()] = package_path
+    return paths_by_name
 
 
 def _delete_asset_if_type(asset_path: str, allowed_class_names: set) -> bool:
@@ -833,43 +881,70 @@ def _delete_asset_if_type(asset_path: str, allowed_class_names: set) -> bool:
         return False
     class_name = asset.get_class().get_name()
     if class_name not in allowed_class_names:
-        _log(f"  cleanup skip: {asset_path} ({class_name})")
         return False
     if unreal.EditorAssetLibrary.delete_asset(asset_path):
-        _log(f"  cleanup delete: {asset_path}")
         return True
     _warn(f"  cleanup delete failed: {asset_path}")
     return False
 
 
 def _cleanup_imported_source_assets(mesh_path: str, data: dict):
+    started = time.perf_counter()
     mesh_folder = mesh_path.rsplit("/", 1)[0]
     material_names, texture_names = _source_asset_names(data)
+    existing_asset_paths = _asset_paths_by_name(mesh_folder)
 
     deleted = 0
-    for name in material_names:
-        asset_path = f"{mesh_folder}/{name}"
-        if asset_path == mesh_path:
-            continue
-        if _delete_asset_if_type(asset_path, {"Material", "MaterialInstanceConstant"}):
-            deleted += 1
-
-    for name in texture_names:
-        asset_path = f"{mesh_folder}/{name}"
-        if asset_path == mesh_path:
-            continue
-        if _delete_asset_if_type(asset_path, {"Texture2D"}):
-            deleted += 1
-
-    if deleted:
-        # NOTE(perf): delete_asset 가 각 패키지를 디스크에서 즉시 지우고, 메쉬/MI/텍스처는 위에서
-        #   이미 개별 save 됐으므로 여기서 추가로 flush 할 게 없다. 예전엔 save_directory(
-        #   only_if_is_dirty=False)로 import 폴더 전체를 강제 재저장했는데, 모든 메쉬가 같은 폴더
-        #   (/Game/untitled_category/untitled_asset)로 들어오는 데다 메쉬마다 호출돼서 폴더가
-        #   쌓일수록 export 가 O(N^2) 로 느려졌다. 그래서 폴더 통째 save 는 하지 않는다.
-        _log(f"  cleanup complete: {deleted} source asset(s) removed from {mesh_folder}")
+    skipped_materials = 0
+    skipped_textures = 0
+    if DELETE_IMPORTED_SOURCE_MATERIALS:
+        for name in material_names:
+            asset_path = existing_asset_paths.get(name.casefold())
+            if not asset_path or asset_path == mesh_path:
+                continue
+            if _delete_asset_if_type(asset_path, {"Material", "MaterialInstanceConstant"}):
+                deleted += 1
     else:
-        _log(f"  cleanup: no source material/texture assets found in {mesh_folder}")
+        skipped_materials = sum(
+            1
+            for name in material_names
+            if (asset_path := existing_asset_paths.get(name.casefold())) and asset_path != mesh_path
+        )
+
+    if DELETE_IMPORTED_SOURCE_TEXTURES:
+        for name in texture_names:
+            asset_path = existing_asset_paths.get(name.casefold())
+            if not asset_path or asset_path == mesh_path:
+                continue
+            if _delete_asset_if_type(asset_path, {"Texture2D"}):
+                deleted += 1
+    else:
+        skipped_textures = sum(
+            1
+            for name in texture_names
+            if (asset_path := existing_asset_paths.get(name.casefold())) and asset_path != mesh_path
+        )
+
+    elapsed = time.perf_counter() - started
+    if deleted or skipped_materials or skipped_textures:
+        # Source asset deletes trigger package deletion, source-control work, and shader churn.
+        # Keep them available for manual maintenance, but do not run them during export by default.
+        material_note = (
+            f"; {skipped_materials} source material asset(s) left in place"
+            if skipped_materials
+            else ""
+        )
+        texture_note = (
+            f"; {skipped_textures} source texture asset(s) left in place"
+            if skipped_textures
+            else ""
+        )
+        _log(
+            f"  cleanup complete: {deleted} source asset(s) removed from {mesh_folder}"
+            f"{material_note}{texture_note} ({elapsed:.2f}s)"
+        )
+    else:
+        _log(f"  cleanup: no source material/texture assets found in {mesh_folder} ({elapsed:.2f}s)")
 
 
 def process_mesh(mesh_path: str, master_mat=None, json_path: str = None) -> bool:

@@ -20,6 +20,8 @@ PIPELINE_DIR = os.environ.get("UE_BLENDER_PIPELINE_DIR", BUNDLED_PIPELINE_DIR).r
     "\\",
     "/",
 )
+_TEXTURELESS_FBX_RESTORE = {}
+TEXTURELESS_FBX_EXPORT_FLAG = "send2ue_material_pipeline_textureless_fbx_export"
 
 
 class MaterialPipelineExtension(ExtensionBase):
@@ -39,7 +41,7 @@ class MaterialPipelineExtension(ExtensionBase):
 
         asset_data = asset_data or {}
         target = bpy.data.objects.get(asset_data.get("_mesh_object_name", ""))
-        if not target or target.type != "MESH":
+        if not target:
             return
 
         self._refresh_unreal_handoff_json_or_error(target)
@@ -47,6 +49,8 @@ class MaterialPipelineExtension(ExtensionBase):
         sidecar = self._load_json_sidecar_for_export(asset_data, target)
         if sidecar is None:
             return
+        self._prepare_textureless_fbx_materials(target)
+
         transfer = self._transfer_entry_for_target(sidecar, target)
         shape_keys = bool(transfer.get("shape_keys"))
         weights = bool(transfer.get("weights"))
@@ -69,6 +73,37 @@ class MaterialPipelineExtension(ExtensionBase):
 
         target.vdt_object_props.transfer_source = source
         self._run_vertex_data_transfer(target, shape_keys, weights)
+
+    def post_mesh_export(self, asset_data, properties):
+        target_name = (asset_data or {}).get("_mesh_object_name", "")
+        self._restore_textureless_fbx_materials(target_name)
+
+    def _prepare_textureless_fbx_materials(self, target):
+        if target.name in _TEXTURELESS_FBX_RESTORE:
+            return
+
+        namespace = bpy.app.driver_namespace
+        _TEXTURELESS_FBX_RESTORE[target.name] = {
+            "had_flag": TEXTURELESS_FBX_EXPORT_FLAG in namespace,
+            "previous": namespace.get(TEXTURELESS_FBX_EXPORT_FLAG),
+        }
+        namespace[TEXTURELESS_FBX_EXPORT_FLAG] = True
+
+    def _textureless_fbx_mesh_objects(self, target):
+        if target.type == "MESH":
+            return [target]
+        return [child for child in target.children_recursive if child.type == "MESH"]
+
+    def _restore_textureless_fbx_materials(self, target_name, state=None):
+        state = state or _TEXTURELESS_FBX_RESTORE.pop(target_name, None)
+        if not state:
+            return
+
+        namespace = bpy.app.driver_namespace
+        if state["had_flag"]:
+            namespace[TEXTURELESS_FBX_EXPORT_FLAG] = state["previous"]
+        else:
+            namespace.pop(TEXTURELESS_FBX_EXPORT_FLAG, None)
 
     def _refresh_unreal_handoff_json_or_error(self, target):
         try:
@@ -210,6 +245,21 @@ class MaterialPipelineExtension(ExtensionBase):
                 bpy.context.view_layer.objects.active = active
             if vdt_props is not None and previous_overwrite_shape_keys is not None:
                 vdt_props.overwrite_shape_keys = previous_overwrite_shape_keys
+
+    def pre_import(self, asset_data, properties):
+        if not self.enabled:
+            return
+        if asset_data.get("skip"):
+            return
+        if asset_data.get("_asset_type") != UnrealTypes.STATIC_MESH:
+            return
+        if not self._resolve_json_path(asset_data.get("asset_path", "")):
+            return
+
+        # The JSON material pipeline imports textures and creates/assigns MIs itself.
+        # Letting the FBX importer also create source materials/textures adds duplicate
+        # assets that immediately need cleanup, which is expensive in Unreal/P4.
+        asset_data["_import_materials_and_textures"] = False
 
     def post_import(self, asset_data, properties):
         if not self.enabled:
