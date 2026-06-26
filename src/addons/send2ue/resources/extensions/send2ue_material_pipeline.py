@@ -72,19 +72,10 @@ class MaterialPipelineExtension(ExtensionBase):
 
     def _refresh_unreal_handoff_json_or_error(self, target):
         try:
-            import ue_unique_export_names_addon as addon
+            from ue_unique_export_names_addon import api as handoff_api
 
-            props = bpy.context.scene.ue_unique_names
-            objects = addon.validation_scope_objects(bpy.context, props.scope)
-            materials = addon.unreal_handoff_materials_from_objects(objects)
-            texture_map = addon.material_texture_map(materials)
-            errors = addon._json_refresh_validation_errors(
-                bpy.context,
-                props,
-                objects,
-                materials,
-                texture_map,
-            )
+            result = handoff_api.refresh_handoff_json(bpy.context)
+            errors = result.get("errors") or []
             if errors:
                 first = errors[0]
                 utilities.report_error(
@@ -92,16 +83,7 @@ class MaterialPipelineExtension(ExtensionBase):
                     f' Target: "{target.name}". First: {first}',
                 )
 
-            prefix = addon.asset_prefix(bpy.context, props.prefix_mode, props.custom_prefix)
-            export_dir = Path(addon.resolve_export_dir(props.texture_export_dir))
-            json_paths = addon.write_unreal_pipeline_json(
-                bpy.context,
-                prefix,
-                objects,
-                materials,
-                texture_map,
-                export_dir,
-            )
+            json_paths = result.get("json_paths") or []
             if not json_paths:
                 utilities.report_error(
                     "Unreal handoff JSON refresh produced no files.",
@@ -150,10 +132,7 @@ class MaterialPipelineExtension(ExtensionBase):
                 candidates.append(name)
 
         try:
-            import ue_unique_export_names_addon as addon
-
-            props = bpy.context.scene.ue_unique_names
-            export_dir = Path(addon.resolve_export_dir(props.texture_export_dir))
+            from ue_unique_export_names_addon import api as handoff_api
         except Exception as exc:
             utilities.report_error(
                 "UE Unique Names add-on is required before Send to Unreal.",
@@ -161,11 +140,7 @@ class MaterialPipelineExtension(ExtensionBase):
             )
             return None
 
-        for name in candidates:
-            candidate = export_dir / f"{name}.json"
-            if candidate.exists():
-                return str(candidate)
-        return None
+        return handoff_api.resolve_sidecar_json_path(candidates, bpy.context)
 
     def _asset_name_from_value(self, value):
         if not value:
@@ -265,16 +240,11 @@ class MaterialPipelineExtension(ExtensionBase):
     def _resolve_json_path(self, asset_path):
         """Return the Blender-authored sidecar JSON path for this imported mesh."""
         try:
-            from pathlib import Path
+            from ue_unique_export_names_addon import api as handoff_api
 
-            import ue_unique_export_names_addon as addon
-
-            mesh_name = asset_path.rsplit("/", 1)[-1]
-            props = bpy.context.scene.ue_unique_names
-            export_dir = addon.resolve_export_dir(props.texture_export_dir)
-            candidate = Path(export_dir) / f"{mesh_name}.json"
-            if candidate.exists():
-                return str(candidate).replace("\\", "/")
+            json_path = handoff_api.resolve_sidecar_json_path(asset_path, bpy.context)
+            if json_path:
+                return str(json_path).replace("\\", "/")
         except Exception as exc:
             print(
                 "[material_pipeline] json_path resolve failed; "
