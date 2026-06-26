@@ -4,10 +4,13 @@
 # This hook only resolves the sidecar JSON written by UE Unique Names and asks
 # Unreal to process the imported mesh through the shared surface-layer pipeline.
 
+import json
 import os
+from pathlib import Path
 
 import bpy
 from send2ue.constants import UnrealTypes
+from send2ue.core import utilities
 from send2ue.core.extension import ExtensionBase
 from send2ue.dependencies.unreal import run_commands
 
@@ -30,25 +33,118 @@ class MaterialPipelineExtension(ExtensionBase):
     )
 
     def pre_mesh_export(self, asset_data, properties):
+        if not self.enabled:
+            return
+
+        asset_data = asset_data or {}
         target = bpy.data.objects.get(asset_data.get("_mesh_object_name", ""))
         if not target or target.type != "MESH":
             return
 
-        shape_keys = bool(getattr(target, "ue_unique_transfer_shape_keys", False))
-        weights = bool(getattr(target, "ue_unique_transfer_weights", False))
+        sidecar = self._load_json_sidecar_for_export(asset_data, target)
+        if sidecar is None:
+            return
+        transfer = self._transfer_entry_for_target(sidecar, target)
+        shape_keys = bool(transfer.get("shape_keys"))
+        weights = bool(transfer.get("weights"))
         if not shape_keys and not weights:
             return
 
         if not hasattr(target, "vdt_object_props"):
-            print("[material_pipeline] Vertex Data Tools object props are unavailable.")
-            return
+            utilities.report_error(
+                "Vertex Data Tools object props are unavailable.",
+                "The UE Unique JSON requests transfer postprocess, but VDT is not available in Blender.",
+            )
 
-        source = target.vdt_object_props.transfer_source
+        source_name = transfer.get("source")
+        source = bpy.data.objects.get(source_name) if source_name else None
         if source is None:
-            print(f"[material_pipeline] Transfer source not set for {target.name}; skipping.")
-            return
+            utilities.report_error(
+                f'Transfer source "{source_name or "-"}" not found for "{target.name}".',
+                "Run Check Unreal Handoff again after setting Export Transfer Source.",
+            )
 
+        target.vdt_object_props.transfer_source = source
         self._run_vertex_data_transfer(target, shape_keys, weights)
+
+    def _load_json_sidecar_for_export(self, asset_data, target):
+        json_path = self._resolve_json_path_for_export(asset_data, target)
+        if not json_path:
+            utilities.report_error(
+                "UE Unique JSON sidecar is missing.",
+                f'Run "Check Unreal Handoff" before Send to Unreal. Target: "{target.name}".',
+            )
+            return None
+
+        try:
+            with open(json_path, "r", encoding="utf-8") as handle:
+                return json.load(handle)
+        except OSError as exc:
+            utilities.report_error(
+                f"Could not read UE Unique JSON sidecar: {json_path}",
+                str(exc),
+            )
+        except json.JSONDecodeError as exc:
+            utilities.report_error(
+                f"Invalid UE Unique JSON sidecar: {json_path}",
+                str(exc),
+            )
+
+    def _resolve_json_path_for_export(self, asset_data, target):
+        candidates = []
+        for value in (
+            asset_data.get("file_path"),
+            asset_data.get("asset_path"),
+            target.name,
+        ):
+            name = self._asset_name_from_value(value)
+            if name and name not in candidates:
+                candidates.append(name)
+
+        try:
+            import ue_unique_export_names_addon as addon
+
+            props = bpy.context.scene.ue_unique_names
+            export_dir = Path(addon.resolve_export_dir(props.texture_export_dir))
+        except Exception as exc:
+            utilities.report_error(
+                "UE Unique Names add-on is required before Send to Unreal.",
+                f"JSON sidecar lookup failed: {exc}",
+            )
+            return None
+
+        for name in candidates:
+            candidate = export_dir / f"{name}.json"
+            if candidate.exists():
+                return str(candidate)
+        return None
+
+    def _asset_name_from_value(self, value):
+        if not value:
+            return ""
+        value = str(value).replace("\\", "/").rstrip("/")
+        name = value.rsplit("/", 1)[-1]
+        if "." in name:
+            name = name.rsplit(".", 1)[0]
+        return name
+
+    def _transfer_entry_for_target(self, sidecar, target):
+        transfer = sidecar.get("transfer_source")
+        if isinstance(transfer, dict) and transfer.get("enabled"):
+            return transfer
+
+        transfers = [
+            entry
+            for entry in sidecar.get("transfer_sources", [])
+            if isinstance(entry, dict) and entry.get("enabled")
+        ]
+        if not transfers:
+            return {}
+
+        for entry in transfers:
+            if entry.get("target") == target.name:
+                return entry
+        return transfers[0]
 
     def _run_vertex_data_transfer(self, target, shape_keys, weights):
         active = bpy.context.view_layer.objects.active

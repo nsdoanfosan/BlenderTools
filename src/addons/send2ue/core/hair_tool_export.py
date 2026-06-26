@@ -16,6 +16,9 @@ def is_hair_tool_object(scene_object):
     if not scene_object or scene_object.type not in {'CURVES', 'MESH'}:
         return False
 
+    if any(_is_edit_mesh_modifier(modifier) for modifier in scene_object.modifiers):
+        return False
+
     node_group_names = {
         modifier.node_group.name
         for modifier in scene_object.modifiers
@@ -25,6 +28,13 @@ def is_hair_tool_object(scene_object):
         any(name.startswith('Hair_System_Setup') for name in node_group_names)
         and any(name.startswith('Hair_System_Profile') for name in node_group_names)
     )
+
+
+def _is_edit_mesh_modifier(modifier):
+    modifier_name = str(getattr(modifier, 'name', '') or '').strip().replace(' ', '_').casefold()
+    node_group = getattr(modifier, 'node_group', None)
+    node_group_name = str(getattr(node_group, 'name', '') or '').strip().replace(' ', '_').casefold()
+    return 'edit_mesh' in {modifier_name, node_group_name}
 
 
 def is_prepared_source(scene_object):
@@ -249,6 +259,32 @@ def _join_objects(objects):
     return objects[0]
 
 
+def _copy_transfer_settings(temporary_object, source_objects):
+    transfer_source = None
+    shape_keys = False
+    weights = False
+
+    for source_object in source_objects:
+        shape_keys = shape_keys or bool(
+            getattr(source_object, 'ue_unique_transfer_shape_keys', False)
+        )
+        weights = weights or bool(
+            getattr(source_object, 'ue_unique_transfer_weights', False)
+        )
+        if transfer_source is None and hasattr(source_object, 'vdt_object_props'):
+            transfer_source = source_object.vdt_object_props.transfer_source
+
+    if hasattr(temporary_object, 'ue_unique_transfer_shape_keys'):
+        temporary_object.ue_unique_transfer_shape_keys = shape_keys
+    if hasattr(temporary_object, 'ue_unique_transfer_weights'):
+        temporary_object.ue_unique_transfer_weights = weights
+    if (
+        transfer_source is not None
+        and hasattr(temporary_object, 'vdt_object_props')
+    ):
+        temporary_object.vdt_object_props.transfer_source = transfer_source
+
+
 def _link_to_export_collection(scene_object, export_collection):
     for collection in list(scene_object.users_collection):
         collection.objects.unlink(scene_object)
@@ -328,8 +364,9 @@ def prepare():
             asset_name = asset_parent.name if asset_parent != asset_sources[0] else asset_sources[0].name
             temporary_object.name = f'{asset_name}__S2U_HAIR'
             temporary_object.data.name = f'{asset_name}__S2U_HAIR'
-            temporary_object[SOURCE_NAME_PROPERTY] = asset_sources[0].name
+            temporary_object[SOURCE_NAME_PROPERTY] = asset_name
             temporary_object[TEMP_PROPERTY] = True
+            _copy_transfer_settings(temporary_object, asset_sources)
             _link_to_export_collection(temporary_object, export_collection)
             state['temporary_object_names'].add(temporary_object.name)
 
