@@ -20,6 +20,12 @@ This is now maintained by [@JoshQuake](https://github.com/JoshQuake) and volunte
 > [`docs/pipeline_contract.md`](https://github.com/nsdoanfosan/substance-tools/blob/main/docs/pipeline_contract.md)
 > and `pipeline_contract.json`. Treat that as the source of truth before
 > changing pipeline-facing names.
+>
+> The Send2UE material handoff extension is bundled in
+> `src/addons/send2ue/resources/extensions/send2ue_material_pipeline.py`; its
+> Unreal Python postprocess lives beside it in
+> `src/addons/send2ue/resources/pipeline/ue_material_setup.py`. Set
+> `UE_BLENDER_PIPELINE_DIR` only when deliberately overriding that bundled code.
 
 
 ## Send to Unreal

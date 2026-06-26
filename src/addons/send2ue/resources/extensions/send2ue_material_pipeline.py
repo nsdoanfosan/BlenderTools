@@ -1,6 +1,6 @@
 # send2ue extension: run the Unreal material setup after each StaticMesh import.
 #
-# The actual material work lives in UE_Blender_Pipeline/ue_material_setup.py.
+# The actual material work lives in ../pipeline/ue_material_setup.py.
 # This hook only resolves the sidecar JSON written by UE Unique Names and asks
 # Unreal to process the imported mesh through the shared surface-layer pipeline.
 
@@ -15,10 +15,11 @@ from send2ue.core.extension import ExtensionBase
 from send2ue.dependencies.unreal import run_commands
 
 
-PIPELINE_DIR = os.environ.get(
-    "UE_BLENDER_PIPELINE_DIR",
-    os.path.join(os.path.expanduser("~"), "Documents", "UE_Blender_Pipeline"),
-).replace("\\", "/")
+BUNDLED_PIPELINE_DIR = (Path(__file__).resolve().parent.parent / "pipeline").as_posix()
+PIPELINE_DIR = os.environ.get("UE_BLENDER_PIPELINE_DIR", BUNDLED_PIPELINE_DIR).replace(
+    "\\",
+    "/",
+)
 
 
 class MaterialPipelineExtension(ExtensionBase):
@@ -40,6 +41,8 @@ class MaterialPipelineExtension(ExtensionBase):
         target = bpy.data.objects.get(asset_data.get("_mesh_object_name", ""))
         if not target or target.type != "MESH":
             return
+
+        self._refresh_unreal_handoff_json_or_error(target)
 
         sidecar = self._load_json_sidecar_for_export(asset_data, target)
         if sidecar is None:
@@ -66,6 +69,51 @@ class MaterialPipelineExtension(ExtensionBase):
 
         target.vdt_object_props.transfer_source = source
         self._run_vertex_data_transfer(target, shape_keys, weights)
+
+    def _refresh_unreal_handoff_json_or_error(self, target):
+        try:
+            import ue_unique_export_names_addon as addon
+
+            props = bpy.context.scene.ue_unique_names
+            objects = addon.validation_scope_objects(bpy.context, props.scope)
+            materials = addon.unreal_handoff_materials_from_objects(objects)
+            texture_map = addon.material_texture_map(materials)
+            errors = addon._json_refresh_validation_errors(
+                bpy.context,
+                props,
+                objects,
+                materials,
+                texture_map,
+            )
+            if errors:
+                first = errors[0]
+                utilities.report_error(
+                    "Unreal handoff validation failed before Send to Unreal.",
+                    f' Target: "{target.name}". First: {first}',
+                )
+
+            prefix = addon.asset_prefix(bpy.context, props.prefix_mode, props.custom_prefix)
+            export_dir = Path(addon.resolve_export_dir(props.texture_export_dir))
+            json_paths = addon.write_unreal_pipeline_json(
+                bpy.context,
+                prefix,
+                objects,
+                materials,
+                texture_map,
+                export_dir,
+            )
+            if not json_paths:
+                utilities.report_error(
+                    "Unreal handoff JSON refresh produced no files.",
+                    f' Target: "{target.name}". Run Check Unreal Handoff.',
+                )
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            utilities.report_error(
+                "Could not validate Unreal handoff before Send to Unreal.",
+                f' Target: "{target.name}". {exc}',
+            )
 
     def _load_json_sidecar_for_export(self, asset_data, target):
         json_path = self._resolve_json_path_for_export(asset_data, target)
