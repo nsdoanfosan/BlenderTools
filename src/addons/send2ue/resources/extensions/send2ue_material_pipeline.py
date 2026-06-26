@@ -54,6 +54,11 @@ class MaterialPipelineExtension(ExtensionBase):
         active = bpy.context.view_layer.objects.active
         selected = list(bpy.context.selected_objects)
         mode = bpy.context.mode
+        vdt_props = getattr(bpy.context.scene, "vdt_props", None)
+        previous_overwrite_shape_keys = (
+            getattr(vdt_props, "overwrite_shape_keys", None)
+            if vdt_props is not None else None
+        )
 
         try:
             if mode != "OBJECT" and active:
@@ -66,6 +71,8 @@ class MaterialPipelineExtension(ExtensionBase):
                 if not hasattr(bpy.ops.object, "vdt_pointer_transfer_shape_keys"):
                     print("[material_pipeline] Shape Key transfer operator is unavailable.")
                 else:
+                    if vdt_props is not None:
+                        vdt_props.overwrite_shape_keys = True
                     bpy.ops.object.vdt_pointer_transfer_shape_keys()
 
             if weights:
@@ -82,6 +89,8 @@ class MaterialPipelineExtension(ExtensionBase):
                     obj.select_set(True)
             if active and active.name in bpy.context.view_layer.objects:
                 bpy.context.view_layer.objects.active = active
+            if vdt_props is not None and previous_overwrite_shape_keys is not None:
+                vdt_props.overwrite_shape_keys = previous_overwrite_shape_keys
 
     def post_import(self, asset_data, properties):
         if not self.enabled:
