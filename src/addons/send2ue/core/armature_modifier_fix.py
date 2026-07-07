@@ -2,10 +2,42 @@
 
 import bpy
 from . import utilities
-from ..constants import BlenderTypes
+from ..constants import BlenderTypes, ToolInfo
 
 
 STATE_KEY = 'send2ue_armature_modifier_fix_state'
+
+
+def _export_armature_objects():
+    export_collection = bpy.data.collections.get(ToolInfo.EXPORT_COLLECTION.value)
+    if not export_collection:
+        return []
+    return [
+        scene_object
+        for scene_object in export_collection.all_objects
+        if (
+            scene_object.type == BlenderTypes.SKELETON
+            and export_collection in scene_object.users_collection
+        )
+    ]
+
+
+def _make_export_armatures_visible(state):
+    """
+    Temporarily unhides armatures that are explicitly in Export.
+
+    Send to Unreal collects rigs through visible objects, but artists often hide
+    armatures in the viewport while working. If a hidden export armature is left
+    hidden, the skeletal mesh export can lose the intended rig/skeleton context.
+    """
+    for rig_object in _export_armature_objects():
+        hide_get = rig_object.hide_get()
+        hide_viewport = rig_object.hide_viewport
+        if not hide_get and not hide_viewport:
+            continue
+        state['visibility'].append((rig_object.name, hide_get, hide_viewport))
+        rig_object.hide_set(False)
+        rig_object.hide_viewport = False
 
 
 def get_top_parent_rig_object(scene_object, rig_objects):
@@ -74,18 +106,21 @@ def prepare():
     """
     cleanup()
 
-    mesh_objects = utilities.get_from_collection(BlenderTypes.MESH)
-    rig_objects = utilities.get_from_collection(BlenderTypes.SKELETON)
-    if not rig_objects:
-        return
-
     state = {
         'modifiers': [],        # list of (object_name, modifier_name)
         'vertex_groups': [],    # list of (object_name, vertex_group_name)
+        'visibility': [],       # list of (object_name, hide_get, hide_viewport)
     }
     bpy.app.driver_namespace[STATE_KEY] = state
 
     try:
+        _make_export_armatures_visible(state)
+
+        mesh_objects = utilities.get_from_collection(BlenderTypes.MESH)
+        rig_objects = utilities.get_from_collection(BlenderTypes.SKELETON)
+        if not rig_objects:
+            return
+
         for mesh_object in mesh_objects:
             # leave meshes that already have an armature modifier alone
             if any(modifier.type == 'ARMATURE' for modifier in mesh_object.modifiers):
@@ -144,3 +179,10 @@ def cleanup():
         vertex_group = scene_object.vertex_groups.get(vertex_group_name)
         if vertex_group:
             scene_object.vertex_groups.remove(vertex_group)
+
+    for object_name, hide_get, hide_viewport in state.get('visibility', []):
+        scene_object = bpy.data.objects.get(object_name)
+        if not scene_object:
+            continue
+        scene_object.hide_set(hide_get)
+        scene_object.hide_viewport = hide_viewport

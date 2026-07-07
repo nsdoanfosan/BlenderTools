@@ -27,6 +27,7 @@ nav:
     - Instance Assets: "./extensions/instance-assets.md"
   - Extras:
     - Pipeline Menu: "./extras/pipeline-menu.md"
+    - Unreal Handoff Automation: "./extras/unreal-handoff-automation.md"
     - Addon Preferences: "./extras/addon-preferences.md"
     - Community Extensions: "./extras/community-extensions.md"
   - Trouble Shooting:
