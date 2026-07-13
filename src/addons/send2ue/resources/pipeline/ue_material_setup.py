@@ -697,6 +697,18 @@ def _master_preset(data: dict, entry: dict = None, mesh_path: str = "") -> dict:
     return result
 
 
+def _uses_tree_material_preset(data: dict, mesh_path: str) -> bool:
+    if _is_tree_asset_path(mesh_path):
+        return True
+    if not data:
+        return False
+    return any(
+        _master_preset(data, entry, mesh_path).get("key") == "tree"
+        for entry in data.get("materials", [])
+        if isinstance(entry, dict)
+    )
+
+
 def _load_master_material(preset: dict):
     master_path = preset["master"]
     master_mat = unreal.load_asset(master_path)
@@ -2203,7 +2215,12 @@ def process_mesh(mesh_path: str, master_mat=None, json_path: str = None) -> bool
         if isinstance(mesh, unreal.StaticMesh) and _set_nanite(mesh, nanite_enabled):
             save_mesh_asset()
         elif _is_skeletal_mesh(mesh):
-            voxelize = _nanite_shape_preservation_voxelize() if ENABLE_SKELETAL_NANITE_VOXELIZE else None
+            voxelize = (
+                _nanite_shape_preservation_voxelize()
+                if ENABLE_SKELETAL_NANITE_VOXELIZE
+                and _uses_tree_material_preset(data, mesh_path)
+                else None
+            )
             if _set_nanite(mesh, nanite_enabled, voxelize):
                 save_mesh_asset()
 

@@ -107,7 +107,10 @@ class MaterialPipelineExtension(ExtensionBase):
         try:
             from ue_unique_export_names_addon import api as handoff_api
 
-            result = handoff_api.refresh_handoff_json(bpy.context)
+            result = handoff_api.refresh_handoff_json(
+                bpy.context,
+                scope="EXPORT_COLLECTION",
+            )
             errors = result.get("errors") or []
             if errors:
                 first = errors[0]
