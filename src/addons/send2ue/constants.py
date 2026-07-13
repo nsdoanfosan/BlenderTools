@@ -2,6 +2,8 @@
 import os
 from enum import Enum
 
+from .pipeline_contract import collection_name
+
 
 class PreFixToken(Enum):
     SOCKET = 'SOCKET'
@@ -35,7 +37,7 @@ class ToolInfo(Enum):
     NAME = 'send2ue'
     APP = 'blender'
     LABEL = 'Send to Unreal'
-    EXPORT_COLLECTION = 'Export'
+    EXPORT_COLLECTION = collection_name('send_to_unreal_export', 'Export')
     COLLECTION_NAMES = [EXPORT_COLLECTION]
     TEMPLATE_VERSION = 1
     FCURVE_FILE = '{file_path}_custom_property_fcurves.json'
@@ -81,4 +83,3 @@ class PathModes(Enum):
 
 class RegexPresets:
     INVALID_NAME_CHARACTERS = r"[^-+\w]+"
-

@@ -13,6 +13,7 @@ from .. import __package__ as base_package
 from ..ui import header_menu
 from ..dependencies import unreal
 from ..constants import BlenderTypes, UnrealTypes, ToolInfo, PreFixToken, PathModes, RegexPresets
+from ..pipeline_contract import unreal_path_mapping
 from mathutils import Vector, Quaternion
 
 # ---------------------------------------------------------------------------
@@ -1195,7 +1196,10 @@ def sync_unreal_mesh_folder_path(*args):
         return
 
     # locate the anchor folder (case-insensitive) and require it to sit on a path boundary
-    anchor = 'Forestportfolio/'
+    mapping = unreal_path_mapping()
+    anchor_name = str(mapping.get('local_anchor') or 'Forestportfolio').strip('/\\')
+    unreal_anchor = str(mapping.get('unreal_anchor') or '/Game/Meshes').rstrip('/')
+    anchor = f'{anchor_name}/'
     anchor_index = file_path.lower().find(anchor.lower())
     if anchor_index == -1:
         return
@@ -1207,7 +1211,7 @@ def sync_unreal_mesh_folder_path(*args):
     remainder = file_path[anchor_index + len(anchor):]
     relative_folder = remainder.rsplit('/', 1)[0] if '/' in remainder else ''
 
-    unreal_path = '/Game/Meshes/'
+    unreal_path = f'{unreal_anchor}/'
     if relative_folder:
         unreal_path += f'{relative_folder}/'
 

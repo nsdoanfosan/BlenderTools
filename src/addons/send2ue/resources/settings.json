@@ -283,6 +283,12 @@
           }
         },
         "skeletal_mesh_import_data": {
+          "build_nanite": {
+            "name": "Build Nanite",
+            "description": "If enabled, builds Nanite data for imported skeletal meshes when supported by Unreal",
+            "type": "BOOLEAN",
+            "default": true
+          },
           "import_content_type": {
             "name": "Import Content Type",
             "description": "Filter the content we want to import from the incoming skeletal mesh",

@@ -5,7 +5,6 @@
 # Unreal to process the imported mesh through the shared surface-layer pipeline.
 
 import json
-import os
 from pathlib import Path
 
 import bpy
@@ -16,10 +15,9 @@ from send2ue.dependencies.unreal import run_commands
 
 
 BUNDLED_PIPELINE_DIR = (Path(__file__).resolve().parent.parent / "pipeline").as_posix()
-PIPELINE_DIR = os.environ.get("UE_BLENDER_PIPELINE_DIR", BUNDLED_PIPELINE_DIR).replace(
-    "\\",
-    "/",
-)
+# The material runtime is part of this Git repository.  Do not allow a stale
+# Documents copy or process environment override to shadow the bundled source.
+PIPELINE_DIR = BUNDLED_PIPELINE_DIR
 _TEXTURELESS_FBX_RESTORE = {}
 TEXTURELESS_FBX_EXPORT_FLAG = "send2ue_material_pipeline_textureless_fbx_export"
 
@@ -251,10 +249,33 @@ class MaterialPipelineExtension(ExtensionBase):
             return
         if asset_data.get("skip"):
             return
-        if asset_data.get("_asset_type") != UnrealTypes.STATIC_MESH:
+        if asset_data.get("_asset_type") not in {
+            UnrealTypes.STATIC_MESH,
+            UnrealTypes.SKELETAL_MESH,
+        }:
             return
-        if not self._resolve_json_path(asset_data.get("asset_path", "")):
+        asset_path = asset_data.get("asset_path", "")
+        json_path = self._resolve_json_path(asset_path)
+        if not json_path:
             return
+
+        json_arg = f'r"{json_path}"'
+        commands = [
+            "import sys",
+            "import importlib.util",
+            "import unreal",
+            f'_d = r"{PIPELINE_DIR}"',
+            f'_asset_path = r"{asset_path}".split(".")[0]',
+            "_pipeline_file = _d.rstrip('/') + '/ue_material_setup.py'",
+            "_spec = importlib.util.spec_from_file_location('send2ue_bundled_ue_material_setup_preflight', _pipeline_file)",
+            "if _spec is None or _spec.loader is None:",
+            "\traise RuntimeError('Could not load bundled material pipeline: ' + _pipeline_file)",
+            "_p = importlib.util.module_from_spec(_spec)",
+            "sys.modules[_spec.name] = _p",
+            "_spec.loader.exec_module(_p)",
+            f"_p.preflight_mesh_materials(_asset_path, json_path={json_arg})",
+        ]
+        run_commands(commands)
 
         # The JSON material pipeline imports textures and creates/assigns MIs itself.
         # Letting the FBX importer also create source materials/textures adds duplicate
@@ -266,7 +287,10 @@ class MaterialPipelineExtension(ExtensionBase):
             return
         if asset_data.get("skip"):
             return
-        if asset_data.get("_asset_type") != UnrealTypes.STATIC_MESH:
+        if asset_data.get("_asset_type") not in {
+            UnrealTypes.STATIC_MESH,
+            UnrealTypes.SKELETAL_MESH,
+        }:
             return
 
         asset_path = asset_data.get("asset_path")
@@ -278,12 +302,26 @@ class MaterialPipelineExtension(ExtensionBase):
 
         commands = [
             "import sys",
+            "import importlib.util",
+            "import unreal",
             f'_d = r"{PIPELINE_DIR}"',
-            "sys.path.append(_d) if _d not in sys.path else None",
-            "import importlib",
-            "import ue_material_setup as _p",
-            "importlib.reload(_p)",
-            f'_p.process_mesh(r"{asset_path}", json_path={json_arg})',
+            f'_asset_path = r"{asset_path}".split(".")[0]',
+            "_pipeline_file = _d.rstrip('/') + '/ue_material_setup.py'",
+            "_spec = importlib.util.spec_from_file_location('send2ue_bundled_ue_material_setup', _pipeline_file)",
+            "if _spec is None or _spec.loader is None:",
+            "\traise RuntimeError('Could not load bundled material pipeline: ' + _pipeline_file)",
+            "_p = importlib.util.module_from_spec(_spec)",
+            "sys.modules[_spec.name] = _p",
+            "_spec.loader.exec_module(_p)",
+            "def _sync_to_imported_asset(_path):",
+            "\ttry:",
+            "\t\tunreal.EditorAssetLibrary.sync_browser_to_objects([_path])",
+            "\texcept Exception as _sync_error:",
+            "\t\tunreal.log_warning('[material_pipeline] content browser sync failed: ' + str(_sync_error))",
+            "try:",
+            f"\t_p.process_mesh(_asset_path, json_path={json_arg})",
+            "finally:",
+            "\t_sync_to_imported_asset(_asset_path)",
         ]
         run_commands(commands)
 

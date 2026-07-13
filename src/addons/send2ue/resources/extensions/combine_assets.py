@@ -4,7 +4,7 @@ import os
 import bpy
 from send2ue.core.extension import ExtensionBase
 from send2ue.core import utilities
-from send2ue.constants import BlenderTypes, UnrealTypes
+from send2ue.constants import BlenderTypes, ToolInfo, UnrealTypes
 
 
 class Options:
@@ -146,7 +146,7 @@ class CombineAssetsExtension(ExtensionBase):
                     mesh_object.parent,
                     BlenderTypes.MESH,
                     exclude_postfix_tokens=True,
-                    required_collection=bpy.data.collections.get('Export'),
+                    required_collection=bpy.data.collections.get(ToolInfo.EXPORT_COLLECTION.value),
                 )
                 # rename the asset to match the empty if this is a static mesh export
                 if mesh_object.parent.type == 'EMPTY':

@@ -357,7 +357,11 @@ class Unreal:
                 value=data.get('value'),
                 unreal_type=data.get('unreal_type'),
             )
-            data_object.set_editor_property(attribute, value)
+            try:
+                data_object.set_editor_property(attribute, value)
+            except Exception:
+                if attribute != 'build_nanite':
+                    raise
         return data_object
 
     @staticmethod
@@ -773,6 +777,11 @@ class UnrealImportAsset(Unreal):
                 self._property_data['unreal']['import_method']['fbx']['skeletal_mesh_import_data'],
                 import_data
             )
+            if 'build_nanite' not in self._property_data['unreal']['import_method']['fbx']['skeletal_mesh_import_data']:
+                try:
+                    import_data.set_editor_property('build_nanite', True)
+                except Exception:
+                    pass
             self._options.skeletal_mesh_import_data = import_data
 
     def set_animation_import_options(self):

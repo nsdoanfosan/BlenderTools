@@ -254,6 +254,18 @@ ASSET_SURFACE_PARAM_BY_LAYER_PARAM = {
     "Moss Blend Mask": "Moss Blend Mask",
 }
 
+# Send to Unreal keeps the source texture stem in the asset name.  These
+# suffixes are the source of truth for the tree texture set, even when an
+# older sidecar uses a generic/legacy parameter name.
+TEXTURE_PARAM_BY_NAME_SUFFIX = (
+    ("_color", "Albedo"),
+    ("_extra", "Extra"),
+    ("_height", "Height"),
+    ("_normal", "Normal"),
+    ("_opacity", "Opacity"),
+    ("_subsurface", "Subsurface"),
+)
+
 # import 되는 텍스처의 인게임 최대 해상도 캡(param 별). 목록에 없으면 DEFAULT 적용.
 MAX_TEXTURE_SIZE_BY_PARAM = {
     "Albedo": 2048,   # 2K
@@ -373,8 +385,33 @@ def _set_texture_property_if_changed(tex, property_name: str, value) -> bool:
     return True
 
 
-def _configure_imported_texture(tex, param: str, virtual_texture_streaming=None) -> bool:
+def _texture_param_from_name(file_path=None, asset_name=None):
+    """Return the canonical import role for a known texture-name suffix."""
+    for value in (file_path, asset_name):
+        if not value:
+            continue
+        stem = os.path.splitext(os.path.basename(str(value).replace("\\", "/")))[0].lower()
+        for suffix, role in TEXTURE_PARAM_BY_NAME_SUFFIX:
+            if stem.endswith(suffix):
+                return role
+    return None
+
+
+def _effective_texture_param(param: str, file_path=None, asset_name=None) -> str:
+    # A recognized filename suffix wins over a legacy JSON role. This keeps
+    # existing MYI/MI JSON contracts working while fixing tree map imports.
+    return _texture_param_from_name(file_path, asset_name) or str(param or "")
+
+
+def _configure_imported_texture(
+    tex,
+    param: str,
+    virtual_texture_streaming=None,
+    file_path=None,
+    asset_name=None,
+) -> bool:
     changed = False
+    param = _effective_texture_param(param, file_path, asset_name)
 
     if param == "Normal":
         changed |= _set_texture_property_if_changed(tex, "srgb", False)
@@ -398,13 +435,15 @@ def _configure_imported_texture(tex, param: str, virtual_texture_streaming=None)
             "compression_settings",
             unreal.TextureCompressionSettings.TC_MASKS,
         )
-    elif param == "Height":
+    elif param in {"Height", "Opacity", "Alpha", "Transmission"}:
         changed |= _set_texture_property_if_changed(tex, "srgb", False)
         changed |= _set_texture_property_if_changed(
             tex,
             "compression_settings",
             unreal.TextureCompressionSettings.TC_GRAYSCALE,
         )
+    elif param == "Subsurface":
+        changed |= _set_texture_property_if_changed(tex, "srgb", True)
     else:
         changed |= _set_texture_property_if_changed(tex, "srgb", True)
 
@@ -458,7 +497,13 @@ def _import_texture(
         source_mtime = None
     if unreal.EditorAssetLibrary.does_asset_exist(full_path) and not force_reimport:
         tex = unreal.load_asset(full_path)
-        if tex is not None and _configure_imported_texture(tex, param, virtual_texture_streaming):
+        if tex is not None and _configure_imported_texture(
+            tex,
+            param,
+            virtual_texture_streaming,
+            file_path,
+            asset_name,
+        ):
             unreal.EditorAssetLibrary.save_asset(full_path)
         if tex_cache is not None and source_mtime is not None:
             tex_cache[full_path] = source_mtime
@@ -470,7 +515,13 @@ def _import_texture(
             and unreal.EditorAssetLibrary.does_asset_exist(full_path)
             and not force_reimport):
         tex = unreal.load_asset(full_path)
-        if tex is not None and _configure_imported_texture(tex, param, virtual_texture_streaming):
+        if tex is not None and _configure_imported_texture(
+            tex,
+            param,
+            virtual_texture_streaming,
+            file_path,
+            asset_name,
+        ):
             unreal.EditorAssetLibrary.save_asset(full_path)
         return full_path
 
@@ -488,7 +539,13 @@ def _import_texture(
         _warn(f"  텍스처 import 실패: {asset_name}")
         return None
 
-    _configure_imported_texture(tex, param, virtual_texture_streaming)
+    _configure_imported_texture(
+        tex,
+        param,
+        virtual_texture_streaming,
+        file_path,
+        asset_name,
+    )
 
     unreal.EditorAssetLibrary.save_asset(full_path)
     if tex_cache is not None and source_mtime is not None:
@@ -1372,7 +1429,7 @@ def _texture_parameter_name(parameter_value):
             return ""
 
 
-def _prune_texture_parameter_overrides(mi, keep_names: set) -> bool:
+def _prune_texture_parameter_overrides(mi, keep_names: set, update: bool = True) -> bool:
     try:
         values = list(mi.get_editor_property("texture_parameter_values"))
     except Exception:
@@ -1385,10 +1442,11 @@ def _prune_texture_parameter_overrides(mi, keep_names: set) -> bool:
     if len(kept) == len(values):
         return False
     mi.set_editor_property("texture_parameter_values", kept)
-    try:
-        unreal.MaterialEditingLibrary.update_material_instance(mi)
-    except Exception:
-        pass
+    if update:
+        try:
+            unreal.MaterialEditingLibrary.update_material_instance(mi)
+        except Exception:
+            pass
     _log(
         "  stale texture overrides pruned: "
         + ", ".join(
@@ -1564,12 +1622,105 @@ def _call_create_or_update_layer_instance(helper, parent_layer, layer_path, text
     return bool(result), []
 
 
+_NORMALIZED_MATERIAL_LAYER_ASSETS = set()
+
+
+def _normalize_material_layer_asset(helper, method_name: str, asset_path: str, label: str):
+    cache_key = (method_name, asset_path)
+    if cache_key in _NORMALIZED_MATERIAL_LAYER_ASSETS:
+        return
+    method = getattr(helper, method_name, None)
+    if method is None:
+        raise RuntimeError(f"CodexMaterialTools {label} normalization helper missing")
+
+    result = method(asset_path)
+    report_text = ""
+    errors = []
+    returned_ok = None
+    if isinstance(result, tuple):
+        if result and isinstance(result[0], bool):
+            returned_ok = bool(result[0])
+            if len(result) > 1:
+                report_text = str(result[1] or "")
+            if len(result) > 2:
+                errors = [str(item) for item in (result[2] or [])]
+        elif result and isinstance(result[0], str):
+            report_text = result[0]
+            if len(result) > 1:
+                errors = [str(item) for item in (result[1] or [])]
+    elif isinstance(result, str):
+        report_text = result
+    elif isinstance(result, bool):
+        returned_ok = result
+
+    try:
+        report = json.loads(report_text) if report_text else {}
+    except Exception:
+        report = {}
+    report_ok = bool(report.get("ok", returned_ok))
+    if not report_ok or errors:
+        detail = " | ".join(errors) or report_text or "unknown normalization failure"
+        raise RuntimeError(f"{label} normalization failed: {asset_path} ({detail})")
+
+    _NORMALIZED_MATERIAL_LAYER_ASSETS.add(cache_key)
+    changed = (
+        report.get("removed_placeholder_count", 0)
+        or report.get("removed_set_declaration_count", 0)
+        or report.get("removed_get_declaration_count", 0)
+        or report.get("restored_tree_input_count", 0)
+    )
+    if changed:
+        _log(f"  {label} normalized: {asset_path}")
+
+
+def _call_set_material_instance_background_layer(helper, mi, layer_asset):
+    if hasattr(helper, "set_material_instance_background_layer_report"):
+        result = helper.set_material_instance_background_layer_report(mi, layer_asset)
+        ok = False
+        report_json = ""
+        errors = []
+        if isinstance(result, tuple):
+            if result and isinstance(result[0], bool):
+                ok = bool(result[0])
+                report_json = str(result[1] if len(result) > 1 else "")
+                if len(result) > 2:
+                    errors = [str(item) for item in (result[2] or [])]
+            elif result and isinstance(result[0], str):
+                report_json = result[0]
+                if len(result) > 1:
+                    errors = [str(item) for item in (result[1] or [])]
+        elif isinstance(result, str):
+            report_json = result
+        else:
+            ok = bool(result)
+        if report_json:
+            try:
+                report = json.loads(report_json)
+                errors.extend(str(item) for item in (report.get("errors") or []))
+                ok = bool(report.get("ok", ok) or report.get("desired_is_set"))
+            except Exception as exc:
+                return False, [f"background layer report parse failed: {exc}"]
+        return ok, errors
+    if hasattr(helper, "set_material_instance_background_layer_with_errors"):
+        result = helper.set_material_instance_background_layer_with_errors(mi, layer_asset)
+        if isinstance(result, tuple):
+            changed = bool(result[0]) if result else False
+            errors = result[1] if len(result) > 1 else []
+            return changed, list(errors or [])
+        return bool(result), []
+    return bool(helper.set_material_instance_background_layer(mi, layer_asset)), []
+
+
 def _assign_material_layer_instance(mi, mat_base: str, layer_maps, preset: dict, entry: dict) -> bool:
     helper = getattr(unreal, "CodexMaterialToolsLibrary", None)
     if not helper or not hasattr(helper, "create_or_update_material_layer_instance"):
         _warn("  CodexMaterialTools layer instance helper missing; MYI assignment skipped")
         return False
-    if not hasattr(helper, "set_material_instance_background_layer"):
+    if not (
+        hasattr(helper, "set_material_instance_background_layer_report")
+        or hasattr(helper, "set_material_instance_background_layer_with_errors")
+        or hasattr(helper, "set_material_instance_background_layer")
+    ):
         _warn("  CodexMaterialTools background layer helper missing; MYI assignment skipped")
         return False
 
@@ -1578,6 +1729,19 @@ def _assign_material_layer_instance(mi, mat_base: str, layer_maps, preset: dict,
     if not parent_layer or not layer_path:
         _warn("  material layer instance path is incomplete; MYI assignment skipped")
         return False
+
+    _normalize_material_layer_asset(
+        helper,
+        "normalize_material_layer_placeholders",
+        str(preset.get("master") or ""),
+        "material master",
+    )
+    _normalize_material_layer_asset(
+        helper,
+        "normalize_material_function_attribute_nodes",
+        parent_layer,
+        "material layer function",
+    )
 
     remap = _layer_texture_remap(preset, entry)
     texture_params = {}
@@ -1612,8 +1776,22 @@ def _assign_material_layer_instance(mi, mat_base: str, layer_maps, preset: dict,
         _warn(f"  MYI load failed after create/update: {layer_path}")
         return False
 
-    changed = bool(helper.set_material_instance_background_layer(mi, layer_asset))
-    changed = _prune_texture_parameter_overrides(mi, set()) or changed
+    # Remove stale flat/layer overrides before the C++ helper persists the MI.
+    # Do not trigger a live material preview update here; UE 5.8 can assert
+    # while compiling a newly-created Material Layer Instance thumbnail.
+    overrides_pruned = _prune_texture_parameter_overrides(mi, set(), update=False)
+    changed, background_errors = _call_set_material_instance_background_layer(
+        helper, mi, layer_asset
+    )
+    if background_errors:
+        _warn(f"  background MYI assignment failed: {layer_path}")
+        for error in background_errors:
+            _warn(f"    {error}")
+        return False
+    if not changed:
+        _warn(f"  background MYI assignment not verified: {layer_path}")
+        return False
+    changed = overrides_pruned or changed
     _log(f"  background MYI <- {layer_path}")
     return changed
 
@@ -1651,13 +1829,20 @@ def _hair_target_material_name(mat_name: str, entry: dict) -> str:
 
 
 def _hair_target_material_path(mat_name: str, entry: dict, preset: dict):
-    target_path = _entry_target_material_path(entry)
-    if target_path:
-        return target_path
     folder = str(preset.get("mi_folder") or "").rstrip("/")
     target_name = _hair_target_material_name(mat_name, entry)
     if not folder or not target_name:
         return None
+    target_path = _entry_target_material_path(entry)
+    if target_path:
+        normalized_target = str(target_path).replace("\\", "/").casefold()
+        normalized_folder = f"{folder}/".replace("\\", "/").casefold()
+        if normalized_target.startswith(normalized_folder):
+            return target_path
+        _warn(
+            f"  ignoring non-hair target material path for hair '{mat_name}': "
+            f"{target_path}"
+        )
     return f"{folder}/{target_name}"
 
 
@@ -1717,6 +1902,58 @@ def _hair_source_material_paths(mat_name: str, entry: dict, preset: dict):
     )
 
 
+def _asset_base_material_path(asset):
+    if asset is None or not hasattr(asset, "get_base_material"):
+        return ""
+    try:
+        base_material = asset.get_base_material()
+    except Exception:
+        return ""
+    try:
+        return str(base_material.get_path_name())
+    except Exception:
+        return str(base_material or "")
+
+
+def _wrong_generated_hair_material_paths(mat_name: str, entry: dict, preset: dict, target_path: str):
+    target_name = _hair_target_material_name(mat_name, entry)
+    candidates = set()
+
+    entry_target_path = _entry_target_material_path(entry)
+    if entry_target_path and entry_target_path != target_path:
+        candidates.add(entry_target_path)
+
+    for path in _asset_paths_named(
+        [target_name],
+        allowed_classes={"MaterialInstanceConstant"},
+    ):
+        if path == target_path:
+            continue
+        if _asset_path_excluded(path, preset.get("exclude_path_fragments")):
+            candidates.add(path)
+
+    wrong_paths = []
+    for path in sorted(candidates):
+        asset = unreal.load_asset(path)
+        base_path = _asset_base_material_path(asset).replace("\\", "/").casefold()
+        if "/game/material/assetsurface/" in base_path:
+            wrong_paths.append(path)
+    return wrong_paths
+
+
+def _delete_wrong_generated_hair_materials(mat_name: str, entry: dict, preset: dict, target_path: str):
+    deleted = []
+    for wrong_path in _wrong_generated_hair_material_paths(mat_name, entry, preset, target_path):
+        if not unreal.EditorAssetLibrary.does_asset_exist(wrong_path):
+            continue
+        if unreal.EditorAssetLibrary.delete_asset(wrong_path):
+            deleted.append(wrong_path)
+            _log(f"  deleted wrong generated hair MI: {wrong_path}")
+        else:
+            _warn(f"  wrong generated hair MI delete failed: {wrong_path}")
+    return deleted
+
+
 def _load_or_migrate_hair_material(asset_tools, mat_name: str, entry: dict, preset: dict):
     target_path = _hair_target_material_path(mat_name, entry, preset)
     if not target_path:
@@ -1735,9 +1972,11 @@ def _load_or_migrate_hair_material(asset_tools, mat_name: str, entry: dict, pres
             _warn(f"  hair MI move/rename failed: {source_path} -> {target_path}")
             return None, None
         _log(f"  hair MI moved: {source_path} -> {target_path}")
+        _delete_wrong_generated_hair_materials(mat_name, entry, preset, target_path)
         return unreal.load_asset(target_path), target_path
 
     if unreal.EditorAssetLibrary.does_asset_exist(target_path):
+        _delete_wrong_generated_hair_materials(mat_name, entry, preset, target_path)
         return unreal.load_asset(target_path), target_path
 
     _warn(f"  hair material instance source missing for '{mat_name}' -> target {target_path}")
@@ -1889,6 +2128,49 @@ def _cleanup_imported_source_assets(mesh_path: str, data: dict):
         _log(f"  cleanup: no source material/texture assets found in {mesh_folder} ({elapsed:.2f}s)")
 
 
+def preflight_mesh_materials(mesh_path: str, json_path: str = None) -> bool:
+    """Normalize shared material-layer assets before Unreal touches an existing mesh.
+
+    A skeletal-mesh reimport recompiles its currently assigned material instances
+    during ImportAssetTasks.  Legacy SpeedTree layers therefore have to be repaired
+    before the FBX import, not from post_import after it.
+    """
+    mesh_path = mesh_path.split(".")[0]
+    mesh_name = mesh_path.rsplit("/", 1)[-1]
+    data = _load_json(mesh_name, json_path, mesh_path)
+    if not data:
+        return False
+
+    helper = getattr(unreal, "CodexMaterialToolsLibrary", None)
+    if helper is None:
+        raise RuntimeError("CodexMaterialTools material preflight helper missing")
+
+    normalized = False
+    for entry in data.get("materials", []):
+        preset = _master_preset(data, entry, mesh_path)
+        if preset.get("assignment") != "material_layer_instance":
+            continue
+        master_path = str(preset.get("master") or "")
+        parent_layer = _layer_parent_path(preset, entry)
+        if master_path:
+            _normalize_material_layer_asset(
+                helper,
+                "normalize_material_layer_placeholders",
+                master_path,
+                "material master",
+            )
+            normalized = True
+        if parent_layer:
+            _normalize_material_layer_asset(
+                helper,
+                "normalize_material_function_attribute_nodes",
+                parent_layer,
+                "material layer function",
+            )
+            normalized = True
+    return normalized
+
+
 def process_mesh(mesh_path: str, master_mat=None, json_path: str = None) -> bool:
     """단일 StaticMesh/SkeletalMesh 를 JSON 기반으로 처리. 변경이 있었으면 True.
 
@@ -1902,16 +2184,28 @@ def process_mesh(mesh_path: str, master_mat=None, json_path: str = None) -> bool
     mesh_name = mesh_path.rsplit("/", 1)[-1]
     data = _load_json(mesh_name, json_path, mesh_path)
 
+    def save_mesh_asset():
+        if _is_skeletal_mesh(mesh):
+            helper = getattr(unreal, "CodexMaterialToolsLibrary", None)
+            if not helper or not hasattr(helper, "save_asset_package_without_thumbnail"):
+                raise RuntimeError(
+                    "CodexMaterialTools safe skeletal-mesh save helper is missing"
+                )
+            if not helper.save_asset_package_without_thumbnail(mesh):
+                raise RuntimeError(f"safe skeletal-mesh save failed: {mesh_path}")
+            return
+        unreal.EditorAssetLibrary.save_asset(mesh_path)
+
     # Nanite: import 되는 StaticMesh 에 켜되, 반투명 머티리얼 메쉬는 끈다.
     # (JSON 이 없으면 불투명으로 가정 → 켬. 반투명으로 판정되면 이미 켜져 있어도 끈다.)
     if ENABLE_NANITE:
         nanite_enabled = not _is_translucent(data)
         if isinstance(mesh, unreal.StaticMesh) and _set_nanite(mesh, nanite_enabled):
-            unreal.EditorAssetLibrary.save_asset(mesh_path)
+            save_mesh_asset()
         elif _is_skeletal_mesh(mesh):
             voxelize = _nanite_shape_preservation_voxelize() if ENABLE_SKELETAL_NANITE_VOXELIZE else None
             if _set_nanite(mesh, nanite_enabled, voxelize):
-                unreal.EditorAssetLibrary.save_asset(mesh_path)
+                save_mesh_asset()
 
     if data is None:
         _warn(f"JSON 사이드카 없음: {mesh_name}.json — skip (블렌더에서 Rename 버튼을 눌렀나요?)")
@@ -1923,7 +2217,7 @@ def process_mesh(mesh_path: str, master_mat=None, json_path: str = None) -> bool
     if json_mesh_name and json_mesh_name != mesh_name:
         _warn(f"JSON mesh_name mismatch: asset={mesh_name}, json={json_mesh_name}; using JSON data")
     if _import_dynamic_wind_if_available(mesh, mesh_path, mesh_name, data, json_path):
-        unreal.EditorAssetLibrary.save_asset(mesh_path)
+        save_mesh_asset()
         changed = True
 
     # 텍스처 재import 회피 캐시(메쉬마다 reload 되므로 디스크에서 읽고, 바뀌면 끝에 저장).
@@ -2016,8 +2310,10 @@ def process_mesh(mesh_path: str, master_mat=None, json_path: str = None) -> bool
                 entry=entry,
                 mat_base=mat_base,
             )
-            if mi_created or parent_changed or params_changed:
+            if (mi_created or parent_changed or params_changed) and preset["assignment"] != "material_layer_instance":
                 unreal.EditorAssetLibrary.save_asset(mi_path)
+                changed = True
+            elif mi_created or parent_changed or params_changed:
                 changed = True
             if _is_skeletal_mesh(mesh):
                 skeletal_slot_assignments[slot_index] = (slot_name, mi)
@@ -2064,8 +2360,10 @@ def process_mesh(mesh_path: str, master_mat=None, json_path: str = None) -> bool
             entry=entry,
             mat_base=mat_base,
         )
-        if mi_created or parent_changed or params_changed:
+        if (mi_created or parent_changed or params_changed) and preset["assignment"] != "material_layer_instance":
             unreal.EditorAssetLibrary.save_asset(mi_path)
+            changed = True
+        elif mi_created or parent_changed or params_changed:
             changed = True
 
         # 4. 슬롯에 MI 할당
@@ -2085,7 +2383,7 @@ def process_mesh(mesh_path: str, master_mat=None, json_path: str = None) -> bool
     _cleanup_imported_source_assets(mesh_path, data)
 
     if changed:
-        unreal.EditorAssetLibrary.save_asset(mesh_path)
+        save_mesh_asset()
         _log(f"메쉬 '{mesh_name}' 완료")
 
     # 마지막으로 브라우저를 메쉬로 돌려 선택 상태로 끝낸다(텍스처 폴더로 튀는 것 방지).

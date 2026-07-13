@@ -2,7 +2,7 @@
 
 import bpy
 from . import armature_modifier_fix, utilities
-from ..constants import BlenderTypes
+from ..constants import BlenderTypes, ToolInfo
 
 
 STATE_KEY = 'send2ue_hair_tool_export_state'
@@ -93,7 +93,15 @@ def _get_head_bone_name(armature_object):
     )
 
 
-def _attribute_scalar(mesh, attribute, loop_index):
+def _loop_to_polygon_indices(mesh):
+    loop_to_polygon = [0] * len(mesh.loops)
+    for polygon in mesh.polygons:
+        for loop_index in polygon.loop_indices:
+            loop_to_polygon[loop_index] = polygon.index
+    return loop_to_polygon
+
+
+def _attribute_scalar(mesh, attribute, loop_index, loop_to_polygon=None):
     if not attribute:
         return 0.0
 
@@ -103,7 +111,7 @@ def _attribute_scalar(mesh, attribute, loop_index):
     elif attribute.domain == 'CORNER':
         data_index = loop_index
     elif attribute.domain == 'FACE':
-        data_index = loop.polygon_index
+        data_index = loop_to_polygon[loop_index] if loop_to_polygon else 0
     else:
         return 0.0
 
@@ -121,6 +129,7 @@ def _pack_rsao(mesh):
     random_attribute = mesh.attributes.get('Random')
     system_color_attribute = mesh.attributes.get('SystemColor')
     ao_attribute = mesh.attributes.get('AO')
+    loop_to_polygon = _loop_to_polygon_indices(mesh)
 
     existing_rsao = mesh.attributes.get(RSAO_NAME)
     if existing_rsao:
@@ -133,9 +142,9 @@ def _pack_rsao(mesh):
     )
     for loop_index, color_item in enumerate(rsao.data):
         color_item.color = (
-            _attribute_scalar(mesh, random_attribute, loop_index),
-            _attribute_scalar(mesh, system_color_attribute, loop_index),
-            _attribute_scalar(mesh, ao_attribute, loop_index),
+            _attribute_scalar(mesh, random_attribute, loop_index, loop_to_polygon),
+            _attribute_scalar(mesh, system_color_attribute, loop_index, loop_to_polygon),
+            _attribute_scalar(mesh, ao_attribute, loop_index, loop_to_polygon),
             1.0,
         )
 
@@ -145,6 +154,42 @@ def _pack_rsao(mesh):
 
     mesh.color_attributes.active_color = mesh.color_attributes[RSAO_NAME]
     mesh.color_attributes.render_color_index = mesh.color_attributes.find(RSAO_NAME)
+
+
+def _remove_empty_material_slots(scene_object):
+    mesh = scene_object.data
+    materials = [slot.material for slot in scene_object.material_slots]
+    if not materials or all(material is not None for material in materials):
+        return
+
+    valid_materials = []
+    old_to_new_index = {}
+    fallback_index = None
+    for old_index, material in enumerate(materials):
+        if material is None:
+            continue
+        if fallback_index is None:
+            fallback_index = old_index
+        old_to_new_index[old_index] = len(valid_materials)
+        valid_materials.append(material)
+
+    if fallback_index is None:
+        return
+
+    fallback_new_index = old_to_new_index[fallback_index]
+    for old_index, material in enumerate(materials):
+        if material is None:
+            old_to_new_index[old_index] = fallback_new_index
+
+    for polygon in mesh.polygons:
+        polygon.material_index = old_to_new_index.get(
+            polygon.material_index,
+            fallback_new_index,
+        )
+
+    mesh.materials.clear()
+    for material in valid_materials:
+        mesh.materials.append(material)
 
 
 def _evaluate_combined_ao(scene_object, state):
@@ -293,7 +338,7 @@ def _link_to_export_collection(scene_object, export_collection):
 
 def _asset_group_key(scene_object):
     """Group a Hair Tool system by its nearest exported Empty ancestor."""
-    export_collection = bpy.data.collections.get('Export')
+    export_collection = bpy.data.collections.get(ToolInfo.EXPORT_COLLECTION.value)
     exported_objects = set(export_collection.all_objects) if export_collection else set()
 
     parent = scene_object.parent
@@ -309,7 +354,7 @@ def prepare():
     """Create export-only mesh copies for Hair Tool systems in the Export collection."""
     cleanup()
 
-    export_collection = bpy.data.collections.get('Export')
+    export_collection = bpy.data.collections.get(ToolInfo.EXPORT_COLLECTION.value)
     if not export_collection:
         return
 
@@ -318,6 +363,7 @@ def prepare():
         for scene_object in export_collection.all_objects
         if (
             export_collection in scene_object.users_collection
+            and scene_object.visible_get()
             and is_hair_tool_object(scene_object)
         )
     ]
@@ -383,6 +429,7 @@ def prepare():
             _evaluate_combined_ao(temporary_object, state)
             _write_hair_tool_uvs(temporary_object.data)
             _pack_rsao(temporary_object.data)
+            _remove_empty_material_slots(temporary_object)
 
             armatures = {
                 armature
