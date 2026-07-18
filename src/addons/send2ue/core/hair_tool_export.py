@@ -8,7 +8,7 @@ from ..constants import BlenderTypes, ToolInfo
 STATE_KEY = 'send2ue_hair_tool_export_state'
 SOURCE_NAME_PROPERTY = '_send2ue_hair_tool_source_name'
 TEMP_PROPERTY = '_send2ue_hair_tool_temp'
-RSAO_NAME = 'RSAO'
+RFAOS_NAME = 'RFAOS'
 
 
 def is_hair_tool_object(scene_object):
@@ -101,9 +101,16 @@ def _loop_to_polygon_indices(mesh):
     return loop_to_polygon
 
 
-def _attribute_scalar(mesh, attribute, loop_index, loop_to_polygon=None):
+def _attribute_component(
+    mesh,
+    attribute,
+    loop_index,
+    component_index=0,
+    loop_to_polygon=None,
+    default=0.0,
+):
     if not attribute:
-        return 0.0
+        return default
 
     loop = mesh.loops[loop_index]
     if attribute.domain == 'POINT':
@@ -113,47 +120,76 @@ def _attribute_scalar(mesh, attribute, loop_index, loop_to_polygon=None):
     elif attribute.domain == 'FACE':
         data_index = loop_to_polygon[loop_index] if loop_to_polygon else 0
     else:
-        return 0.0
+        return default
 
     item = attribute.data[data_index]
     if hasattr(item, 'value'):
         return float(item.value)
     if hasattr(item, 'color'):
-        return float(item.color[0])
+        color = item.color
+        if component_index < len(color):
+            return float(color[component_index])
+        return default
     if hasattr(item, 'vector'):
-        return float(item.vector[0])
-    return 0.0
+        vector = item.vector
+        if component_index < len(vector):
+            return float(vector[component_index])
+        return default
+    return default
 
 
-def _pack_rsao(mesh):
+def _pack_rfaos(mesh):
+    """Pack Random/Factor/AO/SystemColor-alpha into the export vertex color."""
     random_attribute = mesh.attributes.get('Random')
+    factor_attribute = mesh.attributes.get('Factor')
     system_color_attribute = mesh.attributes.get('SystemColor')
     ao_attribute = mesh.attributes.get('AO')
     loop_to_polygon = _loop_to_polygon_indices(mesh)
 
-    existing_rsao = mesh.attributes.get(RSAO_NAME)
-    if existing_rsao:
-        mesh.attributes.remove(existing_rsao)
+    existing_rfaos = mesh.attributes.get(RFAOS_NAME)
+    if existing_rfaos:
+        mesh.attributes.remove(existing_rfaos)
 
-    rsao = mesh.color_attributes.new(
-        name=RSAO_NAME,
+    rfaos = mesh.color_attributes.new(
+        name=RFAOS_NAME,
         type='BYTE_COLOR',
         domain='CORNER',
     )
-    for loop_index, color_item in enumerate(rsao.data):
-        color_item.color = (
-            _attribute_scalar(mesh, random_attribute, loop_index, loop_to_polygon),
-            _attribute_scalar(mesh, system_color_attribute, loop_index, loop_to_polygon),
-            _attribute_scalar(mesh, ao_attribute, loop_index, loop_to_polygon),
-            1.0,
+    for loop_index, color_item in enumerate(rfaos.data):
+        packed = (
+            _attribute_component(
+                mesh, random_attribute, loop_index,
+                loop_to_polygon=loop_to_polygon,
+            ),
+            _attribute_component(
+                mesh, factor_attribute, loop_index,
+                loop_to_polygon=loop_to_polygon,
+            ),
+            _attribute_component(
+                mesh, ao_attribute, loop_index,
+                loop_to_polygon=loop_to_polygon,
+            ),
+            _attribute_component(
+                mesh, system_color_attribute, loop_index,
+                component_index=3,
+                loop_to_polygon=loop_to_polygon,
+            ),
         )
+        # BYTE_COLOR exposes ``color`` in scene-linear space, while FBX writes
+        # the underlying sRGB byte values. RFAOS contains data masks, not
+        # display colors, so write the sRGB-facing property to keep the numeric
+        # RGBA values unchanged when Unreal imports the FBX vertex colors.
+        if hasattr(color_item, 'color_srgb'):
+            color_item.color_srgb = packed
+        else:
+            color_item.color = packed
 
     for color_attribute in list(mesh.color_attributes):
-        if color_attribute.name != RSAO_NAME:
+        if color_attribute.name != RFAOS_NAME:
             mesh.color_attributes.remove(color_attribute)
 
-    mesh.color_attributes.active_color = mesh.color_attributes[RSAO_NAME]
-    mesh.color_attributes.render_color_index = mesh.color_attributes.find(RSAO_NAME)
+    mesh.color_attributes.active_color = mesh.color_attributes[RFAOS_NAME]
+    mesh.color_attributes.render_color_index = mesh.color_attributes.find(RFAOS_NAME)
 
 
 def _remove_empty_material_slots(scene_object):
@@ -354,6 +390,12 @@ def prepare():
     """Create export-only mesh copies for Hair Tool systems in the Export collection."""
     cleanup()
 
+    # The UE Groom path reads evaluated Curves directly. Only the Cards and
+    # Cards + Groom modes need temporary evaluated mesh copies.
+    from . import ue_groom_adapter
+    if not ue_groom_adapter.wants_cards(bpy.context.scene.send2ue):
+        return
+
     export_collection = bpy.data.collections.get(ToolInfo.EXPORT_COLLECTION.value)
     if not export_collection:
         return
@@ -428,7 +470,7 @@ def prepare():
 
             _evaluate_combined_ao(temporary_object, state)
             _write_hair_tool_uvs(temporary_object.data)
-            _pack_rsao(temporary_object.data)
+            _pack_rfaos(temporary_object.data)
             _remove_empty_material_slots(temporary_object)
 
             armatures = {

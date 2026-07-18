@@ -20,6 +20,7 @@ BUNDLED_PIPELINE_DIR = (Path(__file__).resolve().parent.parent / "pipeline").as_
 PIPELINE_DIR = BUNDLED_PIPELINE_DIR
 _TEXTURELESS_FBX_RESTORE = {}
 TEXTURELESS_FBX_EXPORT_FLAG = "send2ue_material_pipeline_textureless_fbx_export"
+MATERIAL_PIPELINE_JSON_PATH_KEY = "_material_pipeline_json_path"
 
 
 class MaterialPipelineExtension(ExtensionBase):
@@ -258,11 +259,14 @@ class MaterialPipelineExtension(ExtensionBase):
         }:
             return
         asset_path = asset_data.get("asset_path", "")
+        asset_data.pop(MATERIAL_PIPELINE_JSON_PATH_KEY, None)
         json_path = self._resolve_json_path(asset_path)
         if not json_path:
             return
+        json_path = str(json_path).replace("\\", "/")
+        asset_data[MATERIAL_PIPELINE_JSON_PATH_KEY] = json_path
 
-        json_arg = f'r"{json_path}"'
+        json_arg = repr(json_path)
         commands = [
             "import sys",
             "import importlib.util",
@@ -300,8 +304,10 @@ class MaterialPipelineExtension(ExtensionBase):
         if not asset_path:
             return
 
-        json_path = self._resolve_json_path(asset_path)
-        json_arg = f'r"{json_path}"' if json_path else "None"
+        json_path = asset_data.get(MATERIAL_PIPELINE_JSON_PATH_KEY)
+        if not json_path:
+            return
+        json_arg = repr(str(json_path))
 
         commands = [
             "import sys",
@@ -318,6 +324,9 @@ class MaterialPipelineExtension(ExtensionBase):
             "_spec.loader.exec_module(_p)",
             "def _sync_to_imported_asset(_path):",
             "\ttry:",
+            "\t\t_command_line = unreal.SystemLibrary.get_command_line().casefold()",
+            "\t\tif '-unattended' in _command_line or '-run=' in _command_line:",
+            "\t\t\treturn",
             "\t\tunreal.EditorAssetLibrary.sync_browser_to_objects([_path])",
             "\texcept Exception as _sync_error:",
             "\t\tunreal.log_warning('[material_pipeline] content browser sync failed: ' + str(_sync_error))",
@@ -339,7 +348,7 @@ class MaterialPipelineExtension(ExtensionBase):
         except Exception as exc:
             print(
                 "[material_pipeline] json_path resolve failed; "
-                f"falling back to pipeline search: {exc}"
+                f"automatic material pipeline skipped: {exc}"
             )
         return None
 

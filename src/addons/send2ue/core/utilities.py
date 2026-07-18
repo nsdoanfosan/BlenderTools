@@ -402,16 +402,19 @@ def get_hair_objects(properties):
         modifiers = get_particle_system_modifiers(mesh_object)
         hair_objects.extend([modifier.particle_system for modifier in modifiers])
 
-    # Live Hair Tool curve systems are converted to temporary mesh objects by
-    # hair_tool_export before validation. Do not also collect their source
-    # curves as Alembic Grooms. Ordinary curve Groom objects remain unchanged.
-    from . import hair_tool_export
+    # Hair Tool curves are normally consumed by the temporary card-mesh path.
+    # The UE Groom Adapter opts them into direct evaluated-Curves export without
+    # changing Hair Tool itself. Ordinary curve Groom objects remain unchanged.
+    from . import hair_tool_export, ue_groom_adapter
     hair_objects.extend([
         curves_object
         for curves_object in get_from_collection(BlenderTypes.CURVES)
         if (
-            not hair_tool_export.is_hair_tool_object(curves_object)
-            and not hair_tool_export.is_prepared_source(curves_object)
+            ue_groom_adapter.is_hair_tool_groom(curves_object, properties)
+            or (
+                not hair_tool_export.is_hair_tool_object(curves_object)
+                and not hair_tool_export.is_prepared_source(curves_object)
+            )
         )
     ])
     return hair_objects

@@ -162,7 +162,7 @@ class Send2Ue(bpy.types.Operator):
         extension.run_extension_tasks(ExtensionTasks.PRE_OPERATION.value)
 
         # Convert live Hair Tool systems to export-only mesh copies. These temporary
-        # objects carry a single RSAO color layer and optional head-bone skinning.
+        # objects carry a single RFAOS color layer and optional head-bone skinning.
         hair_tool_export.prepare()
 
         # Give meshes that live inside an armature but lack an armature modifier a

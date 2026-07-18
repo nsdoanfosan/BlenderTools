@@ -5,6 +5,7 @@ import json
 import time
 import sys
 import inspect
+from contextlib import contextmanager
 from xmlrpc.client import ProtocolError
 from http.client import RemoteDisconnected
 
@@ -20,6 +21,20 @@ if os.environ.get('TEST_ENVIRONMENT'):
     UNREAL_PORT = int(os.environ.get('UNREAL_PORT', 8998))
 
 unreal_response = ''
+_COMMAND_RECORDING_STACK = []
+
+
+@contextmanager
+def record_commands():
+    """Capture extension Unreal command groups without contacting an editor."""
+    command_groups = []
+    _COMMAND_RECORDING_STACK.append(command_groups)
+    try:
+        yield command_groups
+    finally:
+        popped = _COMMAND_RECORDING_STACK.pop()
+        if popped is not command_groups:
+            raise RuntimeError('Send2UE Unreal command recorder stack mismatch.')
 
 
 def get_response():
@@ -140,6 +155,10 @@ def run_commands(commands):
     :param list commands: A formatted string of python commands that will be run by unreal engine.
     :return str: The stdout produced by the remote python command.
     """
+    if _COMMAND_RECORDING_STACK:
+        _COMMAND_RECORDING_STACK[-1].append(list(commands))
+        return ''
+
     from . import remote_execution
 
     # wrap the commands in a try except so that all exceptions can be logged in the output
@@ -462,6 +481,97 @@ class Unreal:
                 unreal.EditorAssetLibrary.delete_asset(temp_asset_path)
 
             return binding_asset_path
+
+    @staticmethod
+    def configure_groom_from_blender_preview(groom_asset, asset_data):
+        """Apply Blender preview width/taper/material values to an imported Groom."""
+        default_material_path = '/Game/Material/Groom/M_UE_Groom_HairTool_Preview'
+        material_path = asset_data.get(
+            '_ue_groom_material_path',
+            default_material_path,
+        )
+        source_material_path = '/HairStrands/Materials/HairDefaultMaterial'
+        material = unreal.load_asset(material_path)
+        if not material:
+            material = unreal.EditorAssetLibrary.duplicate_asset(
+                source_material_path,
+                material_path,
+            )
+        if not material:
+            raise RuntimeError(
+                f'Could not create Groom material {material_path} from {source_material_path}.'
+            )
+
+        # The default bridge material consumes the attributes exported by the
+        # Blender Hair Tool adapter.  Never rebuild an explicitly selected user
+        # material: it may contain a hand-authored graph that Send to Unreal
+        # does not own.
+        if material_path == default_material_path:
+            graph_version = 'HairToolAttributes_v1'
+            version_tag = 'Send2UEGroomGraphVersion'
+            current_version = unreal.EditorAssetLibrary.get_metadata_tag(
+                material,
+                version_tag,
+            )
+            if current_version != graph_version:
+                unreal.MaterialEditingLibrary.delete_all_material_expressions(material)
+                hair_attributes = unreal.MaterialEditingLibrary.create_material_expression(
+                    material,
+                    unreal.MaterialExpressionHairAttributes,
+                    -360,
+                    0,
+                )
+                hair_attributes.set_editor_property(
+                    'desc',
+                    'Hair Tool evaluated Base->Root->Tip->SystemColor, roughness and AO',
+                )
+                for output_name, material_property in (
+                    ('BaseColor', unreal.MaterialProperty.MP_BASE_COLOR),
+                    ('Roughness', unreal.MaterialProperty.MP_ROUGHNESS),
+                    ('AO', unreal.MaterialProperty.MP_AMBIENT_OCCLUSION),
+                ):
+                    unreal.MaterialEditingLibrary.connect_material_property(
+                        hair_attributes,
+                        output_name,
+                        material_property,
+                    )
+                material.set_editor_property(
+                    'shading_model',
+                    unreal.MaterialShadingModel.MSM_HAIR,
+                )
+                material.set_editor_property('two_sided', True)
+                material.set_editor_property('used_with_hair_strands', True)
+                unreal.EditorAssetLibrary.set_metadata_tag(
+                    material,
+                    version_tag,
+                    graph_version,
+                )
+                unreal.MaterialEditingLibrary.recompile_material(material)
+
+        slot_name = material_path.rsplit('/', 1)[-1]
+        material_group = unreal.HairGroupsMaterial()
+        material_group.set_editor_property('slot_name', slot_name)
+        material_group.set_editor_property('material', material)
+        groom_asset.set_editor_property('hair_groups_materials', [material_group])
+
+        hair_width = asset_data.get('_ue_groom_hair_width_cm')
+        root_scale = asset_data.get('_ue_groom_root_scale')
+        tip_scale = asset_data.get('_ue_groom_tip_scale')
+        rendering_groups = list(groom_asset.get_editor_property('hair_groups_rendering'))
+        for rendering_group in rendering_groups:
+            geometry = rendering_group.get_editor_property('geometry_settings')
+            if hair_width is not None:
+                geometry.set_editor_property('hair_width', float(hair_width))
+                geometry.set_editor_property('hair_width_override', True)
+            if root_scale is not None:
+                geometry.set_editor_property('hair_root_scale', float(root_scale))
+            if tip_scale is not None:
+                geometry.set_editor_property('hair_tip_scale', float(tip_scale))
+            rendering_group.set_editor_property('geometry_settings', geometry)
+        groom_asset.set_editor_property('hair_groups_rendering', rendering_groups)
+
+        unreal.EditorAssetLibrary.save_loaded_asset(material, only_if_is_dirty=False)
+        return material.get_path_name()
 
     @staticmethod
     def create_blueprint_asset(blueprint_asset_path):
@@ -867,6 +977,56 @@ class UnrealImportAsset(Unreal):
         # set the groom import options
         self.set_groom_import_options()
 
+    def set_usd_groom_import_task_options(self):
+        """Configure Unreal 5.8's USD Stage importer for a Groom asset."""
+        self.set_import_task_options()
+        options = unreal.UsdStageImportOptions()
+        options.set_editor_property('import_actors', False)
+        options.set_editor_property('import_geometry', True)
+        options.set_editor_property('import_skeletal_animations', False)
+        options.set_editor_property('import_level_sequences', False)
+        options.set_editor_property('import_materials', False)
+        options.set_editor_property('import_groom_assets', True)
+        options.set_editor_property('prim_path_folder_structure', False)
+
+        group_count = max(int(self._asset_data.get('_ue_groom_group_count', 1)), 1)
+        preset = self._asset_data.get('_ue_groom_deformation_preset')
+        interpolation_groups = []
+        for _group_index in range(group_count):
+            group = unreal.HairGroupsInterpolation()
+            interpolation = group.get_editor_property('interpolation_settings')
+            if preset == 'UE_RIGGED_GUIDES':
+                interpolation.set_editor_property('guide_type', unreal.GroomGuideType.RIGGED)
+                interpolation.set_editor_property(
+                    'rigged_guide_num_curves',
+                    int(self._asset_data.get('_ue_groom_rigged_guide_num_curves', 64)),
+                )
+                interpolation.set_editor_property(
+                    'rigged_guide_num_points',
+                    int(self._asset_data.get('_ue_groom_rigged_guide_num_points', 8)),
+                )
+            else:
+                interpolation.set_editor_property('guide_type', unreal.GroomGuideType.GENERATED)
+                interpolation.set_editor_property('hair_to_guide_density', 0.1)
+
+            # Low/Root avoids the expensive shape-matching build while keeping
+            # root proximity stable for the initial Blender-to-UE handoff.
+            interpolation.set_editor_property(
+                'interpolation_quality',
+                unreal.HairInterpolationQuality.LOW,
+            )
+            interpolation.set_editor_property(
+                'interpolation_distance',
+                unreal.HairInterpolationWeight.ROOT,
+            )
+            interpolation.set_editor_property('randomize_guide', False)
+            interpolation.set_editor_property('use_unique_guide', False)
+            group.set_editor_property('interpolation_settings', interpolation)
+            interpolation_groups.append(group)
+
+        options.set_editor_property('groom_interpolation_settings', interpolation_groups)
+        self._options = options
+
     def set_import_task_options(self):
         """
         Sets common import options.
@@ -1082,11 +1242,24 @@ class UnrealRemoteCalls:
         :returns: Returns a list of missing plugins if any.
         :rtype: list[str]
         """
+        # Query Unreal's live plugin manager first. Reading only the .uproject
+        # misses engine plugins that are enabled by default or pulled in as a
+        # dependency (notably HairStrands and USDImporter in UE 5.8).
+        plugin_library = getattr(unreal, 'PluginBlueprintLibrary', None)
+        if plugin_library:
+            return list(plugin_library.get_enabled_plugin_names())
+
+        # Compatibility fallback for older engine versions without the
+        # Blueprint plugin utility library.
         uproject_path = unreal.Paths.get_project_file_path()
         with open(uproject_path, 'r') as uproject:
             project_data = json.load(uproject)
 
-        return [plugin.get('Name') for plugin in project_data.get('Plugins', {}) if plugin.get('Enabled')]
+        return [
+            plugin.get('Name')
+            for plugin in project_data.get('Plugins', [])
+            if plugin.get('Enabled')
+        ]
 
     @staticmethod
     def get_project_settings_value(config_name, section_name, setting_name):
@@ -1274,9 +1447,28 @@ class UnrealRemoteCalls:
                 unreal_import_asset.set_fbx_import_task_options()
             elif file_type.lower() == '.abc':
                 unreal_import_asset.set_abc_import_task_options()
+            elif file_type.lower() in {'.usd', '.usda', '.usdc'} and asset_data.get('_ue_groom_adapter'):
+                unreal_import_asset.set_usd_groom_import_task_options()
 
             # run the import task
-            return unreal_import_asset.run_import()
+            imported_object_paths = unreal_import_asset.run_import()
+            if asset_data.get('_ue_groom_adapter'):
+                result = {'imported_object_paths': imported_object_paths}
+                for imported_object_path in imported_object_paths:
+                    imported_asset = unreal.load_asset(imported_object_path)
+                    if imported_asset and imported_asset.__class__.__name__ == 'GroomAsset':
+                        result['groom_asset_path'] = imported_asset.get_outermost().get_name()
+                        result['groom_material_path'] = Unreal.configure_groom_from_blender_preview(
+                            imported_asset,
+                            asset_data,
+                        )
+                        unreal.EditorAssetLibrary.save_loaded_asset(
+                            imported_asset,
+                            only_if_is_dirty=False,
+                        )
+                        break
+                return result
+            return imported_object_paths
 
     @staticmethod
     def create_asset(asset_path, asset_class=None, asset_factory=None, unique_name=True):
