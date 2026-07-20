@@ -264,12 +264,13 @@ LAYER_PARAM_BY_LEGACY_PARAM = {
     "Texture": "Albedo",
 }
 
-# Parameters initialized from Blender only when a Hair Tool MI is first created.
-# Existing instances own these values so artist edits survive later re-exports.
+# Unreal-owned Hair Tool controls. Blender sidecars intentionally omit these,
+# and existing instance overrides must survive every later re-export.
 HAIR_INSTANCE_OWNED_SCALAR_PARAMETERS = {
     "System Color Influence",
     "System Mask Contrast",
     "System Mask Bias",
+    "System Mask Invert",
     "Roughness Multiplier",
 }
 HAIR_INSTANCE_OWNED_VECTOR_PARAMETERS = {
@@ -3074,15 +3075,24 @@ def _ensure_hair_master_skeletal_mesh_usage(mi) -> bool:
         _warn("  hair MI base material missing; skeletal usage could not be checked")
         return False
     try:
-        if bool(master.get_editor_property("used_with_skeletal_mesh")):
+        changed = False
+        if not bool(master.get_editor_property("used_with_skeletal_mesh")):
+            master.set_editor_property("used_with_skeletal_mesh", True)
+            changed = True
+        try:
+            if not bool(master.get_editor_property("used_with_nanite")):
+                master.set_editor_property("used_with_nanite", True)
+                changed = True
+        except Exception:
+            pass
+        if not changed:
             return False
-        master.set_editor_property("used_with_skeletal_mesh", True)
         compile_errors = unreal.MaterialEditingLibrary.recompile_material(master) or []
         for error in compile_errors:
             _warn(f"  hair master skeletal shader compile: {error}")
         master_path = master.get_path_name().split(".")[0]
         unreal.EditorAssetLibrary.save_asset(master_path, only_if_is_dirty=False)
-        _log(f"  enabled hair master skeletal mesh usage: {master_path}")
+        _log(f"  enabled hair master skeletal/Nanite usage: {master_path}")
         return True
     except Exception as exc:
         _warn(f"  failed to enable hair master skeletal mesh usage: {exc}")

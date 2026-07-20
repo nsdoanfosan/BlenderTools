@@ -654,7 +654,7 @@ def _map_range_clamped(value, from_min, from_max, to_min, to_max):
 
 
 def _bake_hair_tool_colors(curves, starts, counts, settings):
-    """Bake HairShaderMain's Base→Root→Tip→SystemColor rule per point."""
+    """Bake HairShaderMain's Blender-owned Base→Root→Tip rule per point."""
     by_name = {attribute.name.casefold(): attribute for attribute in curves.attributes}
     factor_attribute = by_name.get('factor')
     factors = _point_values(factor_attribute, starts, counts)
@@ -665,11 +665,6 @@ def _bake_hair_tool_colors(curves, starts, counts, settings):
             factors.extend(index / denominator for index in range(count))
     factors = [float(value) for value in factors]
 
-    system_attribute = by_name.get('systemcolor')
-    system_colors = _point_values(system_attribute, starts, counts)
-    if system_colors is None:
-        system_colors = [(0.0, 0.0, 0.0)] * sum(counts)
-
     random_attribute = by_name.get('random')
     random_values = _point_values(random_attribute, starts, counts)
     if random_values is None:
@@ -677,8 +672,11 @@ def _bake_hair_tool_colors(curves, starts, counts, settings):
 
     root_range = _clamp01(settings['root_range'])
     tip_range = _clamp01(settings['tip_range'])
+    root_mix = float(settings['root_mix'])
+    tip_mix = float(settings['tip_mix'])
+    range_epsilon = 1e-12
     colors = []
-    for factor, system_color, random_value in zip(factors, system_colors, random_values):
+    for factor, random_value in zip(factors, random_values):
         if isinstance(random_value, (tuple, list)):
             random_value = random_value[0]
         random_value = float(random_value)
@@ -688,10 +686,13 @@ def _bake_hair_tool_colors(curves, starts, counts, settings):
             random_value + settings['root_texture_brightness'],
             settings['root_texture_overlay'],
         )
-        root_weight = _clamp01(
-            _map_range_clamped(factor, 0.0, root_range, root_extent, 0.0)
-            * settings['root_mix']
-        )
+        if root_range <= range_epsilon or root_mix <= 0.0:
+            root_weight = 0.0
+        else:
+            root_weight = _clamp01(
+                _map_range_clamped(factor, 0.0, root_range, root_extent, 0.0)
+                * root_mix
+            )
         color = tuple(
             _lerp(settings['base_color'][channel], settings['root_color'][channel], root_weight)
             for channel in range(3)
@@ -702,21 +703,19 @@ def _bake_hair_tool_colors(curves, starts, counts, settings):
             random_value + settings['tip_texture_brightness'],
             settings['tip_texture_overlay'],
         )
-        tip_weight = _clamp01(
-            _map_range_clamped(factor, 1.0 - tip_range, 1.0, 0.0, tip_extent)
-            * settings['tip_mix']
-        )
+        if tip_range <= range_epsilon or tip_mix <= 0.0:
+            tip_weight = 0.0
+        else:
+            tip_weight = _clamp01(
+                _map_range_clamped(factor, 1.0 - tip_range, 1.0, 0.0, tip_extent)
+                * tip_mix
+            )
         color = tuple(
             _lerp(color[channel], settings['tip_color'][channel], tip_weight)
             for channel in range(3)
         )
-
-        system_color = tuple(float(component) for component in system_color[:3])
-        colors.append(tuple(
-            color[channel] + system_color[channel] * settings['system_color_mix']
-            for channel in range(3)
-        ))
-    return colors, factor_attribute is not None, system_attribute is not None
+        colors.append(color)
+    return colors, factor_attribute is not None
 
 
 def _mapping_error(report, adapter, kind, attribute):
@@ -1004,25 +1003,21 @@ def inspect_object(scene_object, properties=None):
     ):
         colors = _point_values(color_attribute, starts, counts)
     elif hair_tool_color:
-        colors, has_factor, has_system_color = _bake_hair_tool_colors(
+        colors, has_factor = _bake_hair_tool_colors(
             curves, starts, counts, hair_tool_color
         )
         report['mappings']['color'] = (
             f'{hair_tool_color["material"]}:{hair_tool_color["node"]} '
-            '(Base→Root→Tip→SystemColor)'
+            '(Base→Root→Tip)'
         )
         if not has_factor:
             report['warnings'].append(
                 'Hair Tool Factor 속성이 없어 커브 길이 기준 0~1 Factor를 사용합니다.'
             )
-        if hair_tool_color['system_color_mix'] and not has_system_color:
-            report['warnings'].append(
-                'SystemColor 속성이 없어 Hair Tool 시스템 컬러 가산값은 0으로 사용합니다.'
-            )
         if hair_tool_color['texture_inputs']:
             report['warnings'].append(
                 'Hair Tool 카드 프로필 텍스처 입력은 네이티브 Groom에 직접 대응하지 않아 '
-                'Root/Tip/SystemColor 코어 규칙만 groom_color에 베이크합니다: '
+                'Base/Root/Tip 코어 규칙만 groom_color에 베이크합니다: '
                 + ', '.join(hair_tool_color['texture_inputs'])
             )
     else:
