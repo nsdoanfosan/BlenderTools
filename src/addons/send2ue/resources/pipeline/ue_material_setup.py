@@ -1307,6 +1307,12 @@ def _master_preset(data: dict, entry: dict = None, mesh_path: str = "") -> dict:
     result = dict(preset)
     if key == "tree":
         result.update(_tree_preset_contract_overlay())
+    scope = data.get("codex_test_asset_scope")
+    if isinstance(scope, dict) and _is_codex_test_asset_path(mesh_path):
+        scope_root = str(scope.get("root") or "").rstrip("/")
+        if _is_codex_test_asset_path(scope_root):
+            result["mi_folder"] = scope_root + "/MI"
+            result["layer_instance_folder"] = scope_root + "/MYI"
     result["key"] = key
     if tree_part:
         result["tree_part"] = tree_part
@@ -2502,6 +2508,38 @@ def _layer_instance_path(mat_base: str, preset: dict, entry: dict):
     return f"{folder}/MYI_{base}"
 
 
+def _validate_codex_test_material_scope(data: dict, mesh_path: str) -> bool:
+    if not _is_codex_test_asset_path(mesh_path):
+        return False
+    scope = data.get("codex_test_asset_scope")
+    if not isinstance(scope, dict):
+        raise RuntimeError(
+            "Codex test material sidecar has no isolated asset scope contract"
+        )
+    root = str(scope.get("root") or "").rstrip("/")
+    if not _is_codex_test_asset_path(root):
+        raise RuntimeError("Codex test material scope root is outside /Game/Codex/Tests")
+    for entry in data.get("materials", []):
+        target_path = _entry_target_material_path(entry)
+        if not target_path or not target_path.startswith(root + "/MI/"):
+            raise RuntimeError(
+                "Codex test material target is outside the isolated MI scope"
+            )
+        material_layer = entry.get("material_layer")
+        if not isinstance(material_layer, dict):
+            raise RuntimeError("Codex test material has no isolated layer target")
+        layer_path = str(
+            material_layer.get("instance_path")
+            or material_layer.get("path")
+            or ""
+        ).split(".", 1)[0]
+        if not layer_path.startswith(root + "/MYI/"):
+            raise RuntimeError(
+                "Codex test layer target is outside the isolated MYI scope"
+            )
+    return True
+
+
 def _layer_parent_path(preset: dict, entry: dict):
     material_layer = entry.get("material_layer") if isinstance(entry.get("material_layer"), dict) else {}
     for key in ("parent", "parent_layer"):
@@ -2639,7 +2677,24 @@ def _call_create_or_update_layer_instance(helper, parent_layer, layer_path, text
 _NORMALIZED_MATERIAL_LAYER_ASSETS = set()
 
 
-def _normalize_material_layer_asset(helper, method_name: str, asset_path: str, label: str):
+def _is_codex_test_asset_path(asset_path: str) -> bool:
+    package_path = str(asset_path or "").split(".", 1)[0].replace("\\", "/")
+    return package_path.casefold().startswith("/game/codex/tests/")
+
+
+def _normalize_material_layer_asset(
+    helper,
+    method_name: str,
+    asset_path: str,
+    label: str,
+    mutation_scope_path: str = "",
+):
+    if (
+        _is_codex_test_asset_path(mutation_scope_path)
+        and not _is_codex_test_asset_path(asset_path)
+    ):
+        _log(f"  {label} kept read-only for isolated test: {asset_path}")
+        return
     cache_key = (method_name, asset_path)
     if cache_key in _NORMALIZED_MATERIAL_LAYER_ASSETS:
         return
@@ -2749,12 +2804,14 @@ def _assign_material_layer_instance(mi, mat_base: str, layer_maps, preset: dict,
         "normalize_material_layer_placeholders",
         str(preset.get("master") or ""),
         "material master",
+        mutation_scope_path=layer_path,
     )
     _normalize_material_layer_asset(
         helper,
         "normalize_material_function_attribute_nodes",
         parent_layer,
         "material layer function",
+        mutation_scope_path=layer_path,
     )
 
     remap = _layer_texture_remap(preset, entry)
@@ -3304,7 +3361,10 @@ def _material_pipeline_mutation_paths(mesh_path: str, data: dict) -> list:
             if layer_path:
                 paths.append(layer_path)
 
-    return list(dict.fromkeys(path.split(".")[0] for path in paths if path))
+    paths = list(dict.fromkeys(path.split(".")[0] for path in paths if path))
+    if _is_codex_test_asset_path(mesh_path):
+        paths = [path for path in paths if _is_codex_test_asset_path(path)]
+    return paths
 
 
 def _checkout_material_pipeline_assets(mesh_path: str, data: dict) -> list:
@@ -3343,6 +3403,7 @@ def preflight_mesh_materials(mesh_path: str, json_path: str = None) -> bool:
     if not data:
         return False
     _validate_speedtree_handoff_contract(data, mesh_name)
+    _validate_codex_test_material_scope(data, mesh_path)
 
     instance_profile_targets = _validate_instance_profile_targets(
         data, mesh_path
@@ -3370,6 +3431,7 @@ def preflight_mesh_materials(mesh_path: str, json_path: str = None) -> bool:
                 "normalize_material_layer_placeholders",
                 master_path,
                 "material master",
+                mutation_scope_path=mesh_path,
             )
             normalized = True
         if parent_layer:
@@ -3378,6 +3440,7 @@ def preflight_mesh_materials(mesh_path: str, json_path: str = None) -> bool:
                 "normalize_material_function_attribute_nodes",
                 parent_layer,
                 "material layer function",
+                mutation_scope_path=mesh_path,
             )
             normalized = True
     return normalized
@@ -3398,6 +3461,7 @@ def process_mesh(mesh_path: str, master_mat=None, json_path: str = None) -> bool
     asset_tools = None
     if data:
         _validate_speedtree_handoff_contract(data, mesh_name)
+        _validate_codex_test_material_scope(data, mesh_path)
         instance_profile_targets = _validate_instance_profile_targets(
             data, mesh_path
         )

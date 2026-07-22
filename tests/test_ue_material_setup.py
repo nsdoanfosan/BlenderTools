@@ -618,6 +618,112 @@ class TestUeMaterialTextureImport(unittest.TestCase):
         self.assertNotIn("/Game/Textures/T_Direct", paths)
         self.assertNotIn("/Game/Textures/T_Layer", paths)
 
+    def test_codex_test_mutation_paths_keep_production_references_read_only(self):
+        self.module._master_preset = lambda data, entry, mesh_path: {
+            "master": "/Game/Material/Tree/Master/M_Tree",
+            "assignment": "material_layer_instance",
+            "mi_folder": "/Game/Codex/Tests/Elm/_MaterialPipeline/MI",
+        }
+        self.module._layer_parent_path = (
+            lambda preset, entry: "/Game/Material/Tree/Layer/MY_Tree"
+        )
+        self.module._entry_target_material_path = (
+            lambda entry: "/Game/Codex/Tests/Elm/_MaterialPipeline/MI/MI_Bark"
+        )
+        self.module._layer_instance_path = (
+            lambda *args: "/Game/Codex/Tests/Elm/_MaterialPipeline/MYI/MYI_Bark"
+        )
+
+        paths = self.module._material_pipeline_mutation_paths(
+            "/Game/Codex/Tests/Elm/SK_Tree",
+            {"materials": [{"name": "M_Bark"}]},
+        )
+
+        self.assertIn("/Game/Codex/Tests/Elm/SK_Tree", paths)
+        self.assertIn(
+            "/Game/Codex/Tests/Elm/_MaterialPipeline/MI/MI_Bark", paths
+        )
+        self.assertIn(
+            "/Game/Codex/Tests/Elm/_MaterialPipeline/MYI/MYI_Bark", paths
+        )
+        self.assertNotIn("/Game/Material/Tree/Master/M_Tree", paths)
+        self.assertNotIn("/Game/Material/Tree/Layer/MY_Tree", paths)
+
+    def test_codex_test_normalization_skips_production_reference(self):
+        calls = []
+
+        class Helper:
+            def normalize_material_layer_placeholders(inner_self, asset_path):
+                calls.append(asset_path)
+                return True
+
+        self.module._normalize_material_layer_asset(
+            Helper(),
+            "normalize_material_layer_placeholders",
+            "/Game/Material/Tree/Master/M_Tree",
+            "material master",
+            mutation_scope_path="/Game/Codex/Tests/Elm/SK_Tree",
+        )
+
+        self.assertEqual(calls, [])
+
+    def test_codex_test_scope_requires_isolated_explicit_targets(self):
+        valid = {
+            "codex_test_asset_scope": {
+                "root": "/Game/Codex/Tests/Elm/_MaterialPipeline",
+            },
+            "materials": [
+                {
+                    "name": "M_Bark",
+                    "target_material_path": (
+                        "/Game/Codex/Tests/Elm/_MaterialPipeline/MI/MI_Bark"
+                    ),
+                    "material_layer": {
+                        "instance_path": (
+                            "/Game/Codex/Tests/Elm/_MaterialPipeline/MYI/MYI_Bark"
+                        ),
+                    },
+                }
+            ],
+        }
+        self.assertTrue(
+            self.module._validate_codex_test_material_scope(
+                valid, "/Game/Codex/Tests/Elm/SK_Tree"
+            )
+        )
+
+        invalid = json.loads(json.dumps(valid))
+        invalid["materials"][0]["target_material_path"] = (
+            "/Game/Material/Tree/AssetTree/MI/MI_Bark"
+        )
+        with self.assertRaisesRegex(RuntimeError, "isolated MI scope"):
+            self.module._validate_codex_test_material_scope(
+                invalid, "/Game/Codex/Tests/Elm/SK_Tree"
+            )
+
+    def test_codex_test_scope_overrides_tree_contract_output_folders(self):
+        self.module._tree_preset_contract_overlay = lambda: {
+            "mi_folder": "/Game/Material/Tree/AssetTree/MI",
+            "layer_instance_folder": "/Game/Material/Tree/AssetTree/MYI",
+        }
+        preset = self.module._master_preset(
+            {
+                "codex_test_asset_scope": {
+                    "root": "/Game/Codex/Tests/Elm/_MaterialPipeline",
+                }
+            },
+            {"name": "M_Bark", "master_preset": "tree"},
+            "/Game/Codex/Tests/Elm/SK_Tree",
+        )
+        self.assertEqual(
+            preset["mi_folder"],
+            "/Game/Codex/Tests/Elm/_MaterialPipeline/MI",
+        )
+        self.assertEqual(
+            preset["layer_instance_folder"],
+            "/Game/Codex/Tests/Elm/_MaterialPipeline/MYI",
+        )
+
     def test_material_checkout_skips_added_assets_and_blocks_other_user(self):
         added_path = "/Game/Material/Tree/AssetTree/MI/MI_New"
         other_path = "/Game/Material/Tree/AssetTree/MI/MI_Other"
@@ -1143,7 +1249,7 @@ class TestUeMaterialTextureImport(unittest.TestCase):
                 return True
 
         self.runtime.unreal_module.CodexMaterialToolsLibrary = Helper()
-        self.module._normalize_material_layer_asset = lambda *args: None
+        self.module._normalize_material_layer_asset = lambda *args, **kwargs: None
         self.module._layer_parent_path = lambda preset, entry: "/Game/Layer/Parent"
         self.module._layer_instance_path = lambda *args: layer_path
         self.module._prune_texture_parameter_overrides = lambda *args, **kwargs: False
