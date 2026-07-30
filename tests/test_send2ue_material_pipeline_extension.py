@@ -1,6 +1,7 @@
 import importlib.util
 from pathlib import Path
 import sys
+import tempfile
 import types
 import unittest
 
@@ -129,6 +130,87 @@ class TestMaterialPipelineExactSidecar(unittest.TestCase):
         self.assertNotIn(key, self.asset_data)
         self.assertEqual(len(resolve_calls), 1)
         self.assertEqual(self.command_calls, [])
+
+    def test_pre_import_preserves_sidecar_selected_during_mesh_export(self):
+        exact_path = "D:/texture/SK_Branch_01.json"
+        key = self.module.MATERIAL_PIPELINE_JSON_PATH_KEY
+        self.asset_data[key] = exact_path
+        self.asset_data[self.module.MATERIAL_PIPELINE_JSON_FROM_EXPORT_KEY] = True
+        self.extension._resolve_json_path = lambda asset_path: (_ for _ in ()).throw(
+            AssertionError("pre_import must keep the pre-export asset-unit sidecar")
+        )
+
+        self.extension.pre_import(self.asset_data, None)
+
+        self.assertEqual(self.asset_data[key], exact_path)
+        self.assertEqual(len(self.command_calls), 1)
+        self.assertIn(repr(exact_path), "\n".join(self.command_calls[0]))
+
+    def test_pre_export_prefers_asset_unit_name_over_child_mesh_name(self):
+        package_name = "ue_unique_export_names_addon"
+        api_name = f"{package_name}.api"
+        previous_package = sys.modules.get(package_name)
+        previous_api = sys.modules.get(api_name)
+        package = types.ModuleType(package_name)
+        package.__path__ = []
+        api = types.ModuleType(api_name)
+        captured = []
+        api.resolve_asset_unit_name = lambda target, context: "SK_Branch_01"
+        api.resolve_sidecar_json_path = lambda candidates, context: (
+            captured.append(list(candidates)) or "D:/texture/SK_Branch_01.json"
+        )
+        sys.modules[package_name] = package
+        sys.modules[api_name] = api
+        package.api = api
+        try:
+            path = self.extension._resolve_json_path_for_export(
+                {
+                    "file_path": "D:/temp/SK_Branch_01_Mesh.fbx",
+                    "asset_path": "/Game/Meshes/SK_Branch_01_Mesh",
+                },
+                types.SimpleNamespace(name="SK_Branch_01_Mesh"),
+            )
+        finally:
+            if previous_package is None:
+                sys.modules.pop(package_name, None)
+            else:
+                sys.modules[package_name] = previous_package
+            if previous_api is None:
+                sys.modules.pop(api_name, None)
+            else:
+                sys.modules[api_name] = previous_api
+
+        self.assertEqual(path, "D:/texture/SK_Branch_01.json")
+        self.assertEqual(captured[0][0], "SK_Branch_01")
+        self.assertIn("SK_Branch_01_Mesh", captured[0])
+
+    def test_preflight_asset_path_uses_exact_sidecar_mesh_name(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sidecar = Path(temp_dir) / "SK_Branch_01.json"
+            sidecar.write_text('{"mesh_name": "SK_Branch_01"}', encoding="utf-8")
+            path = self.extension._preflight_asset_path(
+                "/Game/Meshes/Tree/SK_Branch_01_Mesh.SK_Branch_01_Mesh",
+                str(sidecar),
+            )
+        self.assertEqual(path, "/Game/Meshes/Tree/SK_Branch_01")
+
+    def test_post_operation_persists_imported_skeletal_dependencies(self):
+        self.asset_data["_asset_type"] = "SKELETAL_MESH"
+        self.asset_data[self.module.MATERIAL_PIPELINE_JSON_PATH_KEY] = (
+            "D:/texture/SK_CommonGrass.json"
+        )
+
+        self.extension.pre_operation(None)
+        self.extension.post_import(self.asset_data, None)
+        self.extension.post_operation(None)
+
+        self.assertEqual(len(self.command_calls), 2)
+        post_operation_commands = "\n".join(self.command_calls[1])
+        self.assertIn(
+            "persist_generated_skeleton_dependencies",
+            post_operation_commands,
+        )
+        self.assertIn(self.asset_data["asset_path"], post_operation_commands)
 
 
 if __name__ == "__main__":

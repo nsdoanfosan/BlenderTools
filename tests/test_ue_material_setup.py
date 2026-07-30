@@ -70,6 +70,43 @@ class FakeMaterialInstanceConstant:
         return FakeUnrealClass("MaterialInstanceConstant")
 
 
+class FakeSkeletalMaterial:
+    def __init__(self, slot_name="", material=None):
+        self.properties = {
+            "material_interface": material,
+            "material_slot_name": slot_name,
+            "imported_material_slot_name": slot_name,
+            "uv_channel_data": None,
+            "overlay_material_interface": None,
+        }
+
+    def get_editor_property(self, name):
+        return self.properties[name]
+
+    def set_editor_property(self, name, value):
+        self.properties[name] = value
+
+
+class FakeSkeletalMesh:
+    def __init__(self, materials, skeleton=None):
+        self.materials = list(materials)
+        self.skeleton = skeleton
+
+    def get_editor_property(self, name):
+        if name == "static_materials":
+            raise KeyError(name)
+        if name == "materials":
+            return list(self.materials)
+        if name == "skeleton":
+            return self.skeleton
+        raise KeyError(name)
+
+    def set_editor_property(self, name, value):
+        if name != "materials":
+            raise KeyError(name)
+        self.materials = list(value)
+
+
 class FakeAssetData:
     def __init__(self, runtime, asset_path):
         self.runtime = runtime
@@ -416,14 +453,16 @@ class TestUeMaterialTextureImport(unittest.TestCase):
 
     def test_role_settings_cover_masks_normal_grayscale_and_color(self):
         cases = (
-            ("Extra", False, "TC_MASKS"),
-            ("Normal", False, "TC_NORMALMAP"),
-            ("Height", False, "TC_GRAYSCALE"),
-            ("Opacity", False, "TC_GRAYSCALE"),
-            ("Albedo", True, "TC_DEFAULT"),
-            ("Subsurface", True, "TC_DEFAULT"),
+            ("Extra", False, "TC_MASKS", True),
+            ("Normal", False, "TC_NORMALMAP", True),
+            ("Height", False, "TC_GRAYSCALE", True),
+            ("Opacity", False, "TC_GRAYSCALE", False),
+            ("Opacity Map", False, "TC_GRAYSCALE", False),
+            ("Alpha", False, "TC_GRAYSCALE", False),
+            ("Albedo", True, "TC_DEFAULT", True),
+            ("Subsurface", True, "TC_DEFAULT", True),
         )
-        for role, expected_srgb, expected_compression in cases:
+        for role, expected_srgb, expected_compression, expected_vt in cases:
             with self.subTest(role=role):
                 settings = self.module._desired_texture_settings(
                     role,
@@ -435,7 +474,28 @@ class TestUeMaterialTextureImport(unittest.TestCase):
                     expected_compression,
                 )
                 self.assertEqual(settings["max_texture_size"], 0)
-                self.assertTrue(settings["virtual_texture_streaming"])
+                self.assertEqual(
+                    settings["virtual_texture_streaming"],
+                    expected_vt,
+                )
+
+    def test_opacity_role_drift_disables_virtual_texture_without_reimport(self):
+        texture = FakeTexture(
+            srgb=False,
+            compression_settings="TC_GRAYSCALE",
+            max_texture_size=0,
+            virtual_texture_streaming=True,
+        )
+
+        changed = self.module._configure_imported_texture(
+            texture,
+            "Opacity Map",
+            file_path=str(Path(self.temp_dir.name) / "T_leaf_opacity.tga"),
+            asset_name="T_leaf_opacity",
+        )
+
+        self.assertTrue(changed)
+        self.assertFalse(texture.properties["virtual_texture_streaming"])
 
     def test_preexisting_user_checkout_is_not_reverted(self):
         texture = FakeTexture(max_texture_size=1024)
@@ -1065,11 +1125,31 @@ class TestUeMaterialTextureImport(unittest.TestCase):
                 self.module._material_instance_base_name("M_Bark_Mat"),
                 "Bark_Mat",
             )
-            self.assertFalse(
+            self.assertTrue(
                 self.module._tree_texture_param_allowed("Opacity", preset)
+            )
+            self.assertFalse(
+                self.module._tree_texture_param_allowed("Transmission", preset)
             )
         finally:
             self.module._SPEEDTREE_HANDOFF_API = cached_api
+
+    def test_tree_opacity_remap_is_canonical_and_transmission_is_excluded(self):
+        preset = {
+            "key": "tree",
+            "tree_shading": "foliage",
+            "layer_texture_remap": {
+                "Albedo": "Albedo",
+                "Transmission": "Transmission",
+            },
+        }
+
+        remap = self.module._layer_texture_remap(preset, {})
+
+        self.assertEqual(remap["Alpha"], "Opacity Map")
+        self.assertEqual(remap["Opacity"], "Opacity Map")
+        self.assertEqual(remap["Opacity Map"], "Opacity Map")
+        self.assertNotIn("Transmission", remap)
 
     def _contract_sidecar(self, mesh_name="SK_CommonGrass"):
         contract_api = self.module._speedtree_handoff_api()
@@ -1267,6 +1347,159 @@ class TestUeMaterialTextureImport(unittest.TestCase):
 
         self.assertTrue(changed)
         self.assertEqual(self.runtime.mark_add_calls, [layer_path])
+
+
+class TestSkeletalMaterialSectionRemap(unittest.TestCase):
+    def setUp(self):
+        self.runtime = FakeRuntime()
+        self.runtime.unreal_module.SkeletalMesh = FakeSkeletalMesh
+        self.runtime.unreal_module.SkeletalMaterial = FakeSkeletalMaterial
+        self.calls = []
+
+        class Helper:
+            def __init__(inner_self, calls):
+                inner_self.calls = calls
+
+            def remap_skeletal_mesh_material_sections(
+                inner_self, mesh, old_indices, new_indices, apply_fix
+            ):
+                inner_self.calls.append(
+                    {
+                        "slot_count": len(mesh.materials),
+                        "old": list(old_indices),
+                        "new": list(new_indices),
+                        "apply": apply_fix,
+                    }
+                )
+                return True, json.dumps({"changed": True}), []
+
+        self.runtime.unreal_module.CodexMaterialToolsLibrary = Helper(self.calls)
+        self.module = _load_module(self.runtime)
+
+    def test_compaction_remaps_sections_and_persists_imported_slot_names(self):
+        mesh = FakeSkeletalMesh(
+            [FakeSkeletalMaterial(f"Legacy_{index}") for index in range(4)]
+        )
+        bark_a = FakeMaterialInstanceConstant("/Game/MI/MI_BarkA")
+        bark_b = FakeMaterialInstanceConstant("/Game/MI/MI_BarkB")
+
+        changed = self.module._normalize_skeletal_material_slots(
+            mesh,
+            {
+                2: ("M_BarkA", bark_a),
+                3: ("M_BarkB", bark_b),
+            },
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(len(mesh.materials), 2)
+        self.assertEqual(self.calls[0]["slot_count"], 2)
+        self.assertEqual(self.calls[0]["old"], [2, 3])
+        self.assertEqual(self.calls[0]["new"], [0, 1])
+        self.assertEqual(
+            [
+                entry.get_editor_property("imported_material_slot_name")
+                for entry in mesh.materials
+            ],
+            ["M_BarkA", "M_BarkB"],
+        )
+
+
+class TestGeneratedSkeletonDependencySave(unittest.TestCase):
+    def setUp(self):
+        self.runtime = FakeRuntime()
+        self.module = _load_module(self.runtime)
+        self.saved = []
+
+        class Helper:
+            def __init__(inner_self, saved):
+                inner_self.saved = saved
+
+            def save_asset_package_without_thumbnail(inner_self, asset):
+                inner_self.saved.append(asset.get_path_name())
+                return True
+
+        self.helper = Helper(self.saved)
+
+    @staticmethod
+    def mesh_with_skeleton(skeleton_path):
+        class Skeleton:
+            def get_path_name(self):
+                return skeleton_path
+
+        class Mesh:
+            def get_editor_property(self, name):
+                if name != "skeleton":
+                    raise KeyError(name)
+                return Skeleton()
+
+        return Mesh()
+
+    def test_saves_missing_default_generated_skeleton(self):
+        mesh_path = "/Game/Test/SK_Branch"
+        mesh = self.mesh_with_skeleton(
+            "/Game/Test/SK_Branch_Skeleton.SK_Branch_Skeleton"
+        )
+        self.module._project_asset_package_file_exists = lambda _path: False
+
+        changed = self.module._save_generated_skeleton_dependency(
+            mesh, mesh_path, self.helper
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(
+            self.saved,
+            ["/Game/Test/SK_Branch_Skeleton.SK_Branch_Skeleton"],
+        )
+
+    def test_leaves_shared_or_already_saved_skeleton_untouched(self):
+        mesh_path = "/Game/Test/SK_Branch"
+        shared_mesh = self.mesh_with_skeleton(
+            "/Game/Shared/SK_Tree_Skeleton.SK_Tree_Skeleton"
+        )
+        generated_mesh = self.mesh_with_skeleton(
+            "/Game/Test/SK_Branch_Skeleton.SK_Branch_Skeleton"
+        )
+        self.module._project_asset_package_file_exists = lambda _path: True
+
+        self.assertFalse(
+            self.module._save_generated_skeleton_dependency(
+                shared_mesh, mesh_path, self.helper
+            )
+        )
+        self.assertFalse(
+            self.module._save_generated_skeleton_dependency(
+                generated_mesh, mesh_path, self.helper
+            )
+        )
+        self.assertEqual(self.saved, [])
+
+    def test_post_operation_persists_skeleton_then_mesh(self):
+        mesh_path = "/Game/Test/SK_Branch"
+
+        class Skeleton:
+            def get_path_name(self):
+                return "/Game/Test/SK_Branch_Skeleton.SK_Branch_Skeleton"
+
+        mesh = FakeSkeletalMesh([], skeleton=Skeleton())
+        mesh.get_path_name = lambda: f"{mesh_path}.SK_Branch"
+        self.runtime.unreal_module.SkeletalMesh = FakeSkeletalMesh
+        self.runtime.assets[mesh_path] = mesh
+        self.runtime.unreal_module.CodexMaterialToolsLibrary = self.helper
+        self.module._project_asset_package_file_exists = lambda _path: False
+
+        count = self.module.persist_generated_skeleton_dependencies(
+            [mesh_path, mesh_path]
+        )
+
+        self.assertEqual(count, 1)
+        self.assertEqual(
+            self.saved,
+            [
+                "/Game/Test/SK_Branch_Skeleton.SK_Branch_Skeleton",
+                "/Game/Test/SK_Branch.SK_Branch",
+            ],
+        )
 
 
 if __name__ == "__main__":

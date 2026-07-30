@@ -135,6 +135,7 @@ MASTER_PRESETS = {
             "Extra": "Extra",
             "Normal": "Normal",
             "Height": "Height",
+            "Opacity Map": "Opacity Map",
             "Subsurface": "Subsurface",
         },
         "virtual_textures": True,
@@ -701,7 +702,14 @@ def _desired_texture_settings(
         "srgb": srgb,
         "compression_settings": compression,
         "max_texture_size": DEFAULT_MAX_TEXTURE_SIZE,
-        "virtual_texture_streaming": bool(ENABLE_VIRTUAL_TEXTURE_STREAMING),
+        # OpacityMask is sampled by a non-VT linear grayscale parameter in the
+        # canonical tree foliage layer.  Re-enabling VT here makes the instance
+        # override incompatible with that graph and restores solid white cards.
+        "virtual_texture_streaming": (
+            False
+            if param in {"Opacity", "Opacity Map", "Alpha"}
+            else bool(ENABLE_VIRTUAL_TEXTURE_STREAMING)
+        ),
     }
 
 
@@ -2082,6 +2090,10 @@ def _new_skeletal_material_entry(slot_name: str, material, old_entry=None):
     entry = unreal.SkeletalMaterial()
     entry.set_editor_property("material_interface", material)
     entry.set_editor_property("material_slot_name", slot_name)
+    try:
+        entry.set_editor_property("imported_material_slot_name", slot_name)
+    except Exception:
+        pass
     if old_entry is not None:
         for prop in ("uv_channel_data", "overlay_material_interface"):
             try:
@@ -2089,6 +2101,53 @@ def _new_skeletal_material_entry(slot_name: str, material, old_entry=None):
             except Exception:
                 pass
     return entry
+
+
+def _remap_skeletal_material_sections(mesh, ordered) -> bool:
+    helper = getattr(unreal, "CodexMaterialToolsLibrary", None)
+    method = getattr(helper, "remap_skeletal_mesh_material_sections", None)
+    if not callable(method):
+        raise RuntimeError(
+            "CodexMaterialTools skeletal material-section remap helper is missing"
+        )
+    old_indices = [int(old_index) for old_index, _slot_name, _material in ordered]
+    new_indices = list(range(len(ordered)))
+    result = method(mesh, old_indices, new_indices, True)
+    values = result if isinstance(result, tuple) else (result,)
+    explicit_success = next(
+        (value for value in values if isinstance(value, bool)),
+        None,
+    )
+    payload_text = next(
+        (
+            value
+            for value in values
+            if isinstance(value, str) and value.lstrip().startswith("{")
+        ),
+        "{}",
+    )
+    errors = next((value for value in values if isinstance(value, list)), [])
+    try:
+        payload = json.loads(payload_text)
+    except (TypeError, ValueError):
+        payload = {}
+    # Depending on the live UE Python wrapper, a BlueprintCallable function
+    # with output references can surface only OutJson (or OutJson/OutErrors)
+    # and omit its native bool return.  The helper writes the same result to
+    # the required JSON ``ok`` field, so use that authoritative value when no
+    # explicit bool was exposed.
+    success = (
+        explicit_success
+        if explicit_success is not None
+        else bool(payload.get("ok"))
+    )
+    if not success:
+        raise RuntimeError(
+            "skeletal material-section remap failed: "
+            + "; ".join(str(value) for value in errors)
+            + (" | " + payload_text if payload_text else "")
+        )
+    return bool(payload.get("changed"))
 
 
 def _assign_skeletal_slot(mesh, slot_index: int, material, slot_name: str = None) -> bool:
@@ -2156,16 +2215,21 @@ def _normalize_skeletal_material_slots(mesh, assignments: dict) -> bool:
             ):
                 unchanged = False
                 break
-    if unchanged:
-        return False
+    materials_changed = not unchanged
+    if materials_changed:
+        new_entries = []
+        for old_index, slot_name, material in ordered:
+            old_entry = material_entries[old_index] if 0 <= old_index < len(material_entries) else None
+            new_entries.append(_new_skeletal_material_entry(slot_name, material, old_entry))
+        mesh.set_editor_property("materials", new_entries)
 
-    new_entries = []
-    for old_index, slot_name, material in ordered:
-        old_entry = material_entries[old_index] if 0 <= old_index < len(material_entries) else None
-        new_entries.append(_new_skeletal_material_entry(slot_name, material, old_entry))
-
-    mesh.set_editor_property("materials", new_entries)
-    return True
+    try:
+        sections_changed = _remap_skeletal_material_sections(mesh, ordered)
+    except Exception:
+        if materials_changed:
+            mesh.set_editor_property("materials", material_entries)
+        raise
+    return materials_changed or sections_changed
 
 
 def _set_material_interface(mesh, slot_index: int, material) -> bool:
@@ -2246,7 +2310,7 @@ def _tree_texture_param_allowed(param: str, preset: dict = None) -> bool:
             preset.get("tree_shading"),
         )
     param = str(param or "").strip().casefold()
-    if param in {"alpha", "opacity", "opacity map", "transmission"}:
+    if param == "transmission":
         return False
     if param == "subsurface" and preset.get("tree_shading") == "wood":
         return False
@@ -2642,8 +2706,10 @@ def _layer_texture_remap(preset: dict, entry: dict) -> dict:
         mapping = preset.get("layer_texture_remap", {})
     result = {str(key): str(value) for key, value in dict(mapping).items() if key and value}
     if preset.get("key") == "tree":
-        for unused_param in ("Alpha", "Opacity", "Opacity Map", "Transmission"):
-            result.pop(unused_param, None)
+        result.pop("Transmission", None)
+        result["Alpha"] = "Opacity Map"
+        result["Opacity"] = "Opacity Map"
+        result["Opacity Map"] = "Opacity Map"
         if preset.get("tree_shading") != "wood":
             result["Subsurface"] = "Subsurface"
         else:
@@ -3446,6 +3512,51 @@ def preflight_mesh_materials(mesh_path: str, json_path: str = None) -> bool:
     return normalized
 
 
+def _project_asset_package_file_exists(asset_path: str) -> bool:
+    """Return whether a /Game asset package has reached the project Content folder."""
+    package_path = str(asset_path or "").split(".")[0]
+    if not package_path.startswith("/Game/"):
+        return False
+    try:
+        content_dir = unreal.Paths.convert_relative_path_to_full(
+            unreal.Paths.project_content_dir()
+        )
+    except Exception:
+        return False
+    relative_path = package_path[len("/Game/") :].replace("/", os.sep)
+    return os.path.isfile(os.path.join(content_dir, relative_path + ".uasset"))
+
+
+def _save_generated_skeleton_dependency(mesh, mesh_path: str, helper) -> bool:
+    """Persist the default Skeleton created by a Send2UE skeletal-mesh import.
+
+    ImportAssetTasks can leave the generated ``<mesh>_Skeleton`` package only in
+    memory.  Saving the mesh alone then serializes a dependency that disappears
+    after an editor restart.  Existing or explicitly shared Skeleton assets are
+    intentionally left untouched.
+    """
+    try:
+        skeleton = mesh.get_editor_property("skeleton")
+    except Exception:
+        skeleton = None
+    if skeleton is None:
+        return False
+
+    get_path_name = getattr(skeleton, "get_path_name", None)
+    skeleton_path = (
+        str(get_path_name()).split(".")[0] if callable(get_path_name) else ""
+    )
+    expected_path = f"{str(mesh_path).split('.')[0]}_Skeleton"
+    if skeleton_path != expected_path:
+        return False
+    if _project_asset_package_file_exists(skeleton_path):
+        return False
+    if not helper.save_asset_package_without_thumbnail(skeleton):
+        raise RuntimeError(f"generated Skeleton save failed: {skeleton_path}")
+    _log(f"  saved generated Skeleton dependency: {skeleton_path}")
+    return True
+
+
 def process_mesh(mesh_path: str, master_mat=None, json_path: str = None) -> bool:
     """단일 StaticMesh/SkeletalMesh 를 JSON 기반으로 처리. 변경이 있었으면 True.
 
@@ -3481,6 +3592,7 @@ def process_mesh(mesh_path: str, master_mat=None, json_path: str = None) -> bool
                 raise RuntimeError(
                     "CodexMaterialTools safe skeletal-mesh save helper is missing"
                 )
+            _save_generated_skeleton_dependency(mesh, mesh_path, helper)
             if not helper.save_asset_package_without_thumbnail(mesh):
                 raise RuntimeError(f"safe skeletal-mesh save failed: {mesh_path}")
             return
@@ -3709,8 +3821,45 @@ def process_mesh(mesh_path: str, master_mat=None, json_path: str = None) -> bool
         _log(f"메쉬 '{mesh_name}' 완료")
 
     # 마지막으로 브라우저를 메쉬로 돌려 선택 상태로 끝낸다(텍스처 폴더로 튀는 것 방지).
+    if not changed and _is_skeletal_mesh(mesh):
+        # A no-op reimport can still create the default Skeleton package only in
+        # memory. Persist that dependency even when materials and Nanite settings
+        # already match, then resave the mesh so the reference survives restart.
+        helper = getattr(unreal, "CodexMaterialToolsLibrary", None)
+        if not helper or not hasattr(helper, "save_asset_package_without_thumbnail"):
+            raise RuntimeError(
+                "CodexMaterialTools safe skeletal-mesh save helper is missing"
+            )
+        if _save_generated_skeleton_dependency(mesh, mesh_path, helper):
+            if not helper.save_asset_package_without_thumbnail(mesh):
+                raise RuntimeError(f"safe skeletal-mesh save failed: {mesh_path}")
+            _log(f"  persisted generated Skeleton reference for: {mesh_name}")
+
     _sync_browser_to_mesh(mesh_path)
     return changed
+
+
+def persist_generated_skeleton_dependencies(mesh_paths) -> int:
+    """Persist generated Skeleton packages after every Send2UE import completes."""
+    helper = getattr(unreal, "CodexMaterialToolsLibrary", None)
+    if not helper or not hasattr(helper, "save_asset_package_without_thumbnail"):
+        raise RuntimeError(
+            "CodexMaterialTools safe skeletal-mesh save helper is missing"
+        )
+
+    saved_count = 0
+    for raw_path in dict.fromkeys(mesh_paths or []):
+        mesh_path = str(raw_path or "").split(".")[0]
+        mesh = unreal.load_asset(mesh_path)
+        if not _is_skeletal_mesh(mesh):
+            continue
+        if not _save_generated_skeleton_dependency(mesh, mesh_path, helper):
+            continue
+        if not helper.save_asset_package_without_thumbnail(mesh):
+            raise RuntimeError(f"safe skeletal-mesh save failed: {mesh_path}")
+        _log(f"  persisted generated Skeleton reference for: {mesh_path}")
+        saved_count += 1
+    return saved_count
 
 
 def process_meshes(mesh_paths):

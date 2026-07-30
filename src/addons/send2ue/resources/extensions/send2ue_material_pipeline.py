@@ -21,6 +21,8 @@ PIPELINE_DIR = BUNDLED_PIPELINE_DIR
 _TEXTURELESS_FBX_RESTORE = {}
 TEXTURELESS_FBX_EXPORT_FLAG = "send2ue_material_pipeline_textureless_fbx_export"
 MATERIAL_PIPELINE_JSON_PATH_KEY = "_material_pipeline_json_path"
+MATERIAL_PIPELINE_JSON_FROM_EXPORT_KEY = "_material_pipeline_json_from_export"
+_POST_OPERATION_SKELETAL_ASSET_PATHS = []
 
 
 class MaterialPipelineExtension(ExtensionBase):
@@ -33,6 +35,32 @@ class MaterialPipelineExtension(ExtensionBase):
             "After import, run the surface-layer material setup for matching StaticMesh assets."
         ),
     )
+
+    def pre_operation(self, properties):
+        _POST_OPERATION_SKELETAL_ASSET_PATHS.clear()
+
+    def post_operation(self, properties):
+        asset_paths = list(dict.fromkeys(_POST_OPERATION_SKELETAL_ASSET_PATHS))
+        _POST_OPERATION_SKELETAL_ASSET_PATHS.clear()
+        if not self.enabled or not asset_paths:
+            return
+
+        paths_arg = repr(asset_paths)
+        commands = [
+            "import sys",
+            "import importlib.util",
+            "import unreal",
+            f'_d = r"{PIPELINE_DIR}"',
+            "_pipeline_file = _d.rstrip('/') + '/ue_material_setup.py'",
+            "_spec = importlib.util.spec_from_file_location('send2ue_bundled_ue_material_setup_post_operation', _pipeline_file)",
+            "if _spec is None or _spec.loader is None:",
+            "\traise RuntimeError('Could not load bundled material pipeline: ' + _pipeline_file)",
+            "_p = importlib.util.module_from_spec(_spec)",
+            "sys.modules[_spec.name] = _p",
+            "_spec.loader.exec_module(_p)",
+            f"_p.persist_generated_skeleton_dependencies({paths_arg})",
+        ]
+        run_commands(commands)
 
     def pre_mesh_export(self, asset_data, properties):
         if not self.enabled:
@@ -143,6 +171,14 @@ class MaterialPipelineExtension(ExtensionBase):
             )
             return None
 
+        # Preserve the exact asset-unit sidecar through FBX export and import.
+        # The pre-import asset path can still carry the source child mesh name
+        # even when the final Unreal asset is named after its parent Empty.
+        asset_data[MATERIAL_PIPELINE_JSON_PATH_KEY] = str(json_path).replace(
+            "\\", "/"
+        )
+        asset_data[MATERIAL_PIPELINE_JSON_FROM_EXPORT_KEY] = True
+
         try:
             with open(json_path, "r", encoding="utf-8") as handle:
                 return json.load(handle)
@@ -159,14 +195,6 @@ class MaterialPipelineExtension(ExtensionBase):
 
     def _resolve_json_path_for_export(self, asset_data, target):
         candidates = []
-        for value in (
-            asset_data.get("file_path"),
-            asset_data.get("asset_path"),
-            target.name,
-        ):
-            name = self._asset_name_from_value(value)
-            if name and name not in candidates:
-                candidates.append(name)
 
         try:
             from ue_unique_export_names_addon import api as handoff_api
@@ -176,6 +204,21 @@ class MaterialPipelineExtension(ExtensionBase):
                 f"JSON sidecar lookup failed: {exc}",
             )
             return None
+
+        # The pre-export target is the source mesh object, while Send to Unreal
+        # may name the imported asset after its highest Empty ancestor.  Ask the
+        # handoff add-on for that exact asset-unit name before trying child names.
+        asset_unit_name = handoff_api.resolve_asset_unit_name(target, bpy.context)
+        if asset_unit_name:
+            candidates.append(asset_unit_name)
+        for value in (
+            asset_data.get("file_path"),
+            asset_data.get("asset_path"),
+            target.name,
+        ):
+            name = self._asset_name_from_value(value)
+            if name and name not in candidates:
+                candidates.append(name)
 
         return handoff_api.resolve_sidecar_json_path(candidates, bpy.context)
 
@@ -259,12 +302,24 @@ class MaterialPipelineExtension(ExtensionBase):
         }:
             return
         asset_path = asset_data.get("asset_path", "")
-        asset_data.pop(MATERIAL_PIPELINE_JSON_PATH_KEY, None)
-        json_path = self._resolve_json_path(asset_path)
+        from_mesh_export = bool(
+            asset_data.pop(MATERIAL_PIPELINE_JSON_FROM_EXPORT_KEY, False)
+        )
+        json_path = (
+            asset_data.get(MATERIAL_PIPELINE_JSON_PATH_KEY)
+            if from_mesh_export
+            else None
+        )
+        if not from_mesh_export:
+            asset_data.pop(MATERIAL_PIPELINE_JSON_PATH_KEY, None)
         if not json_path:
+            json_path = self._resolve_json_path(asset_path)
+        if not json_path:
+            asset_data.pop(MATERIAL_PIPELINE_JSON_PATH_KEY, None)
             return
         json_path = str(json_path).replace("\\", "/")
         asset_data[MATERIAL_PIPELINE_JSON_PATH_KEY] = json_path
+        preflight_asset_path = self._preflight_asset_path(asset_path, json_path)
 
         json_arg = repr(json_path)
         commands = [
@@ -272,7 +327,7 @@ class MaterialPipelineExtension(ExtensionBase):
             "import importlib.util",
             "import unreal",
             f'_d = r"{PIPELINE_DIR}"',
-            f'_asset_path = r"{asset_path}".split(".")[0]',
+            f'_asset_path = r"{preflight_asset_path}".split(".")[0]',
             "_pipeline_file = _d.rstrip('/') + '/ue_material_setup.py'",
             "_spec = importlib.util.spec_from_file_location('send2ue_bundled_ue_material_setup_preflight', _pipeline_file)",
             "if _spec is None or _spec.loader is None:",
@@ -288,6 +343,20 @@ class MaterialPipelineExtension(ExtensionBase):
         # Letting the FBX importer also create source materials/textures adds duplicate
         # assets that immediately need cleanup, which is expensive in Unreal/P4.
         asset_data["_import_materials_and_textures"] = False
+
+    def _preflight_asset_path(self, asset_path, json_path):
+        """Match preflight identity to the exact sidecar-selected asset unit."""
+        try:
+            with open(json_path, "r", encoding="utf-8") as handle:
+                sidecar = json.load(handle)
+        except (OSError, json.JSONDecodeError, TypeError):
+            return asset_path
+        mesh_name = str(sidecar.get("mesh_name") or "")
+        base_path = str(asset_path or "").split(".")[0]
+        if not mesh_name or "/" not in base_path:
+            return asset_path
+        folder = base_path.rsplit("/", 1)[0]
+        return f"{folder}/{mesh_name}"
 
     def post_import(self, asset_data, properties):
         if not self.enabled:
@@ -307,6 +376,8 @@ class MaterialPipelineExtension(ExtensionBase):
         json_path = asset_data.get(MATERIAL_PIPELINE_JSON_PATH_KEY)
         if not json_path:
             return
+        if asset_data.get("_asset_type") == UnrealTypes.SKELETAL_MESH:
+            _POST_OPERATION_SKELETAL_ASSET_PATHS.append(asset_path)
         json_arg = repr(str(json_path))
 
         commands = [
