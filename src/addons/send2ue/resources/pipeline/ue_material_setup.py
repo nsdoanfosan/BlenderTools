@@ -426,11 +426,25 @@ def _find_json_path(mesh_name: str, mesh_path: str = None):
 
     if not candidates:
         return None
-    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    return candidates[0]
+    unique_candidates = {
+        os.path.normcase(os.path.abspath(path)): path
+        for path in candidates
+    }
+    if len(unique_candidates) != 1:
+        raise RuntimeError(
+            "ambiguous JSON sidecar fallback for "
+            f"{mesh_name}: "
+            + "; ".join(sorted(unique_candidates.values()))
+        )
+    return next(iter(unique_candidates.values()))
 
 
-def _load_json(mesh_name: str, explicit_path: str = None, mesh_path: str = None):
+def _load_json(
+    mesh_name: str,
+    explicit_path: str = None,
+    mesh_path: str = None,
+    expected_sha256: str = "",
+):
     # extension 이 정확한 JSON 경로를 넘겨주면 walk 를 건너뛴다. 없으면 mesh_path 로 폴더를 좁힌다.
     if explicit_path:
         if not os.path.isfile(explicit_path):
@@ -441,8 +455,15 @@ def _load_json(mesh_name: str, explicit_path: str = None, mesh_path: str = None)
     if not path:
         return None
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        with open(path, "rb") as f:
+            payload = f.read()
+        actual_sha256 = hashlib.sha256(payload).hexdigest()
+        if expected_sha256 and actual_sha256 != str(expected_sha256).casefold():
+            raise RuntimeError(
+                "JSON sidecar content changed after Blender export: "
+                f"{path}"
+            )
+        data = json.loads(payload.decode("utf-8"))
         _log(f"JSON sidecar: {path}")
         return data
     except Exception as e:
@@ -461,19 +482,45 @@ def _speedtree_sidecar_descriptor(data: dict):
     return value if isinstance(value, dict) else None
 
 
-def _validate_speedtree_handoff_contract(data: dict, expected_mesh_name: str):
+def _validate_speedtree_handoff_contract(
+    data: dict,
+    expected_mesh_name: str,
+    mesh_path: str = "",
+):
     """Validate new contract-authored sidecars before any Unreal mutation.
 
-    Descriptor-free sidecars are legacy data and intentionally retain the
-    existing inference/search behavior.
+    Descriptor-free non-tree sidecars retain legacy compatibility. Any tree
+    marker requires the current descriptor and material intent contract.
     """
     materials = data.get("materials", []) if isinstance(data, dict) else []
     has_intent = any(
         isinstance(entry, dict) and "speedtree_intent" in entry
         for entry in materials
     )
+    has_tree_entry = any(
+        isinstance(entry, dict)
+        and str(entry.get("master_preset") or "").strip().casefold() == "tree"
+        for entry in materials
+    )
+    has_tree_root = str(
+        (
+            data.get("material_master")
+            or data.get("master_material")
+            or data.get("master_preset")
+            or ""
+        )
+        if isinstance(data, dict)
+        else ""
+    ).strip().casefold() == "tree"
     descriptor = _speedtree_sidecar_descriptor(data)
-    if descriptor is None and not has_intent:
+    requires_speedtree_contract = bool(
+        descriptor is not None
+        or has_intent
+        or has_tree_entry
+        or has_tree_root
+        or _is_tree_asset_path(mesh_path)
+    )
+    if not requires_speedtree_contract:
         return None
 
     contract_api = _speedtree_handoff_api()
@@ -485,7 +532,7 @@ def _validate_speedtree_handoff_contract(data: dict, expected_mesh_name: str):
     if descriptor is None:
         raise RuntimeError(
             "SpeedTree handoff contract preflight blocked before mutation: "
-            "speedtree_intent exists without speedtree_handoff_contract"
+            "tree sidecar has no speedtree_handoff_contract"
         )
 
     errors = []
@@ -2740,9 +2787,6 @@ def _call_create_or_update_layer_instance(helper, parent_layer, layer_path, text
     return bool(result), [], {}
 
 
-_NORMALIZED_MATERIAL_LAYER_ASSETS = set()
-
-
 def _is_codex_test_asset_path(asset_path: str) -> bool:
     package_path = str(asset_path or "").split(".", 1)[0].replace("\\", "/")
     return package_path.casefold().startswith("/game/codex/tests/")
@@ -2760,9 +2804,6 @@ def _normalize_material_layer_asset(
         and not _is_codex_test_asset_path(asset_path)
     ):
         _log(f"  {label} kept read-only for isolated test: {asset_path}")
-        return
-    cache_key = (method_name, asset_path)
-    if cache_key in _NORMALIZED_MATERIAL_LAYER_ASSETS:
         return
     method = getattr(helper, method_name, None)
     if method is None:
@@ -2797,7 +2838,6 @@ def _normalize_material_layer_asset(
         detail = " | ".join(errors) or report_text or "unknown normalization failure"
         raise RuntimeError(f"{label} normalization failed: {asset_path} ({detail})")
 
-    _NORMALIZED_MATERIAL_LAYER_ASSETS.add(cache_key)
     changed = (
         report.get("removed_placeholder_count", 0)
         or report.get("removed_set_declaration_count", 0)
@@ -3456,7 +3496,12 @@ def _checkout_material_pipeline_assets(mesh_path: str, data: dict) -> list:
     return existing
 
 
-def preflight_mesh_materials(mesh_path: str, json_path: str = None) -> bool:
+def preflight_mesh_materials(
+    mesh_path: str,
+    json_path: str = None,
+    expected_mesh_name: str = "",
+    sidecar_sha256: str = "",
+) -> bool:
     """Normalize shared material-layer assets before Unreal touches an existing mesh.
 
     A skeletal-mesh reimport recompiles its currently assigned material instances
@@ -3464,11 +3509,16 @@ def preflight_mesh_materials(mesh_path: str, json_path: str = None) -> bool:
     before the FBX import, not from post_import after it.
     """
     mesh_path = mesh_path.split(".")[0]
-    mesh_name = mesh_path.rsplit("/", 1)[-1]
-    data = _load_json(mesh_name, json_path, mesh_path)
+    mesh_name = str(expected_mesh_name or mesh_path.rsplit("/", 1)[-1]).strip()
+    data = _load_json(
+        mesh_name,
+        json_path,
+        mesh_path,
+        expected_sha256=sidecar_sha256,
+    )
     if not data:
         return False
-    _validate_speedtree_handoff_contract(data, mesh_name)
+    _validate_speedtree_handoff_contract(data, mesh_name, mesh_path)
     _validate_codex_test_material_scope(data, mesh_path)
 
     instance_profile_targets = _validate_instance_profile_targets(
@@ -3557,7 +3607,13 @@ def _save_generated_skeleton_dependency(mesh, mesh_path: str, helper) -> bool:
     return True
 
 
-def process_mesh(mesh_path: str, master_mat=None, json_path: str = None) -> bool:
+def process_mesh(
+    mesh_path: str,
+    master_mat=None,
+    json_path: str = None,
+    expected_mesh_name: str = "",
+    sidecar_sha256: str = "",
+) -> bool:
     """단일 StaticMesh/SkeletalMesh 를 JSON 기반으로 처리. 변경이 있었으면 True.
 
     json_path: send2ue extension 이 넘겨주는 JSON 절대경로(있으면 OneDrive walk 생략).
@@ -3567,11 +3623,16 @@ def process_mesh(mesh_path: str, master_mat=None, json_path: str = None) -> bool
     if not isinstance(mesh, _supported_mesh_classes()):
         return False
 
-    mesh_name = mesh_path.rsplit("/", 1)[-1]
-    data = _load_json(mesh_name, json_path, mesh_path)
+    mesh_name = str(expected_mesh_name or mesh_path.rsplit("/", 1)[-1]).strip()
+    data = _load_json(
+        mesh_name,
+        json_path,
+        mesh_path,
+        expected_sha256=sidecar_sha256,
+    )
     asset_tools = None
     if data:
-        _validate_speedtree_handoff_contract(data, mesh_name)
+        _validate_speedtree_handoff_contract(data, mesh_name, mesh_path)
         _validate_codex_test_material_scope(data, mesh_path)
         instance_profile_targets = _validate_instance_profile_targets(
             data, mesh_path

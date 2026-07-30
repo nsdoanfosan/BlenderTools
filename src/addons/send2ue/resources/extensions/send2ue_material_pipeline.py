@@ -4,6 +4,7 @@
 # This hook only resolves the sidecar JSON written by UE Unique Names and asks
 # Unreal to process the imported mesh through the shared surface-layer pipeline.
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -22,6 +23,8 @@ _TEXTURELESS_FBX_RESTORE = {}
 TEXTURELESS_FBX_EXPORT_FLAG = "send2ue_material_pipeline_textureless_fbx_export"
 MATERIAL_PIPELINE_JSON_PATH_KEY = "_material_pipeline_json_path"
 MATERIAL_PIPELINE_JSON_FROM_EXPORT_KEY = "_material_pipeline_json_from_export"
+MATERIAL_PIPELINE_EXPECTED_MESH_NAME_KEY = "_material_pipeline_expected_mesh_name"
+MATERIAL_PIPELINE_JSON_SHA256_KEY = "_material_pipeline_json_sha256"
 _POST_OPERATION_SKELETAL_ASSET_PATHS = []
 
 
@@ -71,9 +74,13 @@ class MaterialPipelineExtension(ExtensionBase):
         if not target:
             return
 
-        self._refresh_unreal_handoff_json_or_error(target)
+        refresh_result = self._refresh_unreal_handoff_json_or_error(target)
 
-        sidecar = self._load_json_sidecar_for_export(asset_data, target)
+        sidecar = self._load_json_sidecar_for_export(
+            asset_data,
+            target,
+            refresh_result,
+        )
         if sidecar is None:
             return
         self._prepare_textureless_fbx_materials(target)
@@ -154,6 +161,7 @@ class MaterialPipelineExtension(ExtensionBase):
                     "Unreal handoff JSON refresh produced no files.",
                     f' Target: "{target.name}". Run Check Unreal Handoff.',
                 )
+            return result
         except RuntimeError:
             raise
         except Exception as exc:
@@ -162,8 +170,17 @@ class MaterialPipelineExtension(ExtensionBase):
                 f' Target: "{target.name}". {exc}',
             )
 
-    def _load_json_sidecar_for_export(self, asset_data, target):
-        json_path = self._resolve_json_path_for_export(asset_data, target)
+    def _load_json_sidecar_for_export(
+        self,
+        asset_data,
+        target,
+        refresh_result,
+    ):
+        json_path = self._resolve_json_path_for_export(
+            asset_data,
+            target,
+            refresh_result,
+        )
         if not json_path:
             utilities.report_error(
                 "UE Unique JSON sidecar is missing.",
@@ -171,31 +188,54 @@ class MaterialPipelineExtension(ExtensionBase):
             )
             return None
 
-        # Preserve the exact asset-unit sidecar through FBX export and import.
-        # The pre-import asset path can still carry the source child mesh name
-        # even when the final Unreal asset is named after its parent Empty.
-        asset_data[MATERIAL_PIPELINE_JSON_PATH_KEY] = str(json_path).replace(
-            "\\", "/"
-        )
-        asset_data[MATERIAL_PIPELINE_JSON_FROM_EXPORT_KEY] = True
-
         try:
-            with open(json_path, "r", encoding="utf-8") as handle:
-                return json.load(handle)
+            payload = Path(json_path).read_bytes()
+            sidecar = json.loads(payload.decode("utf-8"))
         except OSError as exc:
             utilities.report_error(
                 f"Could not read UE Unique JSON sidecar: {json_path}",
                 str(exc),
             )
+            return None
         except json.JSONDecodeError as exc:
             utilities.report_error(
                 f"Invalid UE Unique JSON sidecar: {json_path}",
                 str(exc),
             )
+            return None
 
-    def _resolve_json_path_for_export(self, asset_data, target):
-        candidates = []
+        expected_mesh_name = str(
+            asset_data.get(MATERIAL_PIPELINE_EXPECTED_MESH_NAME_KEY) or ""
+        ).strip()
+        sidecar_mesh_name = str(sidecar.get("mesh_name") or "").strip()
+        if (
+            not expected_mesh_name
+            or sidecar_mesh_name.casefold() != expected_mesh_name.casefold()
+        ):
+            utilities.report_error(
+                "UE Unique JSON sidecar identity mismatch.",
+                f' Expected: "{expected_mesh_name or "-"}". '
+                f'JSON mesh_name: "{sidecar_mesh_name or "-"}".',
+            )
+            return None
 
+        # Preserve both the exact asset-unit identity and the exact bytes
+        # selected for this export. The path alone is not execution evidence.
+        asset_data[MATERIAL_PIPELINE_JSON_PATH_KEY] = str(json_path).replace(
+            "\\", "/"
+        )
+        asset_data[MATERIAL_PIPELINE_JSON_SHA256_KEY] = hashlib.sha256(
+            payload
+        ).hexdigest()
+        asset_data[MATERIAL_PIPELINE_JSON_FROM_EXPORT_KEY] = True
+        return sidecar
+
+    def _resolve_json_path_for_export(
+        self,
+        asset_data,
+        target,
+        refresh_result,
+    ):
         try:
             from ue_unique_export_names_addon import api as handoff_api
         except Exception as exc:
@@ -205,22 +245,34 @@ class MaterialPipelineExtension(ExtensionBase):
             )
             return None
 
-        # The pre-export target is the source mesh object, while Send to Unreal
-        # may name the imported asset after its highest Empty ancestor.  Ask the
-        # handoff add-on for that exact asset-unit name before trying child names.
-        asset_unit_name = handoff_api.resolve_asset_unit_name(target, bpy.context)
-        if asset_unit_name:
-            candidates.append(asset_unit_name)
-        for value in (
-            asset_data.get("file_path"),
-            asset_data.get("asset_path"),
-            target.name,
-        ):
-            name = self._asset_name_from_value(value)
-            if name and name not in candidates:
-                candidates.append(name)
+        asset_unit_name = str(
+            handoff_api.resolve_asset_unit_name(target, bpy.context) or ""
+        ).strip()
+        if not asset_unit_name:
+            utilities.report_error(
+                "Could not resolve the exact Send to Unreal asset unit.",
+                f' Target: "{target.name}".',
+            )
+            return None
+        asset_data[MATERIAL_PIPELINE_EXPECTED_MESH_NAME_KEY] = asset_unit_name
 
-        return handoff_api.resolve_sidecar_json_path(candidates, bpy.context)
+        matches = []
+        for value in (refresh_result or {}).get("json_paths") or []:
+            path = Path(value)
+            if path.stem.casefold() == asset_unit_name.casefold():
+                matches.append(path)
+        unique_matches = {
+            str(path.resolve(strict=False)).casefold(): path
+            for path in matches
+        }
+        if len(unique_matches) != 1:
+            utilities.report_error(
+                "Exact asset-unit JSON sidecar was not produced uniquely.",
+                f' Asset unit: "{asset_unit_name}". '
+                f"Refresh matches: {len(unique_matches)}.",
+            )
+            return None
+        return str(next(iter(unique_matches.values())))
 
     def _asset_name_from_value(self, value):
         if not value:
@@ -312,6 +364,8 @@ class MaterialPipelineExtension(ExtensionBase):
         )
         if not from_mesh_export:
             asset_data.pop(MATERIAL_PIPELINE_JSON_PATH_KEY, None)
+            asset_data.pop(MATERIAL_PIPELINE_EXPECTED_MESH_NAME_KEY, None)
+            asset_data.pop(MATERIAL_PIPELINE_JSON_SHA256_KEY, None)
         if not json_path:
             json_path = self._resolve_json_path(asset_path)
         if not json_path:
@@ -319,9 +373,29 @@ class MaterialPipelineExtension(ExtensionBase):
             return
         json_path = str(json_path).replace("\\", "/")
         asset_data[MATERIAL_PIPELINE_JSON_PATH_KEY] = json_path
-        preflight_asset_path = self._preflight_asset_path(asset_path, json_path)
+        expected_mesh_name = str(
+            asset_data.get(MATERIAL_PIPELINE_EXPECTED_MESH_NAME_KEY)
+            or self._asset_name_from_value(asset_path)
+        ).strip()
+        sidecar_sha256 = str(
+            asset_data.get(MATERIAL_PIPELINE_JSON_SHA256_KEY) or ""
+        ).strip()
+        if from_mesh_export and (not expected_mesh_name or not sidecar_sha256):
+            utilities.report_error(
+                "Export-bound JSON sidecar evidence is incomplete.",
+                f' Asset: "{asset_path}".',
+            )
+            return
+        asset_data[MATERIAL_PIPELINE_EXPECTED_MESH_NAME_KEY] = expected_mesh_name
+        asset_data[MATERIAL_PIPELINE_JSON_SHA256_KEY] = sidecar_sha256
+        preflight_asset_path = self._preflight_asset_path(
+            asset_path,
+            expected_mesh_name,
+        )
 
         json_arg = repr(json_path)
+        expected_name_arg = repr(expected_mesh_name)
+        sidecar_sha_arg = repr(sidecar_sha256)
         commands = [
             "import sys",
             "import importlib.util",
@@ -335,7 +409,12 @@ class MaterialPipelineExtension(ExtensionBase):
             "_p = importlib.util.module_from_spec(_spec)",
             "sys.modules[_spec.name] = _p",
             "_spec.loader.exec_module(_p)",
-            f"_p.preflight_mesh_materials(_asset_path, json_path={json_arg})",
+            (
+                "_p.preflight_mesh_materials("
+                f"_asset_path, json_path={json_arg}, "
+                f"expected_mesh_name={expected_name_arg}, "
+                f"sidecar_sha256={sidecar_sha_arg})"
+            ),
         ]
         run_commands(commands)
 
@@ -344,14 +423,9 @@ class MaterialPipelineExtension(ExtensionBase):
         # assets that immediately need cleanup, which is expensive in Unreal/P4.
         asset_data["_import_materials_and_textures"] = False
 
-    def _preflight_asset_path(self, asset_path, json_path):
-        """Match preflight identity to the exact sidecar-selected asset unit."""
-        try:
-            with open(json_path, "r", encoding="utf-8") as handle:
-                sidecar = json.load(handle)
-        except (OSError, json.JSONDecodeError, TypeError):
-            return asset_path
-        mesh_name = str(sidecar.get("mesh_name") or "")
+    def _preflight_asset_path(self, asset_path, expected_mesh_name):
+        """Use the Blender-authored asset unit, never JSON, as authority."""
+        mesh_name = str(expected_mesh_name or "").strip()
         base_path = str(asset_path or "").split(".")[0]
         if not mesh_name or "/" not in base_path:
             return asset_path
@@ -376,9 +450,17 @@ class MaterialPipelineExtension(ExtensionBase):
         json_path = asset_data.get(MATERIAL_PIPELINE_JSON_PATH_KEY)
         if not json_path:
             return
+        expected_mesh_name = str(
+            asset_data.get(MATERIAL_PIPELINE_EXPECTED_MESH_NAME_KEY) or ""
+        ).strip()
+        sidecar_sha256 = str(
+            asset_data.get(MATERIAL_PIPELINE_JSON_SHA256_KEY) or ""
+        ).strip()
         if asset_data.get("_asset_type") == UnrealTypes.SKELETAL_MESH:
             _POST_OPERATION_SKELETAL_ASSET_PATHS.append(asset_path)
         json_arg = repr(str(json_path))
+        expected_name_arg = repr(expected_mesh_name)
+        sidecar_sha_arg = repr(sidecar_sha256)
 
         commands = [
             "import sys",
@@ -402,7 +484,12 @@ class MaterialPipelineExtension(ExtensionBase):
             "\texcept Exception as _sync_error:",
             "\t\tunreal.log_warning('[material_pipeline] content browser sync failed: ' + str(_sync_error))",
             "try:",
-            f"\t_p.process_mesh(_asset_path, json_path={json_arg})",
+            (
+                "\t_p.process_mesh("
+                f"_asset_path, json_path={json_arg}, "
+                f"expected_mesh_name={expected_name_arg}, "
+                f"sidecar_sha256={sidecar_sha_arg})"
+            ),
             "finally:",
             "\t_sync_to_imported_asset(_asset_path)",
         ]

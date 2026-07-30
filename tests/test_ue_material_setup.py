@@ -727,6 +727,26 @@ class TestUeMaterialTextureImport(unittest.TestCase):
 
         self.assertEqual(calls, [])
 
+    def test_material_layer_normalization_revalidates_same_asset_live(self):
+        calls = []
+
+        class Helper:
+            def normalize_material_layer_placeholders(inner_self, asset_path):
+                calls.append(asset_path)
+                return True
+
+        asset_path = "/Game/Codex/Tests/Elm/_MaterialPipeline/MYI/MYI_Bark"
+        for _ in range(2):
+            self.module._normalize_material_layer_asset(
+                Helper(),
+                "normalize_material_layer_placeholders",
+                asset_path,
+                "material layer instance",
+                mutation_scope_path="/Game/Codex/Tests/Elm/SK_Tree",
+            )
+
+        self.assertEqual(calls, [asset_path, asset_path])
+
     def test_codex_test_scope_requires_isolated_explicit_targets(self):
         valid = {
             "codex_test_asset_scope": {
@@ -1198,7 +1218,7 @@ class TestUeMaterialTextureImport(unittest.TestCase):
         self.assertEqual(self.runtime.created_assets, [])
         self.assertEqual(self.runtime.save_calls, [])
 
-    def test_new_sidecar_mismatch_blocks_while_legacy_stays_compatible(self):
+    def test_new_sidecar_mismatch_and_descriptor_free_tree_are_blocked(self):
         bad_descriptor = self._contract_sidecar()
         bad_descriptor["speedtree_handoff_contract"]["fingerprint"] = "stale"
         with self.assertRaisesRegex(RuntimeError, "fingerprint mismatch"):
@@ -1230,12 +1250,69 @@ class TestUeMaterialTextureImport(unittest.TestCase):
                 {"name": "M_stem_common_01", "master_preset": "tree"}
             ],
         }
-        self.assertIsNone(
+        with self.assertRaisesRegex(RuntimeError, "no speedtree_handoff_contract"):
             self.module._validate_speedtree_handoff_contract(
                 legacy,
                 "SK_CommonGrass",
             )
+
+        legacy_prop = {
+            "mesh_name": "SM_Prop",
+            "materials": [
+                {"name": "M_Prop", "master_preset": "prop"}
+            ],
+        }
+        self.assertIsNone(
+            self.module._validate_speedtree_handoff_contract(
+                legacy_prop,
+                "SM_Prop",
+                "/Game/Meshes/Props/SM_Prop",
+            )
         )
+
+    def test_json_fallback_rejects_ambiguous_candidates(self):
+        first = Path(self.temp_dir.name) / "first" / "SK_CommonGrass.json"
+        second = Path(self.temp_dir.name) / "second" / "SK_CommonGrass.json"
+        first.parent.mkdir()
+        second.parent.mkdir()
+        first.write_text("{}", encoding="utf-8")
+        second.write_text("{}", encoding="utf-8")
+        self.module._mesh_path_to_disk_folder = lambda mesh_path: None
+        self.module.JSON_SEARCH_ROOTS = [self.temp_dir.name]
+        self.module.EXPORT_DIR = str(Path(self.temp_dir.name) / "missing")
+        self.module._walk_for_json = lambda roots, filename: [
+            str(first),
+            str(second),
+        ]
+
+        with self.assertRaisesRegex(RuntimeError, "ambiguous JSON sidecar fallback"):
+            self.module._find_json_path(
+                "SK_CommonGrass",
+                "/Game/Meshes/Tree/SK_CommonGrass",
+            )
+
+    def test_explicit_json_sidecar_sha_detects_changed_bytes(self):
+        sidecar = Path(self.temp_dir.name) / "SK_CommonGrass.json"
+        payload = json.dumps({"mesh_name": "SK_CommonGrass"}).encode("utf-8")
+        sidecar.write_bytes(payload)
+        expected_sha256 = hashlib.sha256(payload).hexdigest()
+
+        data = self.module._load_json(
+            "SK_CommonGrass",
+            explicit_path=str(sidecar),
+            mesh_path="/Game/Meshes/Tree/SK_CommonGrass",
+            expected_sha256=expected_sha256,
+        )
+        self.assertEqual(data["mesh_name"], "SK_CommonGrass")
+
+        sidecar.write_text('{"mesh_name": "SK_Changed"}', encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "content changed"):
+            self.module._load_json(
+                "SK_CommonGrass",
+                explicit_path=str(sidecar),
+                mesh_path="/Game/Meshes/Tree/SK_CommonGrass",
+                expected_sha256=expected_sha256,
+            )
 
     def test_explicit_json_path_never_falls_back_to_global_search(self):
         calls = []
