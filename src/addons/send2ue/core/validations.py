@@ -3,7 +3,7 @@
 import re
 import os
 import bpy
-from . import utilities, formatting, extension
+from . import utilities, formatting, extension, ue_groom_adapter
 from ..constants import BlenderTypes, PathModes, ToolInfo, Extensions, ExtensionTasks, RegexPresets
 from ..dependencies.unreal import UnrealRemoteCalls as UnrealCalls
 from ..dependencies.rpc.factory import make_remote
@@ -307,10 +307,21 @@ class ValidationManager:
         """
         if self.properties.validate_unreal_plugins and self.properties.import_grooms and self.hair_objects:
             # A dictionary of plugins where the key is the plugin name and value is the plugin label.
-            groom_plugins = {
-                'HairStrands': 'Groom',
-                'AlembicHairImporter': 'Alembic Groom Importer'
-            }
+            groom_plugins = {'HairStrands': 'Groom'}
+            if any(
+                isinstance(hair_object, bpy.types.Object)
+                and ue_groom_adapter.is_hair_tool_groom(hair_object, self.properties)
+                for hair_object in self.hair_objects
+            ):
+                groom_plugins['USDImporter'] = 'USD Importer'
+            if any(
+                not (
+                    isinstance(hair_object, bpy.types.Object)
+                    and ue_groom_adapter.is_hair_tool_groom(hair_object, self.properties)
+                )
+                for hair_object in self.hair_objects
+            ):
+                groom_plugins['AlembicHairImporter'] = 'Alembic Groom Importer'
             enabled_plugins = UnrealRemoteCalls.get_enabled_plugins()
             missing_plugins = [value for key, value in groom_plugins.items() if key not in enabled_plugins]
             plugin_names = ', '.join(missing_plugins)

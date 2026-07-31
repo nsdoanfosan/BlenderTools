@@ -1,5 +1,7 @@
 # Copyright Epic Games, Inc. All Rights Reserved.
 
+import math
+
 import bpy
 from . import armature_modifier_fix, utilities
 from ..constants import BlenderTypes, ToolInfo
@@ -8,7 +10,11 @@ from ..constants import BlenderTypes, ToolInfo
 STATE_KEY = 'send2ue_hair_tool_export_state'
 SOURCE_NAME_PROPERTY = '_send2ue_hair_tool_source_name'
 TEMP_PROPERTY = '_send2ue_hair_tool_temp'
-RSAO_NAME = 'RSAO'
+RFAOS_NAME = 'RFAOS'
+RFAOS_NANITE_UV_RG = 'HairTool_RFAOS_RG'
+RFAOS_NANITE_UV_BA = 'HairTool_RFAOS_BA'
+RFAOS_NANITE_UV_TAG = 2.0
+RFAOS_NANITE_UV_START_INDEX = 2
 
 
 def is_hair_tool_object(scene_object):
@@ -101,9 +107,16 @@ def _loop_to_polygon_indices(mesh):
     return loop_to_polygon
 
 
-def _attribute_scalar(mesh, attribute, loop_index, loop_to_polygon=None):
+def _attribute_component(
+    mesh,
+    attribute,
+    loop_index,
+    component_index=0,
+    loop_to_polygon=None,
+    default=0.0,
+):
     if not attribute:
-        return 0.0
+        return default
 
     loop = mesh.loops[loop_index]
     if attribute.domain == 'POINT':
@@ -113,47 +126,171 @@ def _attribute_scalar(mesh, attribute, loop_index, loop_to_polygon=None):
     elif attribute.domain == 'FACE':
         data_index = loop_to_polygon[loop_index] if loop_to_polygon else 0
     else:
-        return 0.0
+        return default
 
     item = attribute.data[data_index]
     if hasattr(item, 'value'):
         return float(item.value)
     if hasattr(item, 'color'):
-        return float(item.color[0])
+        color = item.color
+        if component_index < len(color):
+            return float(color[component_index])
+        return default
     if hasattr(item, 'vector'):
-        return float(item.vector[0])
-    return 0.0
+        vector = item.vector
+        if component_index < len(vector):
+            return float(vector[component_index])
+        return default
+    return default
 
 
-def _pack_rsao(mesh):
+def _pack_rfaos(mesh):
+    """Pack RFAOS into vertex color and a Skeletal-Nanite-safe UV mirror."""
     random_attribute = mesh.attributes.get('Random')
+    factor_attribute = mesh.attributes.get('Factor')
     system_color_attribute = mesh.attributes.get('SystemColor')
     ao_attribute = mesh.attributes.get('AO')
     loop_to_polygon = _loop_to_polygon_indices(mesh)
 
-    existing_rsao = mesh.attributes.get(RSAO_NAME)
-    if existing_rsao:
-        mesh.attributes.remove(existing_rsao)
+    if factor_attribute is None:
+        raise RuntimeError(
+            f'Hair Tool mesh "{mesh.name}" has no "Factor" attribute. '
+            'Root/Tip ranges cannot be exported without a strand gradient.'
+        )
 
-    rsao = mesh.color_attributes.new(
-        name=RSAO_NAME,
+    factor_values = [
+        _attribute_component(
+            mesh,
+            factor_attribute,
+            loop_index,
+            loop_to_polygon=loop_to_polygon,
+        )
+        for loop_index in range(len(mesh.loops))
+    ]
+    if factor_values and max(factor_values) - min(factor_values) <= (1.0 / 255.0):
+        raise RuntimeError(
+            f'Hair Tool mesh "{mesh.name}" has a constant "Factor" attribute. '
+            'Root/Tip ranges require a varying 0-1 strand gradient.'
+        )
+
+    existing_rfaos = mesh.attributes.get(RFAOS_NAME)
+    if existing_rfaos:
+        mesh.attributes.remove(existing_rfaos)
+
+    rfaos = mesh.color_attributes.new(
+        name=RFAOS_NAME,
         type='BYTE_COLOR',
         domain='CORNER',
     )
-    for loop_index, color_item in enumerate(rsao.data):
-        color_item.color = (
-            _attribute_scalar(mesh, random_attribute, loop_index, loop_to_polygon),
-            _attribute_scalar(mesh, system_color_attribute, loop_index, loop_to_polygon),
-            _attribute_scalar(mesh, ao_attribute, loop_index, loop_to_polygon),
-            1.0,
+    packed_values = []
+    channel_names = ('Random', 'Factor', 'AO', 'SystemColor Alpha')
+    for loop_index in range(len(mesh.loops)):
+        packed = (
+            _attribute_component(
+                mesh, random_attribute, loop_index,
+                loop_to_polygon=loop_to_polygon,
+            ),
+            factor_values[loop_index],
+            _attribute_component(
+                mesh, ao_attribute, loop_index,
+                loop_to_polygon=loop_to_polygon,
+            ),
+            _attribute_component(
+                mesh, system_color_attribute, loop_index,
+                component_index=3,
+                loop_to_polygon=loop_to_polygon,
+            ),
         )
+        for channel_name, value in zip(channel_names, packed):
+            if not math.isfinite(value) or value < -1.0e-5 or value > 1.00001:
+                raise RuntimeError(
+                    f'Hair Tool mesh "{mesh.name}" has invalid {channel_name} '
+                    f'value {value!r} at loop {loop_index}; RFAOS data must be finite 0-1.'
+                )
+        packed_values.append(tuple(min(max(value, 0.0), 1.0) for value in packed))
+
+    for color_item, packed in zip(rfaos.data, packed_values):
+        # BYTE_COLOR exposes ``color`` in scene-linear space, while FBX writes
+        # the underlying sRGB byte values. RFAOS contains data masks, not
+        # display colors, so write the sRGB-facing property to keep the numeric
+        # RGBA values unchanged when Unreal imports the FBX vertex colors.
+        if hasattr(color_item, 'color_srgb'):
+            color_item.color_srgb = packed
+        else:
+            color_item.color = packed
 
     for color_attribute in list(mesh.color_attributes):
-        if color_attribute.name != RSAO_NAME:
+        if color_attribute.name != RFAOS_NAME:
             mesh.color_attributes.remove(color_attribute)
 
-    mesh.color_attributes.active_color = mesh.color_attributes[RSAO_NAME]
-    mesh.color_attributes.render_color_index = mesh.color_attributes.find(RSAO_NAME)
+    mesh.color_attributes.active_color = mesh.color_attributes[RFAOS_NAME]
+    mesh.color_attributes.render_color_index = mesh.color_attributes.find(RFAOS_NAME)
+
+    _pack_rfaos_nanite_uvs(mesh, packed_values)
+
+
+def _ensure_payload_uv(mesh, name, index):
+    uv_layers = mesh.uv_layers
+    layer = uv_layers.get(name)
+    if layer is None:
+        if len(uv_layers) > index:
+            raise RuntimeError(
+                f'Hair Tool Nanite payload UV{index} is occupied by '
+                f'"{uv_layers[index].name}" on "{mesh.name}".'
+            )
+        if len(uv_layers) != index:
+            raise RuntimeError(
+                f'Hair Tool Nanite payload requires UV{index}, but '
+                f'"{mesh.name}" currently has {len(uv_layers)} UV channels.'
+            )
+        layer = uv_layers.new(name=name)
+
+    layer_index = next(
+        (layer_index for layer_index, candidate in enumerate(uv_layers) if candidate == layer),
+        -1,
+    )
+    if layer_index != index:
+        raise RuntimeError(
+            f'Hair Tool Nanite payload "{name}" must be UV{index}, '
+            f'not UV{layer_index}, on "{mesh.name}".'
+        )
+    if len(layer.data) != len(mesh.loops):
+        raise RuntimeError(
+            f'Hair Tool Nanite payload "{name}" loop count does not match '
+            f'"{mesh.name}".'
+        )
+    return layer
+
+
+def _pack_rfaos_nanite_uvs(mesh, packed_values):
+    """Mirror RFAOS into UV2/UV3 because UE 5.8 Skeletal Nanite drops colors.
+
+    UV2 stores tagged Random in U and inverse-transported Factor in V.
+    UV3 stores tagged AO in U and inverse-transported SystemColor mask in V.
+    The FBX skeletal importer applies ``V = 1 - V``, so Unreal receives the
+    original Factor and SystemColor values in the V components.
+    """
+    rg_layer = _ensure_payload_uv(
+        mesh,
+        RFAOS_NANITE_UV_RG,
+        RFAOS_NANITE_UV_START_INDEX,
+    )
+    ba_layer = _ensure_payload_uv(
+        mesh,
+        RFAOS_NANITE_UV_BA,
+        RFAOS_NANITE_UV_START_INDEX + 1,
+    )
+
+    for index, packed in enumerate(packed_values):
+        random_value, factor, ao, system_mask = packed
+        rg_layer.data[index].uv = (
+            RFAOS_NANITE_UV_TAG + random_value,
+            1.0 - factor,
+        )
+        ba_layer.data[index].uv = (
+            RFAOS_NANITE_UV_TAG + ao,
+            1.0 - system_mask,
+        )
 
 
 def _remove_empty_material_slots(scene_object):
@@ -354,6 +491,12 @@ def prepare():
     """Create export-only mesh copies for Hair Tool systems in the Export collection."""
     cleanup()
 
+    # The UE Groom path reads evaluated Curves directly. Only the Cards and
+    # Cards + Groom modes need temporary evaluated mesh copies.
+    from . import ue_groom_adapter
+    if not ue_groom_adapter.wants_cards(bpy.context.scene.send2ue):
+        return
+
     export_collection = bpy.data.collections.get(ToolInfo.EXPORT_COLLECTION.value)
     if not export_collection:
         return
@@ -428,7 +571,7 @@ def prepare():
 
             _evaluate_combined_ao(temporary_object, state)
             _write_hair_tool_uvs(temporary_object.data)
-            _pack_rsao(temporary_object.data)
+            _pack_rfaos(temporary_object.data)
             _remove_empty_material_slots(temporary_object)
 
             armatures = {

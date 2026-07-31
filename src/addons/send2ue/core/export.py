@@ -4,7 +4,7 @@ import json
 import math
 import os
 import bpy
-from . import utilities, validations, settings, ingest, extension, io, hair_tool_export
+from . import utilities, validations, settings, ingest, extension, io, hair_tool_export, ue_groom_adapter
 from ..constants import BlenderTypes, UnrealTypes, FileTypes, PreFixToken, ToolInfo, ExtensionTasks
 
 
@@ -328,6 +328,21 @@ def export_hair(asset_id, properties):
     object_type = asset_data.get('_object_type')
     object_name = asset_data.get('_object_name')
 
+    # Unreal 5.8 can import a Groom from USD BasisCurves carrying GroomAPI.
+    # This direct path preserves evaluated Hair Tool curve attributes and does
+    # not create a particle system or preview mesh.
+    if asset_data.get('_ue_groom_adapter'):
+        curves_object = bpy.data.objects.get(object_name)
+        extension.run_extension_tasks(ExtensionTasks.PRE_GROOM_EXPORT.value)
+        report = ue_groom_adapter.write_usda(
+            curves_object,
+            asset_data['file_path'],
+            properties,
+        )
+        asset_data['_ue_groom_mappings'] = report['mappings']
+        extension.run_extension_tasks(ExtensionTasks.POST_GROOM_EXPORT.value)
+        return
+
     mesh_object = utilities.get_mesh_object_for_groom_name(object_name)
 
     # get all particle systems display options on all mesh objects
@@ -492,18 +507,23 @@ def create_groom_data(hair_objects, properties):
                 object_type = hair_object.settings.type
                 particle_object_name = hair_object.settings.name
 
+            adapter_groom = (
+                isinstance(hair_object, bpy.types.Object)
+                and ue_groom_adapter.is_hair_tool_groom(hair_object, properties)
+            )
+            file_extension = 'usda' if adapter_groom else 'abc'
             file_path = get_file_path(
                 hair_object.name,
                 properties,
                 UnrealTypes.GROOM,
                 lod=False,
-                file_extension='abc'
+                file_extension=file_extension
             )
             asset_id = utilities.get_asset_id(file_path)
             import_path = utilities.get_import_path(properties, UnrealTypes.GROOM)
             asset_name = utilities.get_asset_name(hair_object.name, properties)
 
-            groom_data[asset_id] = {
+            groom_asset_data = {
                 '_asset_type': UnrealTypes.GROOM,
                 '_object_name': hair_object.name,
                 '_particle_object_name': particle_object_name,
@@ -513,6 +533,25 @@ def create_groom_data(hair_objects, properties):
                 'asset_path': f'{import_path}{asset_name}',
                 'skip': False
             }
+            if adapter_groom:
+                adapter = ue_groom_adapter.get_settings(properties)
+                report = ue_groom_adapter.inspect_object(hair_object, properties)
+                preview = report.get('preview') or {}
+                groom_asset_data.update({
+                    '_ue_groom_adapter': True,
+                    '_ue_groom_deformation_preset': adapter.deformation_preset,
+                    '_ue_groom_group_count': report.get('data', {}).get('group_count', 1),
+                    '_ue_groom_rigged_guide_num_curves': adapter.rigged_guide_num_curves,
+                    '_ue_groom_rigged_guide_num_points': adapter.rigged_guide_num_points,
+                    '_ue_groom_preview_material_name': preview.get('material_name'),
+                    '_ue_groom_material_path': preview.get('unreal_material_path'),
+                    '_ue_groom_hair_width_cm': preview.get('hair_width_cm'),
+                    '_ue_groom_root_scale': preview.get('root_scale'),
+                    '_ue_groom_tip_scale': preview.get('tip_scale'),
+                    '_ue_groom_color': preview.get('color'),
+                    '_ue_groom_roughness': preview.get('roughness'),
+                })
+            groom_data[asset_id] = groom_asset_data
             # export particle hair systems as alembic file
             export_hair(asset_id, properties)
 
@@ -535,6 +574,7 @@ def create_asset_data(properties):
         if not (
             isinstance(hair_object, bpy.types.Object)
             and hair_tool_export.is_prepared_source(hair_object)
+            and not ue_groom_adapter.is_hair_tool_groom(hair_object, properties)
         )
     ]
 

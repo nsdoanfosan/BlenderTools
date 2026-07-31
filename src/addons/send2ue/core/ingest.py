@@ -1,13 +1,16 @@
 # Copyright Epic Games, Inc. All Rights Reserved.
 
 import bpy
+import copy
 from . import settings, extension
 from ..constants import PathModes, ExtensionTasks, UnrealTypes
+from ..dependencies import unreal as unreal_dependency
 from ..dependencies.unreal import UnrealRemoteCalls as UnrealCalls
 from .utilities import track_progress, get_asset_id
 from ..dependencies.rpc.factory import make_remote
 
 UnrealRemoteCalls = make_remote(UnrealCalls)
+MANIFEST_SCHEMA_VERSION = 1
 
 
 def _property_data_for_asset(asset_data, property_data):
@@ -23,6 +26,43 @@ def _property_data_for_asset(asset_data, property_data):
     option_data["value"] = bool(asset_data["_import_materials_and_textures"])
     adjusted["import_materials_and_textures"] = option_data
     return adjusted
+
+
+def build_manifest_items(properties):
+    """Serialize the existing extension/import contract for deferred ingest."""
+    property_data = settings.get_extra_property_group_data_as_dictionary(
+        properties,
+        only_key='unreal_type',
+    )
+    manifest_items = []
+    window_properties = bpy.context.window_manager.send2ue
+
+    for asset_id, asset_data in window_properties.asset_data.items():
+        window_properties.asset_id = asset_id
+
+        with unreal_dependency.record_commands() as pre_import_commands:
+            extension.run_extension_tasks(ExtensionTasks.PRE_IMPORT.value)
+
+        adjusted_property_data = _property_data_for_asset(asset_data, property_data)
+
+        with unreal_dependency.record_commands() as post_import_commands:
+            extension.run_extension_tasks(ExtensionTasks.POST_IMPORT.value)
+
+        manifest_items.append({
+            'schema_version': MANIFEST_SCHEMA_VERSION,
+            'asset_id': asset_id,
+            'asset_data': copy.deepcopy(asset_data),
+            'property_data': copy.deepcopy(adjusted_property_data),
+            'pre_import_commands': copy.deepcopy(pre_import_commands),
+            'post_import_commands': copy.deepcopy(post_import_commands),
+            'operations': {
+                'reset_and_import_lods': bool(asset_data.get('lods')),
+                'create_static_mesh_sockets': bool(asset_data.get('sockets')),
+            },
+        })
+
+    window_properties.asset_id = ''
+    return manifest_items
 
 
 @track_progress(message='Importing asset "{attribute}"...', attribute='file_path')
@@ -41,11 +81,15 @@ def import_asset(asset_id, property_data):
 
     if not asset_data.get('skip'):
         file_path = asset_data.get('file_path')
-        UnrealRemoteCalls.import_asset(
+        import_result = UnrealRemoteCalls.import_asset(
             file_path,
             asset_data,
             _property_data_for_asset(asset_data, property_data),
         )
+        if asset_data.get('_ue_groom_adapter') and isinstance(import_result, dict):
+            groom_asset_path = import_result.get('groom_asset_path')
+            if groom_asset_path:
+                asset_data['asset_path'] = groom_asset_path
 
         # import fcurves
         if asset_data.get('fcurve_file_path'):

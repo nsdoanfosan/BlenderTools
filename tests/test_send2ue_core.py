@@ -23,6 +23,11 @@ class TestSend2UeCore(BaseSend2ueTestCaseCore):
         """
         self.run_extension_tests({
             'default': {
+                'ue_groom_adapter': {
+                    'properties': {
+                        'enabled': False
+                    }
+                },
                 'ue2rigify': {
                     'tasks': [
                         'pre_operation'

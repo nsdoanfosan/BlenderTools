@@ -14,11 +14,17 @@ process_mesh(asset_path) 를 RPC 로 호출한다. 수동 실행도 가능.
 가드: 머티리얼명에서 'M_' 를 뗀 것이 메쉬명과 정확히 같거나 '메쉬명_' 으로 시작할 때만 처리.
 """
 
+import hashlib
+import importlib.util
 import json
 import os
 import re
+import sys
 import time
 import unreal
+
+
+UNREAL_INSTANCE_PROFILE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 
 
 def _candidate_contract_paths():
@@ -60,6 +66,54 @@ def _pipeline_contract():
 def _contract_path_mapping():
     return _pipeline_contract().get("unreal_path_mapping", {}).get("current_default", {})
 
+
+_SPEEDTREE_HANDOFF_API_UNSET = object()
+_SPEEDTREE_HANDOFF_API = _SPEEDTREE_HANDOFF_API_UNSET
+
+
+def _candidate_speedtree_handoff_api_paths():
+    seen = set()
+    for contract_path in _candidate_contract_paths():
+        module_path = os.path.join(
+            os.path.dirname(os.path.abspath(contract_path)),
+            "speedtree_handoff_contract.py",
+        )
+        normalized = os.path.normcase(module_path)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        yield module_path
+
+
+def _speedtree_handoff_api():
+    """Load the dependency-free shared rules without adding a repo to sys.path."""
+    global _SPEEDTREE_HANDOFF_API
+    if _SPEEDTREE_HANDOFF_API is not _SPEEDTREE_HANDOFF_API_UNSET:
+        return _SPEEDTREE_HANDOFF_API
+
+    for module_path in _candidate_speedtree_handoff_api_paths():
+        if not os.path.isfile(module_path):
+            continue
+        module_name = "_send2ue_speedtree_handoff_contract"
+        try:
+            spec = importlib.util.spec_from_file_location(module_name, module_path)
+            if spec is None or spec.loader is None:
+                continue
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = module
+            spec.loader.exec_module(module)
+            _SPEEDTREE_HANDOFF_API = module
+            return module
+        except Exception as exc:
+            _warn(
+                "shared SpeedTree handoff API load failed: "
+                f"{module_path} ({exc})"
+            )
+            sys.modules.pop(module_name, None)
+
+    _SPEEDTREE_HANDOFF_API = None
+    return None
+
 # ─── 설정 ────────────────────────────────────────────────────────────────────
 DEFAULT_MASTER_PRESET = "prop"
 MASTER_PRESETS = {
@@ -81,7 +135,8 @@ MASTER_PRESETS = {
             "Extra": "Extra",
             "Normal": "Normal",
             "Height": "Height",
-            "Transmission": "Transmission",
+            "Opacity Map": "Opacity Map",
+            "Subsurface": "Subsurface",
         },
         "virtual_textures": True,
     },
@@ -124,15 +179,20 @@ MASTER_PRESETS = {
         "virtual_textures": True,
     },
     "hair": {
-        "master": "/Game/CC_Shaders/HairShader/RL_Hair",
-        "mi_folder": "/Game/Material/AssetSurface/MI/Hair",
+        "master": "/Game/Material/HairTool/Master/M_HT_HairCards",
+        "mi_folder": "/Game/Material/HairTool/MI",
         "assignment": "none",
-        "virtual_textures": False,
-        "create_if_missing": False,
-        "exclude_path_fragments": ["/Game/Material/AssetSurface/"],
+        "virtual_textures": None,
+        "create_if_missing": True,
+        "exclude_path_fragments": [],
     },
     "tree": {
         "master": "/Game/Material/Tree/AssetTree/Master/M_TreeAsset_Master",
+        "masters_by_shading": {
+            "wood": "/Game/Material/Tree/AssetTree/Master/M_TreeAsset_Master",
+            "foliage": "/Game/Material/Tree/AssetTree/Master/M_TreeAsset_Foliage_Master",
+            "stem": "/Game/Material/Tree/AssetTree/Master/M_TreeAsset_Stem_Master",
+        },
         "mi_folder": "/Game/Material/Tree/AssetTree/MI",
         "assignment": "material_layer_instance",
         "layer_parent": "/Game/Material/Tree/AssetTree/Master/MaterialLayer/MY_Tree_Bark",
@@ -147,7 +207,7 @@ MASTER_PRESETS = {
             "Extra": "Extra",
             "Normal": "Normal",
             "Height": "Height",
-            "Transmission": "Transmission",
+            "Subsurface": "Subsurface",
         },
         "virtual_textures": True,
     },
@@ -178,11 +238,16 @@ KNOWN_PARAMS = {
     "Normal",
     "Height",
     "Transmission",
+    "Subsurface",
     "Emissive",
     "Sheen Color",
     "Sheen Opacity",
     "Sheen Roughness",
     "Moss Blend Mask",
+    "Flow Map",
+    "IRD Map",
+    "ORM Map",
+    "Opacity Map",
 }
 LAYER_PARAM_BY_LEGACY_PARAM = {
     "BaseColor": "Albedo",
@@ -198,6 +263,20 @@ LAYER_PARAM_BY_LEGACY_PARAM = {
     "SheenOpacity": "Sheen Opacity",
     "SheenRoughness": "Sheen Roughness",
     "Texture": "Albedo",
+}
+
+# Unreal-owned Hair Tool controls. Blender sidecars intentionally omit these,
+# and existing instance overrides must survive every later re-export.
+HAIR_INSTANCE_OWNED_SCALAR_PARAMETERS = {
+    "System Color Influence",
+    "System Mask Contrast",
+    "System Mask Bias",
+    "System Mask Invert",
+    "Roughness Multiplier",
+}
+HAIR_INSTANCE_OWNED_VECTOR_PARAMETERS = {
+    "System Color 01",
+    "System Color 02",
 }
 FLAT_PARAM_BY_LAYER_PARAM = {
     "Albedo": "BaseColor",
@@ -266,13 +345,8 @@ TEXTURE_PARAM_BY_NAME_SUFFIX = (
     ("_subsurface", "Subsurface"),
 )
 
-# import 되는 텍스처의 인게임 최대 해상도 캡(param 별). 목록에 없으면 DEFAULT 적용.
-MAX_TEXTURE_SIZE_BY_PARAM = {
-    "Albedo": 2048,   # 2K
-    "BaseColor": 2048,   # legacy JSON
-    "Normal":    2048,   # 2K
-}
-DEFAULT_MAX_TEXTURE_SIZE = 1024   # MetallicRoughness/Emissive/기타 → 1K
+# Virtual Texture Streaming을 쓰므로 모든 텍스처의 인게임 최대 해상도는 제한하지 않는다.
+DEFAULT_MAX_TEXTURE_SIZE = 0
 ENABLE_VIRTUAL_TEXTURE_STREAMING = True
 # import 되는 StaticMesh 를 자동으로 Nanite 로 등록할지(반투명 머티리얼 메쉬는 자동 제외).
 ENABLE_NANITE = True
@@ -281,10 +355,10 @@ DYNAMIC_WIND_JSON_SUFFIX = "_dynamic_wind_import_from_megaplant_groups.json"
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-# 텍스처 재import 회피용 mtime 캐시 (텍스처 asset path -> 소스파일 mtime).
-# send 마다 OneDrive 에서 모든 텍스처를 다시 읽지 않도록, 소스가 안 바뀌었고 에셋이 이미
-# 있으면 import 를 건너뛴다. 소스를 수정하면 mtime 이 바뀌어 자동으로 재import 된다.
+# 텍스처 해시 캐시. 기존 asset path -> mtime(float) 엔트리는 읽을 수 있지만,
+# AssetImportData FileMD5와 실제 설정을 검증한 뒤에만 v2 dict로 지연 마이그레이션한다.
 TEXTURE_IMPORT_CACHE = os.path.join(EXPORT_DIR, "_texture_import_cache.json")
+TEXTURE_CACHE_ENTRY_VERSION = 2
 
 
 def _load_texture_cache() -> dict:
@@ -352,26 +426,186 @@ def _find_json_path(mesh_name: str, mesh_path: str = None):
 
     if not candidates:
         return None
-    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    return candidates[0]
+    unique_candidates = {
+        os.path.normcase(os.path.abspath(path)): path
+        for path in candidates
+    }
+    if len(unique_candidates) != 1:
+        raise RuntimeError(
+            "ambiguous JSON sidecar fallback for "
+            f"{mesh_name}: "
+            + "; ".join(sorted(unique_candidates.values()))
+        )
+    return next(iter(unique_candidates.values()))
 
 
-def _load_json(mesh_name: str, explicit_path: str = None, mesh_path: str = None):
+def _load_json(
+    mesh_name: str,
+    explicit_path: str = None,
+    mesh_path: str = None,
+    expected_sha256: str = "",
+):
     # extension 이 정확한 JSON 경로를 넘겨주면 walk 를 건너뛴다. 없으면 mesh_path 로 폴더를 좁힌다.
-    if explicit_path and os.path.exists(explicit_path):
+    if explicit_path:
+        if not os.path.isfile(explicit_path):
+            raise RuntimeError(f"explicit JSON sidecar is missing: {explicit_path}")
         path = explicit_path
     else:
         path = _find_json_path(mesh_name, mesh_path)
     if not path:
         return None
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        with open(path, "rb") as f:
+            payload = f.read()
+        actual_sha256 = hashlib.sha256(payload).hexdigest()
+        if expected_sha256 and actual_sha256 != str(expected_sha256).casefold():
+            raise RuntimeError(
+                "JSON sidecar content changed after Blender export: "
+                f"{path}"
+            )
+        data = json.loads(payload.decode("utf-8"))
         _log(f"JSON sidecar: {path}")
         return data
     except Exception as e:
+        if explicit_path:
+            raise RuntimeError(
+                f"explicit JSON sidecar could not be read: {path} ({e})"
+            ) from e
         _warn(f"JSON 읽기 실패 ({mesh_name}.json): {e}")
         return None
+
+
+def _speedtree_sidecar_descriptor(data: dict):
+    if not isinstance(data, dict):
+        return None
+    value = data.get("speedtree_handoff_contract")
+    return value if isinstance(value, dict) else None
+
+
+def _validate_speedtree_handoff_contract(
+    data: dict,
+    expected_mesh_name: str,
+    mesh_path: str = "",
+):
+    """Validate new contract-authored sidecars before any Unreal mutation.
+
+    Descriptor-free non-tree sidecars retain legacy compatibility. Any tree
+    marker requires the current descriptor and material intent contract.
+    """
+    materials = data.get("materials", []) if isinstance(data, dict) else []
+    has_intent = any(
+        isinstance(entry, dict) and "speedtree_intent" in entry
+        for entry in materials
+    )
+    has_tree_entry = any(
+        isinstance(entry, dict)
+        and str(entry.get("master_preset") or "").strip().casefold() == "tree"
+        for entry in materials
+    )
+    has_tree_root = str(
+        (
+            data.get("material_master")
+            or data.get("master_material")
+            or data.get("master_preset")
+            or ""
+        )
+        if isinstance(data, dict)
+        else ""
+    ).strip().casefold() == "tree"
+    descriptor = _speedtree_sidecar_descriptor(data)
+    requires_speedtree_contract = bool(
+        descriptor is not None
+        or has_intent
+        or has_tree_entry
+        or has_tree_root
+        or _is_tree_asset_path(mesh_path)
+    )
+    if not requires_speedtree_contract:
+        return None
+
+    contract_api = _speedtree_handoff_api()
+    if contract_api is None:
+        raise RuntimeError(
+            "SpeedTree handoff contract preflight blocked before mutation: "
+            "shared speedtree_handoff_contract.py is unavailable"
+        )
+    if descriptor is None:
+        raise RuntimeError(
+            "SpeedTree handoff contract preflight blocked before mutation: "
+            "tree sidecar has no speedtree_handoff_contract"
+        )
+
+    errors = []
+    try:
+        descriptor = contract_api.validate_sidecar_descriptor(
+            descriptor,
+            expected_mesh_name=expected_mesh_name,
+        )
+    except Exception as exc:
+        errors.append(str(exc))
+
+    json_mesh_name = str(data.get("mesh_name") or "").strip()
+    if not json_mesh_name:
+        errors.append("contract sidecar has no mesh_name")
+    elif json_mesh_name.casefold() != str(expected_mesh_name or "").strip().casefold():
+        errors.append(
+            f"sidecar mesh_name mismatch: {json_mesh_name!r} != "
+            f"{expected_mesh_name!r}"
+        )
+
+    for entry_index, entry in enumerate(materials):
+        if not isinstance(entry, dict):
+            errors.append(f"materials[{entry_index}] is not an object")
+            continue
+        is_tree = str(entry.get("master_preset") or "").strip().casefold() == "tree"
+        intent = entry.get("speedtree_intent")
+        if is_tree and intent is None:
+            errors.append(
+                f"{entry.get('name', '<unnamed>')}: tree entry has no speedtree_intent"
+            )
+            continue
+        if intent is None:
+            continue
+        if not is_tree:
+            errors.append(
+                f"{entry.get('name', '<unnamed>')}: speedtree_intent requires master_preset 'tree'"
+            )
+            continue
+        try:
+            validated = contract_api.validate_material_intent_for_name(
+                intent,
+                str(entry.get("name") or ""),
+            )
+            expected = contract_api.build_material_intent(
+                str(entry.get("name") or ""),
+                explicit_tree_part=str(entry.get("tree_part") or ""),
+                explicit_tree_shading=str(entry.get("tree_shading") or ""),
+                instance_profile=str(entry.get("instance_profile") or ""),
+            )
+            for key, expected_value in expected.items():
+                if validated.get(key) != expected_value:
+                    raise ValueError(
+                        f"speedtree_intent {key} mismatch: "
+                        f"{validated.get(key)!r} != {expected_value!r}"
+                    )
+            if expected.get("instance_profile"):
+                entry_mode = str(
+                    entry.get("material_instance_mode") or ""
+                ).strip().casefold()
+                if entry_mode != expected.get("material_instance_mode"):
+                    raise ValueError(
+                        f"material_instance_mode mismatch: {entry_mode!r} != "
+                        f"{expected.get('material_instance_mode')!r}"
+                    )
+        except Exception as exc:
+            errors.append(f"{entry.get('name', '<unnamed>')}: {exc}")
+
+    if errors:
+        raise RuntimeError(
+            "SpeedTree handoff contract preflight blocked before mutation: "
+            + " | ".join(errors)
+        )
+    return descriptor
 
 
 def _set_texture_property_if_changed(tex, property_name: str, value) -> bool:
@@ -403,23 +637,93 @@ def _effective_texture_param(param: str, file_path=None, asset_name=None) -> str
     return _texture_param_from_name(file_path, asset_name) or str(param or "")
 
 
-def _configure_imported_texture(
-    tex,
+def _file_md5(file_path: str) -> str:
+    digest = hashlib.md5()
+    with open(file_path, "rb") as source_file:
+        for chunk in iter(lambda: source_file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _texture_source_fingerprint(file_path: str, cached_entry=None):
+    # Cache metadata is diagnostic only. A strict content gate must hash the
+    # current source even when mtime/size match a previously verified entry.
+    del cached_entry
+    stat_result = os.stat(file_path)
+    mtime_ns = int(
+        getattr(stat_result, "st_mtime_ns", int(stat_result.st_mtime * 1_000_000_000))
+    )
+    size = int(stat_result.st_size)
+    source_md5 = _file_md5(file_path)
+    return source_md5, {
+        "version": TEXTURE_CACHE_ENTRY_VERSION,
+        "source_path": os.path.normcase(os.path.abspath(file_path)),
+        "mtime_ns": mtime_ns,
+        "size": size,
+        "md5": source_md5,
+    }
+
+
+def _asset_data_tag_value(asset_data, tag_name: str) -> str:
+    if asset_data is None:
+        return ""
+    try:
+        value = asset_data.get_tag_value(tag_name)
+    except Exception:
+        try:
+            value = unreal.AssetRegistryHelpers.get_tag_value(asset_data, tag_name)
+        except Exception:
+            value = ""
+    if isinstance(value, tuple):
+        value = next((item for item in reversed(value) if isinstance(item, str)), "")
+    if value:
+        return str(value)
+    try:
+        tags = asset_data.tags_and_values
+        return str(tags.get(tag_name, ""))
+    except Exception:
+        return ""
+
+
+def _asset_import_file_md5(asset_path: str):
+    try:
+        asset_data = unreal.EditorAssetLibrary.find_asset_data(asset_path)
+    except Exception:
+        return None
+    raw_value = _asset_data_tag_value(asset_data, "AssetImportData")
+    if not raw_value:
+        return None
+
+    try:
+        source_files = json.loads(raw_value)
+    except (TypeError, ValueError):
+        source_files = []
+    if isinstance(source_files, dict):
+        source_files = [source_files]
+    for source_file in source_files if isinstance(source_files, list) else []:
+        if not isinstance(source_file, dict):
+            continue
+        file_md5 = str(source_file.get("FileMD5") or "").lower()
+        if re.fullmatch(r"[0-9a-f]{32}", file_md5) and file_md5 != "0" * 32:
+            return file_md5
+
+    match = re.search(r'\bFileMD5["\']?\s*[:=]\s*["\']?([0-9a-fA-F]{32})', raw_value)
+    if match and match.group(1) != "0" * 32:
+        return match.group(1).lower()
+    return None
+
+
+def _desired_texture_settings(
     param: str,
     virtual_texture_streaming=None,
     file_path=None,
     asset_name=None,
-) -> bool:
-    changed = False
+) -> dict:
+    del virtual_texture_streaming  # Project policy: every imported texture uses VT streaming.
     param = _effective_texture_param(param, file_path, asset_name)
-
     if param == "Normal":
-        changed |= _set_texture_property_if_changed(tex, "srgb", False)
-        changed |= _set_texture_property_if_changed(
-            tex,
-            "compression_settings",
-            unreal.TextureCompressionSettings.TC_NORMALMAP,
-        )
+        srgb = False
+        compression = unreal.TextureCompressionSettings.TC_NORMALMAP
     elif param in {
         "Extra",
         "MetallicRoughness",
@@ -428,44 +732,205 @@ def _configure_imported_texture(
         "Occlusion",
         "Sheen Opacity",
         "Sheen Roughness",
+        "Flow Map",
+        "IRD Map",
+        "ORM Map",
     }:
-        changed |= _set_texture_property_if_changed(tex, "srgb", False)
-        changed |= _set_texture_property_if_changed(
-            tex,
-            "compression_settings",
-            unreal.TextureCompressionSettings.TC_MASKS,
-        )
-    elif param in {"Height", "Opacity", "Alpha", "Transmission"}:
-        changed |= _set_texture_property_if_changed(tex, "srgb", False)
-        changed |= _set_texture_property_if_changed(
-            tex,
-            "compression_settings",
-            unreal.TextureCompressionSettings.TC_GRAYSCALE,
-        )
-    elif param == "Subsurface":
-        changed |= _set_texture_property_if_changed(tex, "srgb", True)
+        srgb = False
+        compression = unreal.TextureCompressionSettings.TC_MASKS
+    elif param in {"Height", "Opacity", "Opacity Map", "Alpha", "Transmission"}:
+        srgb = False
+        compression = unreal.TextureCompressionSettings.TC_GRAYSCALE
     else:
-        changed |= _set_texture_property_if_changed(tex, "srgb", True)
+        srgb = True
+        compression = unreal.TextureCompressionSettings.TC_DEFAULT
 
-    max_size = MAX_TEXTURE_SIZE_BY_PARAM.get(param, DEFAULT_MAX_TEXTURE_SIZE)
-    if max_size:
-        changed |= _set_texture_property_if_changed(tex, "max_texture_size", max_size)
+    return {
+        "srgb": srgb,
+        "compression_settings": compression,
+        "max_texture_size": DEFAULT_MAX_TEXTURE_SIZE,
+        # OpacityMask is sampled by a non-VT linear grayscale parameter in the
+        # canonical tree foliage layer.  Re-enabling VT here makes the instance
+        # override incompatible with that graph and restores solid white cards.
+        "virtual_texture_streaming": (
+            False
+            if param in {"Opacity", "Opacity Map", "Alpha"}
+            else bool(ENABLE_VIRTUAL_TEXTURE_STREAMING)
+        ),
+    }
 
-    if virtual_texture_streaming is None:
-        virtual_texture_streaming = ENABLE_VIRTUAL_TEXTURE_STREAMING
+
+def _texture_settings_match(tex, settings: dict) -> bool:
+    if tex is None:
+        return False
+    for property_name, expected in settings.items():
+        try:
+            current = tex.get_editor_property(property_name)
+        except Exception:
+            return False
+        if property_name in {"srgb", "virtual_texture_streaming"}:
+            current = bool(current)
+        if current != expected:
+            return False
+    return True
+
+
+def _configure_imported_texture(
+    tex,
+    param: str,
+    virtual_texture_streaming=None,
+    file_path=None,
+    asset_name=None,
+) -> bool:
+    changed = False
+    settings = _desired_texture_settings(
+        param,
+        virtual_texture_streaming,
+        file_path,
+        asset_name,
+    )
+    changed |= _set_texture_property_if_changed(tex, "srgb", settings["srgb"])
+    changed |= _set_texture_property_if_changed(
+        tex,
+        "compression_settings",
+        settings["compression_settings"],
+    )
+    changed |= _set_texture_property_if_changed(
+        tex,
+        "max_texture_size",
+        settings["max_texture_size"],
+    )
 
     try:
         before = bool(tex.get_editor_property("virtual_texture_streaming"))
     except Exception:
         before = None
-    if before is not None and before != bool(virtual_texture_streaming):
+    virtual_texture_streaming = settings["virtual_texture_streaming"]
+    if before is not None and before != virtual_texture_streaming:
         if hasattr(tex, "set_virtual_texture_streaming"):
-            tex.set_virtual_texture_streaming(bool(virtual_texture_streaming))
+            tex.set_virtual_texture_streaming(virtual_texture_streaming)
         else:
-            tex.set_editor_property("virtual_texture_streaming", bool(virtual_texture_streaming))
+            tex.set_editor_property("virtual_texture_streaming", virtual_texture_streaming)
         changed = True
 
     return changed
+
+
+def _source_control_flag(state, property_name: str) -> bool:
+    try:
+        return bool(getattr(state, property_name))
+    except Exception:
+        try:
+            return bool(state.get_editor_property(property_name))
+        except Exception:
+            return False
+
+
+def _source_control_error(source_control) -> str:
+    try:
+        return str(source_control.last_error_msg())
+    except Exception:
+        return "unknown source-control error"
+
+
+def _checkout_texture_for_update(asset_path: str) -> bool:
+    source_control = getattr(unreal, "SourceControl", None)
+    if source_control is None:
+        raise RuntimeError("Unreal SourceControl helper is unavailable")
+    try:
+        state = source_control.query_file_state(asset_path, True, False)
+    except TypeError:
+        state = source_control.query_file_state(asset_path)
+
+    if _source_control_flag(state, "is_checked_out_other"):
+        raise RuntimeError(f"texture is checked out by another user: {asset_path}")
+    if (
+        _source_control_flag(state, "is_checked_out")
+        or _source_control_flag(state, "is_added")
+    ):
+        return False
+
+    if not source_control.check_out_file(asset_path, True):
+        raise RuntimeError(
+            f"texture source-control checkout failed: {asset_path} "
+            f"({_source_control_error(source_control)})"
+        )
+    _log(f"  texture source-control checkout: {asset_path}")
+    return _source_control_flag(state, "is_valid")
+
+
+def _revert_owned_texture_checkout(asset_path: str):
+    source_control = getattr(unreal, "SourceControl", None)
+    if source_control is None:
+        return
+    source_control.revert_unchanged_file(asset_path, True)
+
+
+def _mark_texture_for_add(asset_path: str):
+    source_control = getattr(unreal, "SourceControl", None)
+    if source_control is None:
+        raise RuntimeError("Unreal SourceControl helper is unavailable")
+    if not source_control.mark_file_for_add(asset_path, True):
+        raise RuntimeError(
+            f"texture source-control add failed: {asset_path} "
+            f"({_source_control_error(source_control)})"
+        )
+    _log(f"  texture source-control add: {asset_path}")
+
+
+def _run_texture_import(file_path: str, asset_name: str, replace_existing: bool):
+    task = unreal.AssetImportTask()
+    task.set_editor_property("filename", file_path)
+    task.set_editor_property("destination_path", TEXTURES_FOLDER)
+    task.set_editor_property("destination_name", asset_name)
+    task.set_editor_property("automated", True)
+    task.set_editor_property("replace_existing", bool(replace_existing))
+    task.set_editor_property("save", False)
+    unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks([task])
+    return task
+
+
+def _texture_import_task_succeeded(task, full_path: str) -> bool:
+    try:
+        if any(obj is not None for obj in task.get_objects()):
+            return True
+    except Exception:
+        pass
+    try:
+        imported_paths = task.get_editor_property("imported_object_paths") or []
+    except Exception:
+        try:
+            imported_paths = task.imported_object_paths or []
+        except Exception:
+            imported_paths = []
+    expected_path = full_path.split(".")[0]
+    return any(str(path).split(".")[0] == expected_path for path in imported_paths)
+
+
+def _save_texture_asset(full_path: str) -> bool:
+    if unreal.EditorAssetLibrary.save_asset(full_path, only_if_is_dirty=False):
+        return True
+    _warn(f"  texture save failed: {full_path}")
+    return False
+
+
+def _cache_verified_texture(
+    tex_cache: dict,
+    full_path: str,
+    source_md5: str,
+    fingerprint: dict,
+    tex,
+    desired_settings: dict,
+) -> bool:
+    if _asset_import_file_md5(full_path) != source_md5:
+        _warn(f"  texture AssetImportData FileMD5 verification failed: {full_path}")
+        return False
+    if not _texture_settings_match(tex, desired_settings):
+        _warn(f"  texture role-setting verification failed: {full_path}")
+        return False
+    if tex_cache is not None:
+        tex_cache[full_path] = dict(fingerprint)
+    return True
 
 
 def _import_texture(
@@ -478,7 +943,8 @@ def _import_texture(
 ):
     """디스크 텍스처를 TEXTURES_FOLDER 로 직접 import 하고 종류별 설정 적용. asset path 반환.
 
-    tex_cache 가 주어지면, 소스파일 mtime 이 캐시와 같고 에셋이 이미 있을 때 import 를 건너뛴다.
+    AssetImportData FileMD5와 역할 설정이 모두 같으면 force mode에서도 mutation 없이 건너뛴다.
+    legacy mtime cache entry는 검증 성공 뒤에만 v2 fingerprint dict로 교체된다.
     """
     if not asset_name:
         _warn(f"  텍스처 asset_name 없음 — skip ({file_path})")
@@ -488,70 +954,117 @@ def _import_texture(
         return None
 
     full_path = f"{TEXTURES_FOLDER}/{asset_name}"
-
-    # mtime 캐시 히트면 재import 생략(OneDrive 재읽기/하이드레이션 방지). getmtime 은 메타데이터만
-    # 읽으므로 클라우드 파일을 받아오지 않는다.
     try:
-        source_mtime = os.path.getmtime(file_path)
-    except OSError:
-        source_mtime = None
-    if unreal.EditorAssetLibrary.does_asset_exist(full_path) and not force_reimport:
-        tex = unreal.load_asset(full_path)
-        if tex is not None and _configure_imported_texture(
-            tex,
-            param,
-            virtual_texture_streaming,
+        source_md5, fingerprint = _texture_source_fingerprint(
             file_path,
-            asset_name,
-        ):
-            unreal.EditorAssetLibrary.save_asset(full_path)
-        if tex_cache is not None and source_mtime is not None:
-            tex_cache[full_path] = source_mtime
-        _log(f"  texture exists, import skipped: {asset_name} ({param})")
-        return full_path
-
-    if (tex_cache is not None and source_mtime is not None
-            and tex_cache.get(full_path) == source_mtime
-            and unreal.EditorAssetLibrary.does_asset_exist(full_path)
-            and not force_reimport):
-        tex = unreal.load_asset(full_path)
-        if tex is not None and _configure_imported_texture(
-            tex,
-            param,
-            virtual_texture_streaming,
-            file_path,
-            asset_name,
-        ):
-            unreal.EditorAssetLibrary.save_asset(full_path)
-        return full_path
-
-    task = unreal.AssetImportTask()
-    task.set_editor_property('filename', file_path)
-    task.set_editor_property('destination_path', TEXTURES_FOLDER)
-    task.set_editor_property('destination_name', asset_name)
-    task.set_editor_property('automated', True)
-    task.set_editor_property('replace_existing', bool(force_reimport))
-    task.set_editor_property('save', True)
-    unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks([task])
-
-    tex = unreal.load_asset(full_path)
-    if tex is None:
-        _warn(f"  텍스처 import 실패: {asset_name}")
+            tex_cache.get(full_path) if tex_cache is not None else None,
+        )
+    except OSError as exc:
+        _warn(f"  텍스처 MD5 읽기 실패: {asset_name} ({exc})")
         return None
 
-    _configure_imported_texture(
-        tex,
+    desired_settings = _desired_texture_settings(
         param,
         virtual_texture_streaming,
         file_path,
         asset_name,
     )
+    asset_exists = unreal.EditorAssetLibrary.does_asset_exist(full_path)
+    if not asset_exists:
+        task = _run_texture_import(file_path, asset_name, replace_existing=False)
+        if not _texture_import_task_succeeded(task, full_path):
+            _warn(f"  텍스처 import task 실패: {asset_name}")
+            return None
+        tex = unreal.load_asset(full_path)
+        if tex is None:
+            _warn(f"  텍스처 import 실패: {asset_name}")
+            return None
+        _configure_imported_texture(
+            tex,
+            param,
+            virtual_texture_streaming,
+            file_path,
+            asset_name,
+        )
+        if not _save_texture_asset(full_path):
+            return None
+        _mark_texture_for_add(full_path)
+        if not _cache_verified_texture(
+            tex_cache,
+            full_path,
+            source_md5,
+            fingerprint,
+            tex,
+            desired_settings,
+        ):
+            return None
+        _log(f"  텍스처 import: {asset_name} ({param})")
+        return full_path
 
-    unreal.EditorAssetLibrary.save_asset(full_path)
-    if tex_cache is not None and source_mtime is not None:
-        tex_cache[full_path] = source_mtime
-    _log(f"  텍스처 import: {asset_name} ({param})")
-    return full_path
+    tex = unreal.load_asset(full_path)
+    imported_md5 = _asset_import_file_md5(full_path)
+    source_matches = imported_md5 == source_md5
+    settings_match = _texture_settings_match(tex, desired_settings)
+    if source_matches and settings_match:
+        if not _cache_verified_texture(
+            tex_cache,
+            full_path,
+            source_md5,
+            fingerprint,
+            tex,
+            desired_settings,
+        ):
+            return None
+        force_note = " (force ignored: verified unchanged)" if force_reimport else ""
+        _log(f"  texture verified, import skipped: {asset_name} ({param}){force_note}")
+        return full_path
+
+    checkout_owned = _checkout_texture_for_update(full_path)
+    try:
+        if not source_matches or tex is None:
+            task = _run_texture_import(file_path, asset_name, replace_existing=True)
+            if not _texture_import_task_succeeded(task, full_path):
+                _warn(f"  텍스처 reimport task 실패: {asset_name}")
+                return None
+            tex = unreal.load_asset(full_path)
+            if tex is None:
+                _warn(f"  텍스처 reimport 실패: {asset_name}")
+                return None
+            _configure_imported_texture(
+                tex,
+                param,
+                virtual_texture_streaming,
+                file_path,
+                asset_name,
+            )
+            if not _save_texture_asset(full_path):
+                return None
+            _log(f"  텍스처 reimport: {asset_name} ({param})")
+        else:
+            _configure_imported_texture(
+                tex,
+                param,
+                virtual_texture_streaming,
+                file_path,
+                asset_name,
+            )
+            if not _save_texture_asset(full_path):
+                return None
+            _log(f"  texture role settings updated: {asset_name} ({param})")
+
+        if not _cache_verified_texture(
+            tex_cache,
+            full_path,
+            source_md5,
+            fingerprint,
+            tex,
+            desired_settings,
+        ):
+            return None
+        return full_path
+    finally:
+        if checkout_owned:
+            _revert_owned_texture_checkout(full_path)
 
 
 def _nanite_shape_preservation_voxelize():
@@ -621,6 +1134,9 @@ def _sync_browser_to_mesh(mesh_path: str):
     """Content Browser 를 import 된 메쉬로 이동/선택시킨다.
     (텍스처 import 가 마지막이라 브라우저가 /Game/Textures 로 튀는 것을 되돌림)"""
     try:
+        command_line = unreal.SystemLibrary.get_command_line().casefold()
+        if "-unattended" in command_line or "-run=" in command_line:
+            return
         unreal.EditorAssetLibrary.sync_browser_to_objects([mesh_path])
     except Exception as e:
         _warn(f"  브라우저 동기화 실패(무시): {e}")
@@ -654,14 +1170,131 @@ def _entry_name_blob(entry: dict) -> str:
 
 
 def _tree_part_key(entry: dict):
+    aliases = {
+        "bark": "bark",
+        "trunk": "bark",
+        "stump": "bark",
+        "branch": "branch",
+        "branches": "branch",
+        "twig": "branch",
+        "twigs": "branch",
+        "stem": "branch",
+        "stems": "branch",
+        "leaf": "leaf",
+        "leaves": "leaf",
+        "foliage": "leaf",
+        "cluster": "leaf",
+    }
+    sources = (
+        entry,
+        entry.get("material_layer")
+        if isinstance(entry.get("material_layer"), dict)
+        else {},
+    )
+    explicit_value = ""
+    for source in sources:
+        explicit = str(
+            source.get("tree_part")
+            or source.get("unreal_tree_part")
+            or ""
+        ).strip().casefold()
+        if explicit:
+            explicit_value = explicit
+            break
+
+    contract_api = _speedtree_handoff_api()
+    if contract_api is not None:
+        return contract_api.classify_tree_part(
+            _entry_name_blob(entry),
+            explicit=explicit_value,
+        )
+
+    for source in sources:
+        explicit = str(
+            source.get("tree_part")
+            or source.get("unreal_tree_part")
+            or ""
+        ).strip().casefold()
+        normalized = aliases.get(explicit)
+        if normalized:
+            return normalized
     blob = _entry_name_blob(entry)
-    if any(token in blob for token in ("leaf", "leaves", "foliage")):
+    name_tokens = {
+        token
+        for token in re.split(r"[^a-z0-9]+", blob)
+        if token
+    }
+    # Leaf-atlas scope wins over a subgroup label.  M_leaf_*_stem/twig uses the
+    # leaf UV/translucency contract even when the source collection says stem.
+    if name_tokens.intersection({"leaf", "leaves", "foliage", "cluster"}):
         return "leaf"
-    if any(token in blob for token in ("branch", "twig")):
+    if (
+        name_tokens.intersection({"branch", "branches", "twig", "twigs", "stem", "stems"})
+        or any(token.endswith(("branch", "twig")) for token in name_tokens)
+    ):
         return "branch"
-    if any(token in blob for token in ("bark", "trunk", "stump")):
+    if name_tokens.intersection({"bark", "trunk", "stump"}):
         return "bark"
     return None
+
+
+def _tree_shading_key(entry: dict, tree_part: str = None) -> str:
+    aliases = {
+        "wood": "wood",
+        "opaque": "wood",
+        "foliage": "foliage",
+        "subsurface": "foliage",
+        "sss": "foliage",
+        "stem": "stem",
+        "wrap": "stem",
+    }
+    sources = (
+        entry,
+        entry.get("material_layer")
+        if isinstance(entry.get("material_layer"), dict)
+        else {},
+    )
+    explicit_value = ""
+    for source in sources:
+        explicit = str(
+            source.get("tree_shading")
+            or source.get("unreal_tree_shading")
+            or source.get("tree_master_variant")
+            or ""
+        ).strip().casefold()
+        if explicit:
+            explicit_value = explicit
+            break
+
+    contract_api = _speedtree_handoff_api()
+    if contract_api is not None:
+        return contract_api.classify_tree_shading(
+            _entry_name_blob(entry),
+            explicit=explicit_value,
+            tree_part=tree_part,
+        )
+
+    for source in sources:
+        explicit = str(
+            source.get("tree_shading")
+            or source.get("unreal_tree_shading")
+            or source.get("tree_master_variant")
+            or ""
+        ).strip().casefold()
+        normalized = aliases.get(explicit)
+        if normalized:
+            return normalized
+    tree_part = tree_part or _tree_part_key(entry)
+    if tree_part == "leaf":
+        return "foliage"
+    name_tokens = {
+        token
+        for token in re.split(r"[^a-z0-9]+", _entry_name_blob(entry))
+        if token
+    }
+    if name_tokens.intersection({"stem", "stems"}):
+        return "stem"
+    return "wood"
 
 
 def _is_tree_asset_path(mesh_path: str) -> bool:
@@ -669,21 +1302,57 @@ def _is_tree_asset_path(mesh_path: str) -> bool:
     return "/tree/" in normalized or "/trees/" in normalized
 
 
+def _is_speedtree_asset(data: dict, mesh_path: str) -> bool:
+    descriptor = _speedtree_sidecar_descriptor(data)
+    if descriptor is not None:
+        return str(descriptor.get("asset_kind") or "").casefold() == "speedtree"
+    return _is_tree_asset_path(mesh_path)
+
+
+def _tree_preset_contract_overlay() -> dict:
+    contract_api = _speedtree_handoff_api()
+    if contract_api is None or not hasattr(contract_api, "tree_unreal_preset"):
+        return {}
+    value = contract_api.tree_unreal_preset()
+    if not isinstance(value, dict):
+        return {}
+    result = {}
+    for key in (
+        "mi_folder",
+        "layer_instance_folder",
+        "layer_texture_remap",
+        "virtual_textures",
+        "masters_by_shading",
+    ):
+        if key in value:
+            result[key] = value[key]
+    if isinstance(value.get("layer_parents_by_part"), dict):
+        result["layer_parents_by_name"] = value["layer_parents_by_part"]
+    masters = value.get("masters_by_shading")
+    if isinstance(masters, dict) and masters.get("wood"):
+        result["master"] = masters["wood"]
+    return result
+
+
 def _master_preset(data: dict, entry: dict = None, mesh_path: str = "") -> dict:
     entry = entry or {}
     tree_part = _tree_part_key(entry)
-    if tree_part or _is_tree_asset_path(mesh_path):
-        key = "tree"
-    else:
-        key = (
-            entry.get("material_master")
-            or entry.get("master_material")
-            or entry.get("master_preset")
-            or data.get("material_master")
-            or data.get("master_material")
-            or data.get("master_preset")
-            or DEFAULT_MASTER_PRESET
-        )
+    tree_shading = _tree_shading_key(entry, tree_part)
+    key = (
+        entry.get("material_master")
+        or entry.get("master_material")
+        or entry.get("master_preset")
+    )
+    if not key:
+        if tree_part or _is_tree_asset_path(mesh_path):
+            key = "tree"
+        else:
+            key = (
+                data.get("material_master")
+                or data.get("master_material")
+                or data.get("master_preset")
+                or DEFAULT_MASTER_PRESET
+            )
     key = str(key or DEFAULT_MASTER_PRESET).strip().lower()
     preset = MASTER_PRESETS.get(key)
     if preset is None:
@@ -691,10 +1360,37 @@ def _master_preset(data: dict, entry: dict = None, mesh_path: str = "") -> dict:
         key = DEFAULT_MASTER_PRESET
         preset = MASTER_PRESETS[key]
     result = dict(preset)
+    if key == "tree":
+        result.update(_tree_preset_contract_overlay())
+    scope = data.get("codex_test_asset_scope")
+    if isinstance(scope, dict) and _is_codex_test_asset_path(mesh_path):
+        scope_root = str(scope.get("root") or "").rstrip("/")
+        if _is_codex_test_asset_path(scope_root):
+            result["mi_folder"] = scope_root + "/MI"
+            result["layer_instance_folder"] = scope_root + "/MYI"
     result["key"] = key
     if tree_part:
         result["tree_part"] = tree_part
+    if key == "tree":
+        result["tree_shading"] = tree_shading
+        masters_by_shading = result.get("masters_by_shading")
+        if isinstance(masters_by_shading, dict):
+            shading_master = str(masters_by_shading.get(tree_shading) or "").strip()
+            if shading_master:
+                result["master"] = shading_master
     return result
+
+
+def _uses_tree_material_preset(data: dict, mesh_path: str) -> bool:
+    if _is_speedtree_asset(data, mesh_path):
+        return True
+    if not data:
+        return False
+    return any(
+        _master_preset(data, entry, mesh_path).get("key") == "tree"
+        for entry in data.get("materials", [])
+        if isinstance(entry, dict)
+    )
 
 
 def _load_master_material(preset: dict):
@@ -782,6 +1478,318 @@ def _entry_create_if_missing(entry: dict, preset: dict) -> bool:
     return bool(value)
 
 
+def _entry_instance_profile(entry: dict) -> str:
+    profile = str(entry.get("instance_profile") or "").strip()
+    if not profile:
+        return ""
+    contract_api = _speedtree_handoff_api()
+    if contract_api is not None:
+        try:
+            profile = contract_api.normalize_instance_profile(profile)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"invalid SpeedTree instance_profile {profile!r}: {exc}"
+            ) from exc
+    else:
+        if not UNREAL_INSTANCE_PROFILE_RE.fullmatch(profile):
+            raise RuntimeError(
+                f"invalid SpeedTree instance_profile {profile!r}; use one key made "
+                "of letters, numbers, '_' or '-'"
+            )
+        profile = profile.casefold()
+    mode = str(
+        entry.get("material_instance_mode") or "create_or_reuse"
+    ).strip().casefold()
+    if mode not in {"create_or_reuse", "assign_existing"}:
+        raise RuntimeError(
+            f"unsupported material_instance_mode {mode!r} for profile {profile!r}"
+        )
+    return profile
+
+
+def _instance_profile_material_paths(entry: dict, preset: dict):
+    profile = _entry_instance_profile(entry)
+    if not profile:
+        return None
+    if preset.get("key") != "tree":
+        raise RuntimeError(
+            f"instance_profile is only supported for SpeedTree materials: "
+            f"{entry.get('name', '<unnamed>')}"
+        )
+    if _entry_target_material_path(entry):
+        raise RuntimeError(
+            "instance_profile cannot be combined with target_material_path"
+        )
+    mat_base = _material_instance_base_name(str(entry.get("name") or ""))
+    mi_folder = str(preset.get("mi_folder") or "").rstrip("/")
+    if not mat_base or not mi_folder:
+        raise RuntimeError(
+            f"could not resolve base MI path for instance_profile {profile!r}"
+        )
+    base_path = f"{mi_folder}/MI_{mat_base}"
+    contract_api = _speedtree_handoff_api()
+    if contract_api is not None:
+        target_name = contract_api.profile_target_name(
+            str(entry.get("name") or ""),
+            profile,
+        )
+    else:
+        target_name = f"MI_{mat_base}_{profile}"
+    return {
+        "profile": profile,
+        "mode": str(
+            entry.get("material_instance_mode") or "create_or_reuse"
+        ).strip().casefold(),
+        "base_path": base_path,
+        "target_path": f"{mi_folder}/{target_name}",
+    }
+
+
+def _is_material_instance_constant(asset) -> bool:
+    if asset is None:
+        return False
+    instance_class = getattr(unreal, "MaterialInstanceConstant", None)
+    if instance_class is not None:
+        try:
+            if isinstance(asset, instance_class):
+                return True
+        except TypeError:
+            pass
+    try:
+        return asset.get_class().get_name() == "MaterialInstanceConstant"
+    except Exception:
+        return False
+
+
+def _validate_instance_profile_targets(data: dict, mesh_path: str = "") -> dict:
+    """Resolve every user-owned child MI before any pipeline mutation starts."""
+    targets = {}
+    plans_by_target_path = {}
+    errors = []
+    for entry_index, entry in enumerate(data.get("materials", [])):
+        if not isinstance(entry, dict):
+            continue
+        try:
+            profile = _entry_instance_profile(entry)
+            if not profile:
+                continue
+            if entry.get("translucent"):
+                raise RuntimeError("translucent entries cannot use instance_profile")
+            preset = _master_preset(data, entry, mesh_path)
+            paths = _instance_profile_material_paths(entry, preset)
+            base_path = paths["base_path"]
+            target_path = paths["target_path"]
+            base_exists = unreal.EditorAssetLibrary.does_asset_exist(base_path)
+            target_exists = unreal.EditorAssetLibrary.does_asset_exist(target_path)
+            base_asset = unreal.load_asset(base_path) if base_exists else None
+            target_asset = unreal.load_asset(target_path) if target_exists else None
+            if base_exists and not _is_material_instance_constant(base_asset):
+                raise RuntimeError(
+                    f"base asset is not a MaterialInstanceConstant: {base_path}"
+                )
+            if target_exists and not _is_material_instance_constant(target_asset):
+                raise RuntimeError(
+                    f"target asset is not a MaterialInstanceConstant: {target_path}"
+                )
+            if not target_exists and paths["mode"] == "assign_existing":
+                raise RuntimeError(
+                    f"user-managed instance is missing: {target_path}"
+                )
+            master_path = str(preset.get("master") or "").split(".")[0]
+            master_asset = unreal.load_asset(master_path) if master_path else None
+            if not base_exists and master_asset is None:
+                raise RuntimeError(
+                    f"base MI master is missing: {master_path or '<empty>'}"
+                )
+            intent = (base_path, master_path)
+            plan = plans_by_target_path.get(target_path)
+            if plan is not None and plan["intent"] != intent:
+                raise RuntimeError(
+                    f"conflicting profile target intent: {target_path}"
+                )
+            if plan is None:
+                plan = {
+                    **paths,
+                    "intent": intent,
+                    "preset": preset,
+                    "master_path": master_path,
+                    "master_asset": master_asset,
+                    "base_asset": base_asset,
+                    "asset": target_asset,
+                    "create_base": not base_exists,
+                    "create_target": not target_exists,
+                    "entry_indices": [],
+                }
+                plans_by_target_path[target_path] = plan
+            plan["entry_indices"].append(entry_index)
+            targets[entry_index] = plan
+        except Exception as exc:
+            errors.append(f"{entry.get('name', '<unnamed>')}: {exc}")
+    if errors:
+        raise RuntimeError(
+            "SpeedTree instance profile preflight blocked before mutation: "
+            + " | ".join(errors)
+        )
+    return targets
+
+
+def _mark_new_asset_for_add(asset_path: str, label: str = "asset"):
+    source_control = getattr(unreal, "SourceControl", None)
+    if source_control is None:
+        return
+    try:
+        state = source_control.query_file_state(asset_path, True, False)
+    except TypeError:
+        state = source_control.query_file_state(asset_path)
+    if _source_control_flag(state, "is_checked_out_other"):
+        raise RuntimeError(
+            f"{label} is checked out by another user: {asset_path}"
+        )
+    if _source_control_flag(state, "is_added"):
+        return
+    if not source_control.mark_file_for_add(asset_path, True):
+        raise RuntimeError(
+            f"{label} source-control add failed: {asset_path} "
+            f"({_source_control_error(source_control)})"
+        )
+    _log(f"  {label} source-control add: {asset_path}")
+
+
+def _mark_material_instance_for_add(asset_path: str):
+    _mark_new_asset_for_add(asset_path, "material instance")
+
+
+def _save_and_mark_new_material_asset(asset_path: str, label: str = "material instance"):
+    try:
+        if not unreal.EditorAssetLibrary.save_asset(
+            asset_path,
+            only_if_is_dirty=False,
+        ):
+            raise RuntimeError(f"{label} save failed: {asset_path}")
+        _mark_new_asset_for_add(asset_path, label)
+    except Exception:
+        try:
+            unreal.EditorAssetLibrary.delete_asset(asset_path)
+        except Exception as rollback_exc:
+            _warn(f"  {label} rollback failed: {asset_path} ({rollback_exc})")
+        raise
+
+
+def _load_exact_material_instance(asset_path: str):
+    if not unreal.EditorAssetLibrary.does_asset_exist(asset_path):
+        return None
+    asset = unreal.load_asset(asset_path)
+    if not _is_material_instance_constant(asset):
+        raise RuntimeError(
+            f"asset is not a MaterialInstanceConstant: {asset_path}"
+        )
+    return asset
+
+
+def _create_profile_mi_asset(asset_tools, asset_path: str, parent):
+    existing = _load_exact_material_instance(asset_path)
+    if existing is not None:
+        return existing, False
+
+    folder, name = asset_path.rsplit("/", 1)
+    unreal.EditorAssetLibrary.make_directory(folder)
+    factory = unreal.MaterialInstanceConstantFactoryNew()
+    create_error = None
+    try:
+        asset = asset_tools.create_asset(
+            name,
+            folder,
+            unreal.MaterialInstanceConstant,
+            factory,
+        )
+    except Exception as exc:
+        asset = None
+        create_error = exc
+    if asset is None:
+        raced_asset = _load_exact_material_instance(asset_path)
+        if raced_asset is not None:
+            return raced_asset, False
+        detail = f" ({create_error})" if create_error else ""
+        raise RuntimeError(
+            f"material instance creation failed: {asset_path}{detail}"
+        )
+    try:
+        unreal.MaterialEditingLibrary.set_material_instance_parent(asset, parent)
+        if not unreal.EditorAssetLibrary.save_asset(
+            asset_path, only_if_is_dirty=False
+        ):
+            raise RuntimeError(f"material instance save failed: {asset_path}")
+        _mark_material_instance_for_add(asset_path)
+    except Exception:
+        try:
+            unreal.EditorAssetLibrary.delete_asset(asset_path)
+        except Exception as rollback_exc:
+            _warn(
+                f"  failed material instance rollback: {asset_path} "
+                f"({rollback_exc})"
+            )
+        raise
+    return asset, True
+
+
+def _ensure_instance_profile_targets(asset_tools, targets: dict) -> dict:
+    """Create missing Base/Target MIs before mesh or texture mutation."""
+    unique_plans = []
+    seen = set()
+    for plan in targets.values():
+        target_path = plan["target_path"]
+        if target_path not in seen:
+            seen.add(target_path)
+            unique_plans.append(plan)
+    unique_plans.sort(key=lambda plan: plan["target_path"].casefold())
+
+    created_paths = []
+    try:
+        for plan in unique_plans:
+            if plan["create_base"]:
+                plan["base_asset"], base_created = _create_profile_mi_asset(
+                    asset_tools,
+                    plan["base_path"],
+                    plan["master_asset"],
+                )
+                plan["create_base"] = False
+                if base_created:
+                    created_paths.append(plan["base_path"])
+            if plan["create_target"]:
+                plan["asset"], target_created = _create_profile_mi_asset(
+                    asset_tools,
+                    plan["target_path"],
+                    plan["base_asset"],
+                )
+                plan["create_target"] = False
+                if target_created:
+                    created_paths.append(plan["target_path"])
+                    _log(
+                        f"  user-managed profile '{plan['profile']}' created once: "
+                        f"{plan['target_path']}"
+                    )
+                else:
+                    _log(
+                        f"  user-managed profile '{plan['profile']}' race-reused unchanged: "
+                        f"{plan['target_path']}"
+                    )
+            else:
+                _log(
+                    f"  user-managed profile '{plan['profile']}' reused unchanged: "
+                    f"{plan['target_path']}"
+                )
+    except Exception:
+        for asset_path in reversed(created_paths):
+            try:
+                unreal.EditorAssetLibrary.delete_asset(asset_path)
+            except Exception as rollback_exc:
+                _warn(
+                    f"  profile MI rollback failed: {asset_path} ({rollback_exc})"
+                )
+        raise
+    return targets
+
+
 def _derive_number_suffix_copy_source(target_path: str):
     if not target_path or "/" not in target_path:
         return None
@@ -802,8 +1810,9 @@ def _load_or_copy_target_material(
     master_mat=None,
     create_if_missing: bool = True,
 ):
-    if unreal.EditorAssetLibrary.does_asset_exist(target_path):
-        return unreal.load_asset(target_path), target_path, False, "existing"
+    existing = _load_exact_material_instance(target_path)
+    if existing is not None:
+        return existing, target_path, False, "existing"
 
     if not copy_from_path:
         copy_from_path = _derive_number_suffix_copy_source(target_path)
@@ -825,10 +1834,13 @@ def _load_or_copy_target_material(
             factory,
         )
         if mi is None:
+            raced = _load_exact_material_instance(target_path)
+            if raced is not None:
+                return raced, target_path, False, "existing"
             _warn(f"  target material create failed: {target_path}")
             return None, target_path, False, "missing"
         unreal.MaterialEditingLibrary.set_material_instance_parent(mi, master_mat)
-        unreal.EditorAssetLibrary.save_asset(target_path, only_if_is_dirty=False)
+        _save_and_mark_new_material_asset(target_path)
         _log(f"  MI create: {target_path}")
         return mi, target_path, True, "new"
     if not unreal.EditorAssetLibrary.does_asset_exist(copy_from_path):
@@ -856,7 +1868,14 @@ def _load_or_copy_target_material(
         _warn(f"  target material copy failed: {copy_from_path} -> {target_path}")
         return None, target_path, False, "missing"
 
-    unreal.EditorAssetLibrary.save_asset(target_path, only_if_is_dirty=False)
+    if not _is_material_instance_constant(copied):
+        try:
+            unreal.EditorAssetLibrary.delete_asset(target_path)
+        finally:
+            raise RuntimeError(
+                f"copied target is not a MaterialInstanceConstant: {target_path}"
+            )
+    _save_and_mark_new_material_asset(target_path)
     _log(f"  MI copy: {copy_from_path} -> {target_path}")
     return copied, target_path, True, "copy"
 
@@ -1005,9 +2024,24 @@ def _mesh_relative_disk_folder_candidates(mesh_path: str):
     return candidates
 
 
+def _dynamic_wind_contract_rules() -> dict:
+    contract_api = _speedtree_handoff_api()
+    if contract_api is None or not hasattr(contract_api, "dynamic_wind_rules"):
+        return {}
+    value = contract_api.dynamic_wind_rules()
+    return value if isinstance(value, dict) else {}
+
+
 def _dynamic_wind_json_from_data(data: dict):
     data = data or {}
-    for key in ("dynamic_wind_json", "dynamic_wind_json_path", "wind_json", "wind_json_path"):
+    rules = _dynamic_wind_contract_rules()
+    fields = rules.get("sidecar_fields") or (
+        "dynamic_wind_json",
+        "dynamic_wind_json_path",
+        "wind_json",
+        "wind_json_path",
+    )
+    for key in fields:
         value = str(data.get(key) or "").strip()
         if value:
             return value
@@ -1067,7 +2101,11 @@ def _find_dynamic_wind_json(data: dict, mesh_path: str, mesh_name: str, json_pat
             if os.path.isfile(candidate):
                 return candidate
 
-    filename = f"{mesh_name}{DYNAMIC_WIND_JSON_SUFFIX}"
+    suffix = str(
+        _dynamic_wind_contract_rules().get("filename_suffix")
+        or DYNAMIC_WIND_JSON_SUFFIX
+    )
+    filename = f"{mesh_name}{suffix}"
     for folder in dirs:
         candidate = os.path.join(folder, filename)
         if os.path.isfile(candidate):
@@ -1076,7 +2114,7 @@ def _find_dynamic_wind_json(data: dict, mesh_path: str, mesh_name: str, json_pat
 
 
 def _import_dynamic_wind_if_available(mesh, mesh_path: str, mesh_name: str, data: dict, json_path: str = None) -> bool:
-    if not _is_skeletal_mesh(mesh) or not _is_tree_asset_path(mesh_path):
+    if not _is_skeletal_mesh(mesh) or not _is_speedtree_asset(data, mesh_path):
         return False
     helper = getattr(unreal, "CodexDynamicWindImportLibrary", None)
     if not helper or not hasattr(helper, "import_dynamic_wind_json_to_skeletal_mesh"):
@@ -1099,6 +2137,10 @@ def _new_skeletal_material_entry(slot_name: str, material, old_entry=None):
     entry = unreal.SkeletalMaterial()
     entry.set_editor_property("material_interface", material)
     entry.set_editor_property("material_slot_name", slot_name)
+    try:
+        entry.set_editor_property("imported_material_slot_name", slot_name)
+    except Exception:
+        pass
     if old_entry is not None:
         for prop in ("uv_channel_data", "overlay_material_interface"):
             try:
@@ -1106,6 +2148,53 @@ def _new_skeletal_material_entry(slot_name: str, material, old_entry=None):
             except Exception:
                 pass
     return entry
+
+
+def _remap_skeletal_material_sections(mesh, ordered) -> bool:
+    helper = getattr(unreal, "CodexMaterialToolsLibrary", None)
+    method = getattr(helper, "remap_skeletal_mesh_material_sections", None)
+    if not callable(method):
+        raise RuntimeError(
+            "CodexMaterialTools skeletal material-section remap helper is missing"
+        )
+    old_indices = [int(old_index) for old_index, _slot_name, _material in ordered]
+    new_indices = list(range(len(ordered)))
+    result = method(mesh, old_indices, new_indices, True)
+    values = result if isinstance(result, tuple) else (result,)
+    explicit_success = next(
+        (value for value in values if isinstance(value, bool)),
+        None,
+    )
+    payload_text = next(
+        (
+            value
+            for value in values
+            if isinstance(value, str) and value.lstrip().startswith("{")
+        ),
+        "{}",
+    )
+    errors = next((value for value in values if isinstance(value, list)), [])
+    try:
+        payload = json.loads(payload_text)
+    except (TypeError, ValueError):
+        payload = {}
+    # Depending on the live UE Python wrapper, a BlueprintCallable function
+    # with output references can surface only OutJson (or OutJson/OutErrors)
+    # and omit its native bool return.  The helper writes the same result to
+    # the required JSON ``ok`` field, so use that authoritative value when no
+    # explicit bool was exposed.
+    success = (
+        explicit_success
+        if explicit_success is not None
+        else bool(payload.get("ok"))
+    )
+    if not success:
+        raise RuntimeError(
+            "skeletal material-section remap failed: "
+            + "; ".join(str(value) for value in errors)
+            + (" | " + payload_text if payload_text else "")
+        )
+    return bool(payload.get("changed"))
 
 
 def _assign_skeletal_slot(mesh, slot_index: int, material, slot_name: str = None) -> bool:
@@ -1173,16 +2262,21 @@ def _normalize_skeletal_material_slots(mesh, assignments: dict) -> bool:
             ):
                 unchanged = False
                 break
-    if unchanged:
-        return False
+    materials_changed = not unchanged
+    if materials_changed:
+        new_entries = []
+        for old_index, slot_name, material in ordered:
+            old_entry = material_entries[old_index] if 0 <= old_index < len(material_entries) else None
+            new_entries.append(_new_skeletal_material_entry(slot_name, material, old_entry))
+        mesh.set_editor_property("materials", new_entries)
 
-    new_entries = []
-    for old_index, slot_name, material in ordered:
-        old_entry = material_entries[old_index] if 0 <= old_index < len(material_entries) else None
-        new_entries.append(_new_skeletal_material_entry(slot_name, material, old_entry))
-
-    mesh.set_editor_property("materials", new_entries)
-    return True
+    try:
+        sections_changed = _remap_skeletal_material_sections(mesh, ordered)
+    except Exception:
+        if materials_changed:
+            mesh.set_editor_property("materials", material_entries)
+        raise
+    return materials_changed or sections_changed
 
 
 def _set_material_interface(mesh, slot_index: int, material) -> bool:
@@ -1253,7 +2347,24 @@ def _assign_layer_zero_textures(mi, param_tex_map: dict) -> bool:
     return changed
 
 
-def _entry_layers(entry: dict):
+def _tree_texture_param_allowed(param: str, preset: dict = None) -> bool:
+    if not preset or preset.get("key") != "tree":
+        return True
+    contract_api = _speedtree_handoff_api()
+    if contract_api is not None:
+        return contract_api.tree_texture_param_allowed(
+            param,
+            preset.get("tree_shading"),
+        )
+    param = str(param or "").strip().casefold()
+    if param == "transmission":
+        return False
+    if param == "subsurface" and preset.get("tree_shading") == "wood":
+        return False
+    return True
+
+
+def _entry_layers(entry: dict, preset: dict = None):
     layers = entry.get("layers") or []
     normalized = []
     for layer_index, layer in enumerate(layers):
@@ -1261,7 +2372,8 @@ def _entry_layers(entry: dict):
         for texture in layer.get("textures", []):
             item = dict(texture)
             item["param"] = _surface_layer_param(item.get("param"))
-            textures.append(item)
+            if _tree_texture_param_allowed(item["param"], preset):
+                textures.append(item)
         normalized.append(
             {
                 "name": str(layer.get("name") or f"Layer_{layer_index + 1:02d}"),
@@ -1276,7 +2388,8 @@ def _entry_layers(entry: dict):
     for texture in entry.get("textures", []):
         item = dict(texture)
         item["param"] = _surface_layer_param(item.get("param"))
-        textures.append(item)
+        if _tree_texture_param_allowed(item["param"], preset):
+            textures.append(item)
     return [{"name": "Base", "index": 0, "textures": textures}] if textures else []
 
 
@@ -1297,7 +2410,10 @@ def _import_layer_textures(
                 param,
                 tex_cache,
                 force_reimport=force_reimport,
-                virtual_texture_streaming=virtual_texture_streaming,
+                virtual_texture_streaming=texture.get(
+                    "virtual_texture_streaming",
+                    virtual_texture_streaming,
+                ),
             )
             if tex_path and param in KNOWN_PARAMS:
                 param_tex_map[param] = tex_path
@@ -1327,7 +2443,8 @@ def reimport_textures_from_json(json_path: str) -> int:
     imported = 0
     seen = set()
     for entry in data.get("materials", []):
-        for layer in _entry_layers(entry):
+        preset = _master_preset(data, entry)
+        for layer in _entry_layers(entry, preset):
             for texture in layer.get("textures", []):
                 asset_name = texture.get("asset_name")
                 param = texture.get("param")
@@ -1502,6 +2619,38 @@ def _layer_instance_path(mat_base: str, preset: dict, entry: dict):
     return f"{folder}/MYI_{base}"
 
 
+def _validate_codex_test_material_scope(data: dict, mesh_path: str) -> bool:
+    if not _is_codex_test_asset_path(mesh_path):
+        return False
+    scope = data.get("codex_test_asset_scope")
+    if not isinstance(scope, dict):
+        raise RuntimeError(
+            "Codex test material sidecar has no isolated asset scope contract"
+        )
+    root = str(scope.get("root") or "").rstrip("/")
+    if not _is_codex_test_asset_path(root):
+        raise RuntimeError("Codex test material scope root is outside /Game/Codex/Tests")
+    for entry in data.get("materials", []):
+        target_path = _entry_target_material_path(entry)
+        if not target_path or not target_path.startswith(root + "/MI/"):
+            raise RuntimeError(
+                "Codex test material target is outside the isolated MI scope"
+            )
+        material_layer = entry.get("material_layer")
+        if not isinstance(material_layer, dict):
+            raise RuntimeError("Codex test material has no isolated layer target")
+        layer_path = str(
+            material_layer.get("instance_path")
+            or material_layer.get("path")
+            or ""
+        ).split(".", 1)[0]
+        if not layer_path.startswith(root + "/MYI/"):
+            raise RuntimeError(
+                "Codex test layer target is outside the isolated MYI scope"
+            )
+    return True
+
+
 def _layer_parent_path(preset: dict, entry: dict):
     material_layer = entry.get("material_layer") if isinstance(entry.get("material_layer"), dict) else {}
     for key in ("parent", "parent_layer"):
@@ -1602,7 +2751,17 @@ def _layer_texture_remap(preset: dict, entry: dict) -> dict:
     )
     if not isinstance(mapping, dict):
         mapping = preset.get("layer_texture_remap", {})
-    return {str(key): str(value) for key, value in dict(mapping).items() if key and value}
+    result = {str(key): str(value) for key, value in dict(mapping).items() if key and value}
+    if preset.get("key") == "tree":
+        result.pop("Transmission", None)
+        result["Alpha"] = "Opacity Map"
+        result["Opacity"] = "Opacity Map"
+        result["Opacity Map"] = "Opacity Map"
+        if preset.get("tree_shading") != "wood":
+            result["Subsurface"] = "Subsurface"
+        else:
+            result.pop("Subsurface", None)
+    return result
 
 
 def _call_create_or_update_layer_instance(helper, parent_layer, layer_path, texture_params, scalar_params=None, vector_params=None):
@@ -1617,17 +2776,34 @@ def _call_create_or_update_layer_instance(helper, parent_layer, layer_path, text
     )
     if isinstance(result, tuple):
         ok = bool(result[0]) if result else False
+        report = {}
+        if len(result) > 1 and result[1]:
+            try:
+                report = json.loads(str(result[1]))
+            except Exception:
+                report = {}
         errors = result[2] if len(result) > 2 else []
-        return ok, errors
-    return bool(result), []
+        return ok, errors, report
+    return bool(result), [], {}
 
 
-_NORMALIZED_MATERIAL_LAYER_ASSETS = set()
+def _is_codex_test_asset_path(asset_path: str) -> bool:
+    package_path = str(asset_path or "").split(".", 1)[0].replace("\\", "/")
+    return package_path.casefold().startswith("/game/codex/tests/")
 
 
-def _normalize_material_layer_asset(helper, method_name: str, asset_path: str, label: str):
-    cache_key = (method_name, asset_path)
-    if cache_key in _NORMALIZED_MATERIAL_LAYER_ASSETS:
+def _normalize_material_layer_asset(
+    helper,
+    method_name: str,
+    asset_path: str,
+    label: str,
+    mutation_scope_path: str = "",
+):
+    if (
+        _is_codex_test_asset_path(mutation_scope_path)
+        and not _is_codex_test_asset_path(asset_path)
+    ):
+        _log(f"  {label} kept read-only for isolated test: {asset_path}")
         return
     method = getattr(helper, method_name, None)
     if method is None:
@@ -1662,7 +2838,6 @@ def _normalize_material_layer_asset(helper, method_name: str, asset_path: str, l
         detail = " | ".join(errors) or report_text or "unknown normalization failure"
         raise RuntimeError(f"{label} normalization failed: {asset_path} ({detail})")
 
-    _NORMALIZED_MATERIAL_LAYER_ASSETS.add(cache_key)
     changed = (
         report.get("removed_placeholder_count", 0)
         or report.get("removed_set_declaration_count", 0)
@@ -1735,12 +2910,14 @@ def _assign_material_layer_instance(mi, mat_base: str, layer_maps, preset: dict,
         "normalize_material_layer_placeholders",
         str(preset.get("master") or ""),
         "material master",
+        mutation_scope_path=layer_path,
     )
     _normalize_material_layer_asset(
         helper,
         "normalize_material_function_attribute_nodes",
         parent_layer,
         "material layer function",
+        mutation_scope_path=layer_path,
     )
 
     remap = _layer_texture_remap(preset, entry)
@@ -1757,7 +2934,7 @@ def _assign_material_layer_instance(mi, mat_base: str, layer_maps, preset: dict,
             f"{len(scalar_params)} scalar(s), {len(vector_params)} vector(s)"
         )
 
-    ok, errors = _call_create_or_update_layer_instance(
+    ok, errors, layer_report = _call_create_or_update_layer_instance(
         helper,
         parent_layer,
         layer_path,
@@ -1775,6 +2952,18 @@ def _assign_material_layer_instance(mi, mat_base: str, layer_maps, preset: dict,
     if layer_asset is None:
         _warn(f"  MYI load failed after create/update: {layer_path}")
         return False
+    if layer_report.get("created"):
+        try:
+            _mark_new_asset_for_add(layer_path, "material layer instance")
+        except Exception:
+            try:
+                unreal.EditorAssetLibrary.delete_asset(layer_path)
+            except Exception as rollback_exc:
+                _warn(
+                    f"  material layer instance rollback failed: "
+                    f"{layer_path} ({rollback_exc})"
+                )
+            raise
 
     # Remove stale flat/layer overrides before the C++ helper persists the MI.
     # Do not trigger a live material preview update here; UE 5.8 can assert
@@ -1813,6 +3002,9 @@ def _assign_master_textures(mi, layer_maps, assignment: str, preset: dict = None
 
 
 def _material_instance_base_name(mat_name: str) -> str:
+    contract_api = _speedtree_handoff_api()
+    if contract_api is not None:
+        return contract_api.material_instance_base_name(mat_name)
     if mat_name.startswith("M_"):
         return mat_name[2:]
     if mat_name.startswith("MI_"):
@@ -1954,33 +3146,120 @@ def _delete_wrong_generated_hair_materials(mat_name: str, entry: dict, preset: d
     return deleted
 
 
-def _load_or_migrate_hair_material(asset_tools, mat_name: str, entry: dict, preset: dict):
+def _load_or_create_hair_material(asset_tools, mat_name: str, entry: dict, preset: dict):
     target_path = _hair_target_material_path(mat_name, entry, preset)
     if not target_path:
         _warn(f"  hair material target path incomplete for '{mat_name}'")
-        return None, None
+        return None, None, False
 
-    source_paths = [path for path in _hair_source_material_paths(mat_name, entry, preset) if path != target_path]
-    if source_paths:
-        source_path = source_paths[0]
-        if unreal.EditorAssetLibrary.does_asset_exist(target_path):
-            if not unreal.EditorAssetLibrary.delete_asset(target_path):
-                _warn(f"  existing wrong hair MI delete failed: {target_path}")
-                return None, None
-            _log(f"  deleted wrong generated hair MI: {target_path}")
-        if not unreal.EditorAssetLibrary.rename_asset(source_path, target_path):
-            _warn(f"  hair MI move/rename failed: {source_path} -> {target_path}")
-            return None, None
-        _log(f"  hair MI moved: {source_path} -> {target_path}")
-        _delete_wrong_generated_hair_materials(mat_name, entry, preset, target_path)
-        return unreal.load_asset(target_path), target_path
+    master = _load_master_material(preset)
+    if master is None:
+        return None, target_path, False
+    mi, _path, created, _source = _load_or_copy_target_material(
+        asset_tools,
+        target_path,
+        master_mat=master,
+        create_if_missing=_entry_create_if_missing(entry, preset),
+    )
+    if mi is None:
+        return None, target_path, False
+    try:
+        current_parent = mi.get_editor_property("parent")
+    except Exception:
+        current_parent = None
+    if not _same_asset(current_parent, master):
+        unreal.MaterialEditingLibrary.set_material_instance_parent(mi, master)
+        _log(f"  hair MI parent update: {target_path} -> {master.get_path_name()}")
+    return mi, target_path, bool(created)
 
-    if unreal.EditorAssetLibrary.does_asset_exist(target_path):
-        _delete_wrong_generated_hair_materials(mat_name, entry, preset, target_path)
-        return unreal.load_asset(target_path), target_path
 
-    _warn(f"  hair material instance source missing for '{mat_name}' -> target {target_path}")
-    return None, None
+def _assign_hair_tool_parameters(
+    mi,
+    entry: dict,
+    layer_maps,
+    initialize_instance_owned_parameters: bool = True,
+) -> bool:
+    changed = False
+    for param, tex_path in _first_layer_textures(layer_maps).items():
+        texture = unreal.load_asset(tex_path)
+        if texture is None:
+            continue
+        unreal.MaterialEditingLibrary.set_material_instance_texture_parameter_value(
+            mi, param, texture
+        )
+        _log(f"  hair texture {param} <- {tex_path.split('/')[-1]}")
+        changed = True
+
+    hair_tool = entry.get("hair_tool") or {}
+    for name, value in (hair_tool.get("scalar_parameters") or {}).items():
+        name = str(name)
+        if (
+            not initialize_instance_owned_parameters
+            and name in HAIR_INSTANCE_OWNED_SCALAR_PARAMETERS
+        ):
+            _log(f"  preserve existing hair MI scalar: {name}")
+            continue
+        unreal.MaterialEditingLibrary.set_material_instance_scalar_parameter_value(
+            mi, name, float(value)
+        )
+        changed = True
+    for name, value in (hair_tool.get("vector_parameters") or {}).items():
+        name = str(name)
+        if (
+            not initialize_instance_owned_parameters
+            and name in HAIR_INSTANCE_OWNED_VECTOR_PARAMETERS
+        ):
+            _log(f"  preserve existing hair MI vector: {name}")
+            continue
+        components = list(value or [])
+        while len(components) < 4:
+            components.append(1.0)
+        color = unreal.LinearColor(
+            float(components[0]),
+            float(components[1]),
+            float(components[2]),
+            float(components[3]),
+        )
+        unreal.MaterialEditingLibrary.set_material_instance_vector_parameter_value(
+            mi, name, color
+        )
+        changed = True
+    if changed:
+        unreal.MaterialEditingLibrary.update_material_instance(mi)
+    return changed
+
+
+def _ensure_hair_master_skeletal_mesh_usage(mi) -> bool:
+    try:
+        master = mi.get_base_material()
+    except Exception:
+        master = None
+    if master is None:
+        _warn("  hair MI base material missing; skeletal usage could not be checked")
+        return False
+    try:
+        changed = False
+        if not bool(master.get_editor_property("used_with_skeletal_mesh")):
+            master.set_editor_property("used_with_skeletal_mesh", True)
+            changed = True
+        try:
+            if not bool(master.get_editor_property("used_with_nanite")):
+                master.set_editor_property("used_with_nanite", True)
+                changed = True
+        except Exception:
+            pass
+        if not changed:
+            return False
+        compile_errors = unreal.MaterialEditingLibrary.recompile_material(master) or []
+        for error in compile_errors:
+            _warn(f"  hair master skeletal shader compile: {error}")
+        master_path = master.get_path_name().split(".")[0]
+        unreal.EditorAssetLibrary.save_asset(master_path, only_if_is_dirty=False)
+        _log(f"  enabled hair master skeletal/Nanite usage: {master_path}")
+        return True
+    except Exception as exc:
+        _warn(f"  failed to enable hair master skeletal mesh usage: {exc}")
+        return False
 
 
 def _source_asset_names(data: dict):
@@ -2128,7 +3407,101 @@ def _cleanup_imported_source_assets(mesh_path: str, data: dict):
         _log(f"  cleanup: no source material/texture assets found in {mesh_folder} ({elapsed:.2f}s)")
 
 
-def preflight_mesh_materials(mesh_path: str, json_path: str = None) -> bool:
+_CHECKED_OUT_MATERIAL_PIPELINE_ASSETS = set()
+
+
+def _material_asset_needs_checkout(asset_path: str) -> bool:
+    source_control = getattr(unreal, "SourceControl", None)
+    if source_control is None:
+        return True
+    try:
+        state = source_control.query_file_state(asset_path, True, False)
+    except TypeError:
+        state = source_control.query_file_state(asset_path)
+    if _source_control_flag(state, "is_checked_out_other"):
+        raise RuntimeError(
+            f"material pipeline asset is checked out by another user: {asset_path}"
+        )
+    return not (
+        _source_control_flag(state, "is_checked_out")
+        or _source_control_flag(state, "is_added")
+    )
+
+
+def _material_pipeline_mutation_paths(mesh_path: str, data: dict) -> list:
+    """Resolve existing packages the current material contract may mutate."""
+    paths = [mesh_path]
+    for entry in data.get("materials", []):
+        mat_name = str(entry.get("name", ""))
+        if entry.get("translucent"):
+            continue
+        preset = _master_preset(data, entry, mesh_path)
+        master_path = str(preset.get("master") or "").split(".")[0]
+        if master_path:
+            paths.append(master_path)
+        parent_layer = _layer_parent_path(preset, entry)
+        if parent_layer:
+            paths.append(parent_layer)
+
+        target_path = _entry_target_material_path(entry)
+        if preset.get("key") == "hair":
+            target_path = target_path or _hair_target_material_path(
+                mat_name,
+                entry,
+                preset,
+            )
+        if not target_path:
+            mat_base = _material_instance_base_name(mat_name)
+            mi_folder = str(preset.get("mi_folder") or "").rstrip("/")
+            if mat_base and mi_folder:
+                target_path = f"{mi_folder}/MI_{mat_base}"
+        if target_path:
+            paths.append(target_path)
+
+        if preset.get("assignment") == "material_layer_instance":
+            layer_path = _layer_instance_path(
+                _material_instance_base_name(mat_name),
+                preset,
+                entry,
+            )
+            if layer_path:
+                paths.append(layer_path)
+
+    paths = list(dict.fromkeys(path.split(".")[0] for path in paths if path))
+    if _is_codex_test_asset_path(mesh_path):
+        paths = [path for path in paths if _is_codex_test_asset_path(path)]
+    return paths
+
+
+def _checkout_material_pipeline_assets(mesh_path: str, data: dict) -> list:
+    existing = []
+    for path in _material_pipeline_mutation_paths(mesh_path, data):
+        if (
+            path in _CHECKED_OUT_MATERIAL_PIPELINE_ASSETS
+            or not unreal.EditorAssetLibrary.does_asset_exist(path)
+        ):
+            continue
+        if _material_asset_needs_checkout(path):
+            existing.append(path)
+    if not existing:
+        return []
+    subsystem = unreal.get_editor_subsystem(unreal.EditorAssetSubsystem)
+    failed = [path for path in existing if not subsystem.checkout_asset(path)]
+    if failed:
+        raise RuntimeError(
+            "material pipeline source-control checkout failed: " + ", ".join(failed)
+        )
+    _CHECKED_OUT_MATERIAL_PIPELINE_ASSETS.update(existing)
+    _log(f"  source-control checkout: {len(existing)} material pipeline asset(s)")
+    return existing
+
+
+def preflight_mesh_materials(
+    mesh_path: str,
+    json_path: str = None,
+    expected_mesh_name: str = "",
+    sidecar_sha256: str = "",
+) -> bool:
     """Normalize shared material-layer assets before Unreal touches an existing mesh.
 
     A skeletal-mesh reimport recompiles its currently assigned material instances
@@ -2136,10 +3509,26 @@ def preflight_mesh_materials(mesh_path: str, json_path: str = None) -> bool:
     before the FBX import, not from post_import after it.
     """
     mesh_path = mesh_path.split(".")[0]
-    mesh_name = mesh_path.rsplit("/", 1)[-1]
-    data = _load_json(mesh_name, json_path, mesh_path)
+    mesh_name = str(expected_mesh_name or mesh_path.rsplit("/", 1)[-1]).strip()
+    data = _load_json(
+        mesh_name,
+        json_path,
+        mesh_path,
+        expected_sha256=sidecar_sha256,
+    )
     if not data:
         return False
+    _validate_speedtree_handoff_contract(data, mesh_name, mesh_path)
+    _validate_codex_test_material_scope(data, mesh_path)
+
+    instance_profile_targets = _validate_instance_profile_targets(
+        data, mesh_path
+    )
+    _checkout_material_pipeline_assets(mesh_path, data)
+    _ensure_instance_profile_targets(
+        unreal.AssetToolsHelpers.get_asset_tools(),
+        instance_profile_targets,
+    )
 
     helper = getattr(unreal, "CodexMaterialToolsLibrary", None)
     if helper is None:
@@ -2158,6 +3547,7 @@ def preflight_mesh_materials(mesh_path: str, json_path: str = None) -> bool:
                 "normalize_material_layer_placeholders",
                 master_path,
                 "material master",
+                mutation_scope_path=mesh_path,
             )
             normalized = True
         if parent_layer:
@@ -2166,12 +3556,64 @@ def preflight_mesh_materials(mesh_path: str, json_path: str = None) -> bool:
                 "normalize_material_function_attribute_nodes",
                 parent_layer,
                 "material layer function",
+                mutation_scope_path=mesh_path,
             )
             normalized = True
     return normalized
 
 
-def process_mesh(mesh_path: str, master_mat=None, json_path: str = None) -> bool:
+def _project_asset_package_file_exists(asset_path: str) -> bool:
+    """Return whether a /Game asset package has reached the project Content folder."""
+    package_path = str(asset_path or "").split(".")[0]
+    if not package_path.startswith("/Game/"):
+        return False
+    try:
+        content_dir = unreal.Paths.convert_relative_path_to_full(
+            unreal.Paths.project_content_dir()
+        )
+    except Exception:
+        return False
+    relative_path = package_path[len("/Game/") :].replace("/", os.sep)
+    return os.path.isfile(os.path.join(content_dir, relative_path + ".uasset"))
+
+
+def _save_generated_skeleton_dependency(mesh, mesh_path: str, helper) -> bool:
+    """Persist the default Skeleton created by a Send2UE skeletal-mesh import.
+
+    ImportAssetTasks can leave the generated ``<mesh>_Skeleton`` package only in
+    memory.  Saving the mesh alone then serializes a dependency that disappears
+    after an editor restart.  Existing or explicitly shared Skeleton assets are
+    intentionally left untouched.
+    """
+    try:
+        skeleton = mesh.get_editor_property("skeleton")
+    except Exception:
+        skeleton = None
+    if skeleton is None:
+        return False
+
+    get_path_name = getattr(skeleton, "get_path_name", None)
+    skeleton_path = (
+        str(get_path_name()).split(".")[0] if callable(get_path_name) else ""
+    )
+    expected_path = f"{str(mesh_path).split('.')[0]}_Skeleton"
+    if skeleton_path != expected_path:
+        return False
+    if _project_asset_package_file_exists(skeleton_path):
+        return False
+    if not helper.save_asset_package_without_thumbnail(skeleton):
+        raise RuntimeError(f"generated Skeleton save failed: {skeleton_path}")
+    _log(f"  saved generated Skeleton dependency: {skeleton_path}")
+    return True
+
+
+def process_mesh(
+    mesh_path: str,
+    master_mat=None,
+    json_path: str = None,
+    expected_mesh_name: str = "",
+    sidecar_sha256: str = "",
+) -> bool:
     """단일 StaticMesh/SkeletalMesh 를 JSON 기반으로 처리. 변경이 있었으면 True.
 
     json_path: send2ue extension 이 넘겨주는 JSON 절대경로(있으면 OneDrive walk 생략).
@@ -2181,8 +3623,28 @@ def process_mesh(mesh_path: str, master_mat=None, json_path: str = None) -> bool
     if not isinstance(mesh, _supported_mesh_classes()):
         return False
 
-    mesh_name = mesh_path.rsplit("/", 1)[-1]
-    data = _load_json(mesh_name, json_path, mesh_path)
+    mesh_name = str(expected_mesh_name or mesh_path.rsplit("/", 1)[-1]).strip()
+    data = _load_json(
+        mesh_name,
+        json_path,
+        mesh_path,
+        expected_sha256=sidecar_sha256,
+    )
+    asset_tools = None
+    if data:
+        _validate_speedtree_handoff_contract(data, mesh_name, mesh_path)
+        _validate_codex_test_material_scope(data, mesh_path)
+        instance_profile_targets = _validate_instance_profile_targets(
+            data, mesh_path
+        )
+        _checkout_material_pipeline_assets(mesh_path, data)
+        asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
+        _ensure_instance_profile_targets(
+            asset_tools,
+            instance_profile_targets,
+        )
+    else:
+        instance_profile_targets = {}
 
     def save_mesh_asset():
         if _is_skeletal_mesh(mesh):
@@ -2191,6 +3653,7 @@ def process_mesh(mesh_path: str, master_mat=None, json_path: str = None) -> bool
                 raise RuntimeError(
                     "CodexMaterialTools safe skeletal-mesh save helper is missing"
                 )
+            _save_generated_skeleton_dependency(mesh, mesh_path, helper)
             if not helper.save_asset_package_without_thumbnail(mesh):
                 raise RuntimeError(f"safe skeletal-mesh save failed: {mesh_path}")
             return
@@ -2203,7 +3666,12 @@ def process_mesh(mesh_path: str, master_mat=None, json_path: str = None) -> bool
         if isinstance(mesh, unreal.StaticMesh) and _set_nanite(mesh, nanite_enabled):
             save_mesh_asset()
         elif _is_skeletal_mesh(mesh):
-            voxelize = _nanite_shape_preservation_voxelize() if ENABLE_SKELETAL_NANITE_VOXELIZE else None
+            voxelize = (
+                _nanite_shape_preservation_voxelize()
+                if ENABLE_SKELETAL_NANITE_VOXELIZE
+                and _uses_tree_material_preset(data, mesh_path)
+                else None
+            )
             if _set_nanite(mesh, nanite_enabled, voxelize):
                 save_mesh_asset()
 
@@ -2211,7 +3679,6 @@ def process_mesh(mesh_path: str, master_mat=None, json_path: str = None) -> bool
         _warn(f"JSON 사이드카 없음: {mesh_name}.json — skip (블렌더에서 Rename 버튼을 눌렀나요?)")
         return False
 
-    asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
     changed = False
     json_mesh_name = str(data.get("mesh_name", ""))
     if json_mesh_name and json_mesh_name != mesh_name:
@@ -2220,12 +3687,12 @@ def process_mesh(mesh_path: str, master_mat=None, json_path: str = None) -> bool
         save_mesh_asset()
         changed = True
 
-    # 텍스처 재import 회피 캐시(메쉬마다 reload 되므로 디스크에서 읽고, 바뀌면 끝에 저장).
+    # 검증된 텍스처 fingerprint 캐시(메쉬마다 reload하고, 검증된 entry만 끝에 저장).
     tex_cache = _load_texture_cache()
     tex_cache_before = dict(tex_cache)
     skeletal_slot_assignments = {}
 
-    for entry in data.get("materials", []):
+    for entry_index, entry in enumerate(data.get("materials", [])):
         mat_name = str(entry.get("name", ""))
         slot_name = _entry_slot_display_name(entry, mat_name)
         target_material_path = _entry_target_material_path(entry)
@@ -2243,9 +3710,25 @@ def process_mesh(mesh_path: str, master_mat=None, json_path: str = None) -> bool
 
         preset = _master_preset(data, entry, mesh_path)
         if preset.get("key") == "hair":
-            mi, mi_path = _load_or_migrate_hair_material(asset_tools, mat_name, entry, preset)
+            mi, mi_path, mi_created = _load_or_create_hair_material(
+                asset_tools, mat_name, entry, preset
+            )
             if mi is None:
                 continue
+            if _is_skeletal_mesh(mesh):
+                _ensure_hair_master_skeletal_mesh_usage(mi)
+            layer_maps = _import_layer_textures(
+                _entry_layers(entry, preset),
+                tex_cache,
+                virtual_texture_streaming=preset.get("virtual_textures"),
+            )
+            if _assign_hair_tool_parameters(
+                mi,
+                entry,
+                layer_maps,
+                initialize_instance_owned_parameters=mi_created,
+            ):
+                unreal.EditorAssetLibrary.save_asset(mi_path, only_if_is_dirty=False)
             _log(f"  hair slot[{slot_index}] '{mat_name}' -> {mi_path}")
             if _is_skeletal_mesh(mesh):
                 skeletal_slot_assignments[slot_index] = (slot_name, mi)
@@ -2295,7 +3778,7 @@ def process_mesh(mesh_path: str, master_mat=None, json_path: str = None) -> bool
                 f"  slot[{slot_index}] '{mat_name}' -> {mi_path} "
                 f"(master: {preset['key']})"
             )
-            layers = _entry_layers(entry)
+            layers = _entry_layers(entry, preset)
             layer_maps = _import_layer_textures(
                 layers,
                 tex_cache,
@@ -2346,7 +3829,7 @@ def process_mesh(mesh_path: str, master_mat=None, json_path: str = None) -> bool
             continue
 
         # 3. Assign textures using the selected master material contract.
-        layers = _entry_layers(entry)
+        layers = _entry_layers(entry, preset)
         layer_maps = _import_layer_textures(
             layers,
             tex_cache,
@@ -2360,16 +3843,28 @@ def process_mesh(mesh_path: str, master_mat=None, json_path: str = None) -> bool
             entry=entry,
             mat_base=mat_base,
         )
-        if (mi_created or parent_changed or params_changed) and preset["assignment"] != "material_layer_instance":
+        if mi_created:
+            _save_and_mark_new_material_asset(mi_path)
+            changed = True
+        elif (parent_changed or params_changed) and preset["assignment"] != "material_layer_instance":
             unreal.EditorAssetLibrary.save_asset(mi_path)
             changed = True
-        elif mi_created or parent_changed or params_changed:
+        elif parent_changed or params_changed:
             changed = True
 
-        # 4. 슬롯에 MI 할당
+        # 4. Keep the base MI/MYI pipeline-managed. A profile target is
+        # user-owned and assignment-only: do not save, reparent, or edit it.
+        assigned_mi = mi
+        profile_target = instance_profile_targets.get(entry_index)
+        if profile_target:
+            assigned_mi = profile_target["asset"]
+            _log(
+                f"  user-managed profile '{profile_target['profile']}' -> "
+                f"{profile_target['target_path']} (reused without mutation)"
+            )
         if _is_skeletal_mesh(mesh):
-            skeletal_slot_assignments[slot_index] = (slot_name, mi)
-        if _assign_slot(mesh, slot_index, mi, slot_name):
+            skeletal_slot_assignments[slot_index] = (slot_name, assigned_mi)
+        if _assign_slot(mesh, slot_index, assigned_mi, slot_name):
             changed = True
 
     # 이번 처리에서 새로 import 된 텍스처가 있으면 캐시 갱신
@@ -2387,8 +3882,45 @@ def process_mesh(mesh_path: str, master_mat=None, json_path: str = None) -> bool
         _log(f"메쉬 '{mesh_name}' 완료")
 
     # 마지막으로 브라우저를 메쉬로 돌려 선택 상태로 끝낸다(텍스처 폴더로 튀는 것 방지).
+    if not changed and _is_skeletal_mesh(mesh):
+        # A no-op reimport can still create the default Skeleton package only in
+        # memory. Persist that dependency even when materials and Nanite settings
+        # already match, then resave the mesh so the reference survives restart.
+        helper = getattr(unreal, "CodexMaterialToolsLibrary", None)
+        if not helper or not hasattr(helper, "save_asset_package_without_thumbnail"):
+            raise RuntimeError(
+                "CodexMaterialTools safe skeletal-mesh save helper is missing"
+            )
+        if _save_generated_skeleton_dependency(mesh, mesh_path, helper):
+            if not helper.save_asset_package_without_thumbnail(mesh):
+                raise RuntimeError(f"safe skeletal-mesh save failed: {mesh_path}")
+            _log(f"  persisted generated Skeleton reference for: {mesh_name}")
+
     _sync_browser_to_mesh(mesh_path)
     return changed
+
+
+def persist_generated_skeleton_dependencies(mesh_paths) -> int:
+    """Persist generated Skeleton packages after every Send2UE import completes."""
+    helper = getattr(unreal, "CodexMaterialToolsLibrary", None)
+    if not helper or not hasattr(helper, "save_asset_package_without_thumbnail"):
+        raise RuntimeError(
+            "CodexMaterialTools safe skeletal-mesh save helper is missing"
+        )
+
+    saved_count = 0
+    for raw_path in dict.fromkeys(mesh_paths or []):
+        mesh_path = str(raw_path or "").split(".")[0]
+        mesh = unreal.load_asset(mesh_path)
+        if not _is_skeletal_mesh(mesh):
+            continue
+        if not _save_generated_skeleton_dependency(mesh, mesh_path, helper):
+            continue
+        if not helper.save_asset_package_without_thumbnail(mesh):
+            raise RuntimeError(f"safe skeletal-mesh save failed: {mesh_path}")
+        _log(f"  persisted generated Skeleton reference for: {mesh_path}")
+        saved_count += 1
+    return saved_count
 
 
 def process_meshes(mesh_paths):

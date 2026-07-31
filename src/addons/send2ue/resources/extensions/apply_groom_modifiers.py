@@ -1,5 +1,5 @@
 import bpy
-from send2ue.core import utilities
+from send2ue.core import ue_groom_adapter, utilities
 from send2ue.constants import ToolInfo
 from send2ue.core.extension import ExtensionBase
 
@@ -16,7 +16,20 @@ def get_temp_collection(collection_name="GroomTempCollection"):
 # make copies of original objects, link to temp collection
 def apply_groom_modifiers():
     properties = bpy.context.scene.send2ue
-    hair_objects = utilities.get_hair_objects(properties)
+    hair_objects = [
+        hair_object
+        for hair_object in utilities.get_hair_objects(properties)
+        if not (
+            isinstance(hair_object, bpy.types.Object)
+            and ue_groom_adapter.is_hair_tool_groom(hair_object, properties)
+        )
+    ]
+    # Adapter Grooms are evaluated non-destructively by the USD writer. Applying
+    # their Hair Tool and preview modifiers here can destroy the Curves component
+    # before export and leaves the user's object partially modified on failure.
+    if not hair_objects:
+        return
+
     temp_collection = get_temp_collection()
 
     for hair_object in hair_objects:

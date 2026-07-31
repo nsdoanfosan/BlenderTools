@@ -4,7 +4,6 @@ import bpy
 from send2ue.core.extension import ExtensionBase
 from send2ue.core import utilities
 from send2ue.constants import UnrealTypes
-from send2ue.dependencies.unreal import UnrealRemoteCalls as UnrealCalls
 from send2ue.dependencies.rpc.factory import make_remote
 
 
@@ -55,9 +54,15 @@ class CreatePostImportAssetsForGroom(ExtensionBase):
                 binding_asset_path = None
                 # get the mesh asset data related to this groom asset data
                 mesh_asset_data = utilities.get_related_mesh_asset_data_from_groom_asset_data(asset_data)
+                if mesh_asset_data.get('_asset_type') != UnrealTypes.SKELETAL_MESH:
+                    return
+
                 groom_asset_path = asset_data.get('asset_path', '')
                 mesh_asset_path = mesh_asset_data.get('asset_path', '')
-                UnrealRemoteCalls = make_remote(UnrealCalls)               
+                # Resolve the Unreal dependency at call time so live add-on reloads do not
+                # retain an outdated remote-call class after the module changes.
+                from send2ue.dependencies import unreal as unreal_dependency
+                UnrealRemoteCalls = make_remote(unreal_dependency.UnrealRemoteCalls)
 
                 if not UnrealRemoteCalls.asset_exists(groom_asset_path):
                     return
