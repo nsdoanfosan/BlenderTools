@@ -359,6 +359,8 @@ DYNAMIC_WIND_JSON_SUFFIX = "_dynamic_wind_import_from_megaplant_groups.json"
 # AssetImportData FileMD5와 실제 설정을 검증한 뒤에만 v2 dict로 지연 마이그레이션한다.
 TEXTURE_IMPORT_CACHE = os.path.join(EXPORT_DIR, "_texture_import_cache.json")
 TEXTURE_CACHE_ENTRY_VERSION = 2
+_TEXTURE_ASSET_SEARCH_CACHE = {}
+_TEXTURE_ASSET_REGISTRY_INDEX = None
 
 
 def _load_texture_cache() -> dict:
@@ -933,7 +935,108 @@ def _cache_verified_texture(
     return True
 
 
-def _import_texture(
+def _is_texture2d(asset) -> bool:
+    if asset is None:
+        return False
+    texture_class = getattr(unreal, "Texture2D", None)
+    if texture_class is not None:
+        try:
+            if isinstance(asset, texture_class):
+                return True
+        except TypeError:
+            pass
+    try:
+        return asset.get_class().get_name() == "Texture2D"
+    except Exception:
+        return False
+
+
+def _load_texture2d(asset_path: str):
+    try:
+        asset = unreal.load_asset(asset_path)
+    except Exception as exc:
+        _warn(f"  texture asset load failed; candidate omitted: {asset_path} ({exc})")
+        return None
+    if asset is not None and not _is_texture2d(asset):
+        _log(f"  non-Texture2D candidate omitted: {asset_path}")
+        return None
+    return asset
+
+
+def _texture_asset_paths_named(asset_name: str) -> list:
+    """Build one Texture2D name index per Unreal Python process."""
+    global _TEXTURE_ASSET_REGISTRY_INDEX
+    if _TEXTURE_ASSET_REGISTRY_INDEX is None:
+        registry = unreal.AssetRegistryHelpers.get_asset_registry()
+        try:
+            assets = registry.get_assets_by_path("/Game", recursive=True)
+        except TypeError:
+            assets = registry.get_assets_by_path("/Game", True)
+        index = {}
+        for asset_data in assets:
+            if _asset_data_class_name(asset_data).casefold() != "texture2d":
+                continue
+            name = str(asset_data.asset_name).strip().casefold()
+            path = str(asset_data.package_name).split(".")[0]
+            if name and path:
+                index.setdefault(name, []).append(path)
+        _TEXTURE_ASSET_REGISTRY_INDEX = {
+            name: sorted(set(paths), key=str.casefold)
+            for name, paths in index.items()
+        }
+    return list(
+        (_TEXTURE_ASSET_REGISTRY_INDEX or {}).get(
+            str(asset_name or "").strip().casefold(),
+            [],
+        )
+    )
+
+
+def _existing_texture_asset_path(asset_name: str, preferred_path: str = ""):
+    """Resolve one exact existing Texture2D without guessing between matches."""
+    preferred_path = str(preferred_path or "").split(".")[0]
+    if preferred_path:
+        try:
+            preferred_exists = unreal.EditorAssetLibrary.does_asset_exist(preferred_path)
+        except Exception as exc:
+            _warn(
+                "  texture asset existence lookup failed; candidate omitted: "
+                f"{preferred_path} ({exc})"
+            )
+            preferred_exists = False
+        if preferred_exists and _load_texture2d(preferred_path) is not None:
+            return preferred_path
+
+    cache_key = str(asset_name or "").strip().casefold()
+    if not cache_key:
+        return None
+    if cache_key in _TEXTURE_ASSET_SEARCH_CACHE:
+        return _TEXTURE_ASSET_SEARCH_CACHE[cache_key]
+
+    try:
+        candidates = _texture_asset_paths_named(asset_name)
+    except Exception as exc:
+        _log(f"  texture registry lookup unavailable: {asset_name} ({exc})")
+        candidates = []
+
+    candidates = list(
+        dict.fromkeys(str(path).split(".")[0] for path in candidates if path)
+    )
+    if len(candidates) == 1 and _load_texture2d(candidates[0]) is not None:
+        resolved = candidates[0]
+        _log(f"  existing texture resolved by exact name: {asset_name} -> {resolved}")
+    else:
+        resolved = None
+        if len(candidates) > 1:
+            _log(
+                "  texture exact-name lookup ambiguous; parameter left empty: "
+                f"{asset_name} ({', '.join(candidates)})"
+            )
+    _TEXTURE_ASSET_SEARCH_CACHE[cache_key] = resolved
+    return resolved
+
+
+def _import_texture_impl(
     file_path: str,
     asset_name: str,
     param: str,
@@ -947,13 +1050,23 @@ def _import_texture(
     legacy mtime cache entry는 검증 성공 뒤에만 v2 fingerprint dict로 교체된다.
     """
     if not asset_name:
-        _warn(f"  텍스처 asset_name 없음 — skip ({file_path})")
-        return None
-    if not file_path or not os.path.exists(file_path):
-        _warn(f"  텍스처 파일 없음: {asset_name} ({file_path})")
+        _log(f"  texture has no asset_name; parameter left empty ({file_path})")
         return None
 
     full_path = f"{TEXTURES_FOLDER}/{asset_name}"
+    if not file_path or not os.path.isfile(file_path):
+        existing_path = _existing_texture_asset_path(asset_name, full_path)
+        if existing_path:
+            _log(
+                "  declared texture source unavailable; existing asset reused: "
+                f"{asset_name} -> {existing_path}"
+            )
+            return existing_path
+        _log(
+            "  texture unresolved; parameter left empty: "
+            f"{asset_name} ({file_path})"
+        )
+        return None
     try:
         source_md5, fingerprint = _texture_source_fingerprint(
             file_path,
@@ -976,7 +1089,7 @@ def _import_texture(
             _warn(f"  텍스처 import task 실패: {asset_name}")
             return None
         tex = unreal.load_asset(full_path)
-        if tex is None:
+        if not _is_texture2d(tex):
             _warn(f"  텍스처 import 실패: {asset_name}")
             return None
         _configure_imported_texture(
@@ -1002,6 +1115,9 @@ def _import_texture(
         return full_path
 
     tex = unreal.load_asset(full_path)
+    if not _is_texture2d(tex):
+        _log(f"  non-Texture2D destination omitted: {full_path}")
+        return None
     imported_md5 = _asset_import_file_md5(full_path)
     source_matches = imported_md5 == source_md5
     settings_match = _texture_settings_match(tex, desired_settings)
@@ -1021,13 +1137,13 @@ def _import_texture(
 
     checkout_owned = _checkout_texture_for_update(full_path)
     try:
-        if not source_matches or tex is None:
+        if not source_matches:
             task = _run_texture_import(file_path, asset_name, replace_existing=True)
             if not _texture_import_task_succeeded(task, full_path):
                 _warn(f"  텍스처 reimport task 실패: {asset_name}")
                 return None
             tex = unreal.load_asset(full_path)
-            if tex is None:
+            if not _is_texture2d(tex):
                 _warn(f"  텍스처 reimport 실패: {asset_name}")
                 return None
             _configure_imported_texture(
@@ -1065,6 +1181,131 @@ def _import_texture(
     finally:
         if checkout_owned:
             _revert_owned_texture_checkout(full_path)
+
+
+def _verified_texture_fallback_after_failure(
+    file_path: str,
+    asset_name: str,
+    param: str,
+    virtual_texture_streaming,
+    preferred_verified_before: bool,
+):
+    preferred_path = f"{TEXTURES_FOLDER}/{asset_name}"
+    if preferred_verified_before:
+        return preferred_path
+    candidates = []
+    try:
+        candidates.extend(_texture_asset_paths_named(asset_name))
+    except Exception as exc:
+        _log(f"  texture registry fallback unavailable: {asset_name} ({exc})")
+    candidates = list(dict.fromkeys(str(path).split(".")[0] for path in candidates))
+    candidates = [path for path in candidates if path != preferred_path]
+
+    try:
+        source_md5 = _file_md5(file_path)
+        desired_settings = _desired_texture_settings(
+            param,
+            virtual_texture_streaming,
+            file_path,
+            asset_name,
+        )
+    except Exception as exc:
+        _warn(f"  texture fallback verification unavailable: {asset_name} ({exc})")
+        return None
+
+    verified = []
+    for candidate in candidates:
+        texture = _load_texture2d(candidate)
+        if texture is None:
+            continue
+        try:
+            candidate_matches = (
+                _asset_import_file_md5(candidate) == source_md5
+                and _texture_settings_match(texture, desired_settings)
+            )
+        except Exception as exc:
+            _warn(
+                "  existing texture verification failed; candidate omitted: "
+                f"{candidate} ({exc})"
+            )
+            continue
+        if candidate_matches:
+            verified.append(candidate)
+    if len(verified) == 1:
+        return verified[0]
+    if len(verified) > 1:
+        _log(
+            "  verified texture fallback ambiguous; parameter left empty: "
+            f"{asset_name} ({', '.join(verified)})"
+        )
+    return None
+
+
+def _import_texture(
+    file_path: str,
+    asset_name: str,
+    param: str,
+    tex_cache: dict = None,
+    force_reimport: bool = False,
+    virtual_texture_streaming=None,
+):
+    """Best-effort texture handoff; texture failures never gate the mesh/MI flow."""
+    preferred_verified_before = False
+    source_is_local = bool(asset_name and file_path and os.path.isfile(file_path))
+    if source_is_local:
+        preferred_path = f"{TEXTURES_FOLDER}/{asset_name}"
+        try:
+            preferred_exists = unreal.EditorAssetLibrary.does_asset_exist(preferred_path)
+            if preferred_exists:
+                preferred_texture = _load_texture2d(preferred_path)
+                preferred_verified_before = bool(
+                    preferred_texture is not None
+                    and _asset_import_file_md5(preferred_path) == _file_md5(file_path)
+                    and _texture_settings_match(
+                        preferred_texture,
+                        _desired_texture_settings(
+                            param,
+                            virtual_texture_streaming,
+                            file_path,
+                            asset_name,
+                        ),
+                    )
+                )
+        except Exception as exc:
+            _warn(f"  preferred texture verification failed: {asset_name} ({exc})")
+    try:
+        resolved = _import_texture_impl(
+            file_path,
+            asset_name,
+            param,
+            tex_cache,
+            force_reimport=force_reimport,
+            virtual_texture_streaming=virtual_texture_streaming,
+        )
+    except Exception as exc:
+        _warn(
+            "  local texture handoff failed; fallback evaluated: "
+            f"{asset_name or '<unnamed>'} ({exc})"
+        )
+        resolved = None
+    if resolved:
+        return resolved
+    verified_fallback = None
+    if source_is_local:
+        verified_fallback = _verified_texture_fallback_after_failure(
+            file_path,
+            asset_name,
+            param,
+            virtual_texture_streaming,
+            preferred_verified_before,
+        )
+    if verified_fallback:
+        _log(
+            "  verified existing texture reused after local handoff failure: "
+            f"{asset_name} -> {verified_fallback}"
+        )
+        return verified_fallback
+    return None
 
 
 def _nanite_shape_preservation_voxelize():
@@ -1397,11 +1638,17 @@ def _load_master_material(preset: dict):
     master_path = preset["master"]
     master_mat = unreal.load_asset(master_path)
     if master_mat is None:
-        _warn(f"마스터 머티리얼 없음: {master_path}")
+        _log(f"  master material unavailable; fallback remains empty: {master_path}")
     return master_mat
 
 
-def _create_or_load_mi(asset_tools, master_mat, mat_base: str, mi_folder: str):
+def _create_or_load_mi(
+    asset_tools,
+    master_mat,
+    mat_base: str,
+    mi_folder: str,
+    manage_existing: bool = False,
+):
     mi_name = f"MI_{mat_base}"
     mi_path = f"{mi_folder}/{mi_name}"
     if unreal.EditorAssetLibrary.does_asset_exist(mi_path):
@@ -1411,7 +1658,11 @@ def _create_or_load_mi(asset_tools, master_mat, mat_base: str, mi_folder: str):
             current_parent = mi.get_editor_property("parent")
         except Exception:
             current_parent = None
-        if not _same_asset(current_parent, master_mat):
+        if (
+            manage_existing
+            and master_mat is not None
+            and not _same_asset(current_parent, master_mat)
+        ):
             unreal.MaterialEditingLibrary.set_material_instance_parent(mi, master_mat)
             _log(f"  MI parent 변경: {mi_name} -> {master_mat.get_path_name()}")
             parent_changed = True
@@ -1434,6 +1685,10 @@ def _create_or_load_mi(asset_tools, master_mat, mat_base: str, mi_folder: str):
         if copied is not None:
             _log(f"  MI copy: {copy_from_path} -> {mi_path}")
             return copied, mi_path, True, False, "copy"
+
+    if master_mat is None:
+        _log(f"  MI and usable master unavailable; slot left unchanged: {mi_path}")
+        return None, mi_path, False, False, "missing"
 
     unreal.EditorAssetLibrary.make_directory(mi_folder)
     factory = unreal.MaterialInstanceConstantFactoryNew()
@@ -1476,6 +1731,33 @@ def _entry_create_if_missing(entry: dict, preset: dict) -> bool:
     if isinstance(value, str):
         return value.strip().casefold() not in {"0", "false", "no", "off"}
     return bool(value)
+
+
+def _entry_manages_existing_material_instance(entry: dict) -> bool:
+    """Existing MIs are assignment-only unless the contract explicitly opts in."""
+    manage_existing = entry.get("manage_existing_material_instance", False)
+    if isinstance(manage_existing, str):
+        manage_existing = manage_existing.strip().casefold() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+    ownership = str(
+        entry.get("material_instance_ownership")
+        or entry.get("material_ownership")
+        or ""
+    ).strip().casefold()
+    return bool(manage_existing) or ownership in {"pipeline", "managed"}
+
+
+def _entry_reuses_material_instance_unchanged(entry: dict, preset: dict) -> bool:
+    """Return whether an existing MI is assignment-only."""
+    if _entry_manages_existing_material_instance(entry):
+        return False
+    # These fields still document ownership intent, but default reuse is broad:
+    # finding an exact MI ends texture discovery and mutation for this slot.
+    return True
 
 
 def _entry_instance_profile(entry: dict) -> str:
@@ -1579,28 +1861,57 @@ def _validate_instance_profile_targets(data: dict, mesh_path: str = "") -> dict:
             paths = _instance_profile_material_paths(entry, preset)
             base_path = paths["base_path"]
             target_path = paths["target_path"]
-            base_exists = unreal.EditorAssetLibrary.does_asset_exist(base_path)
             target_exists = unreal.EditorAssetLibrary.does_asset_exist(target_path)
-            base_asset = unreal.load_asset(base_path) if base_exists else None
             target_asset = unreal.load_asset(target_path) if target_exists else None
-            if base_exists and not _is_material_instance_constant(base_asset):
-                raise RuntimeError(
-                    f"base asset is not a MaterialInstanceConstant: {base_path}"
-                )
             if target_exists and not _is_material_instance_constant(target_asset):
                 raise RuntimeError(
                     f"target asset is not a MaterialInstanceConstant: {target_path}"
                 )
+            if target_exists:
+                intent = ("existing_target", target_path)
+                plan = plans_by_target_path.get(target_path)
+                if plan is not None and plan["intent"] != intent:
+                    raise RuntimeError(
+                        f"conflicting profile target intent: {target_path}"
+                    )
+                if plan is None:
+                    plan = {
+                        **paths,
+                        "intent": intent,
+                        "preset": preset,
+                        "master_path": "",
+                        "master_asset": None,
+                        "base_asset": None,
+                        "asset": target_asset,
+                        "target_existed": True,
+                        "create_base": False,
+                        "create_target": False,
+                        "entry_indices": [],
+                    }
+                    plans_by_target_path[target_path] = plan
+                plan["entry_indices"].append(entry_index)
+                targets[entry_index] = plan
+                continue
             if not target_exists and paths["mode"] == "assign_existing":
+                _log(
+                    f"  user-managed instance unavailable; base fallback remains: "
+                    f"{target_path}"
+                )
+                continue
+            base_exists = unreal.EditorAssetLibrary.does_asset_exist(base_path)
+            base_asset = unreal.load_asset(base_path) if base_exists else None
+            if base_exists and not _is_material_instance_constant(base_asset):
                 raise RuntimeError(
-                    f"user-managed instance is missing: {target_path}"
+                    f"base asset is not a MaterialInstanceConstant: {base_path}"
                 )
             master_path = str(preset.get("master") or "").split(".")[0]
             master_asset = unreal.load_asset(master_path) if master_path else None
-            if not base_exists and master_asset is None:
-                raise RuntimeError(
-                    f"base MI master is missing: {master_path or '<empty>'}"
+            if not base_exists and master_asset is None and not target_exists:
+                _log(
+                    f"  profile base and master unavailable; material remains "
+                    f"unassigned: {base_path}"
                 )
+                continue
             intent = (base_path, master_path)
             plan = plans_by_target_path.get(target_path)
             if plan is not None and plan["intent"] != intent:
@@ -1616,7 +1927,8 @@ def _validate_instance_profile_targets(data: dict, mesh_path: str = "") -> dict:
                     "master_asset": master_asset,
                     "base_asset": base_asset,
                     "asset": target_asset,
-                    "create_base": not base_exists,
+                    "target_existed": False,
+                    "create_base": not base_exists and not target_exists,
                     "create_target": not target_exists,
                     "entry_indices": [],
                 }
@@ -1673,6 +1985,28 @@ def _save_and_mark_new_material_asset(asset_path: str, label: str = "material in
         except Exception as rollback_exc:
             _warn(f"  {label} rollback failed: {asset_path} ({rollback_exc})")
         raise
+
+
+def _save_material_texture_update(asset_path: str) -> bool:
+    """Persist best-effort parameter changes without making textures an admission gate."""
+    try:
+        saved = unreal.EditorAssetLibrary.save_asset(
+            asset_path,
+            only_if_is_dirty=False,
+        )
+    except Exception as exc:
+        _warn(
+            f"  material texture update save failed: {asset_path} ({exc}); "
+            "handoff continues"
+        )
+        return False
+    if not saved:
+        _warn(
+            f"  material texture update save failed: {asset_path}; "
+            "handoff continues"
+        )
+        return False
+    return True
 
 
 def _load_exact_material_instance(asset_path: str):
@@ -1819,10 +2153,13 @@ def _load_or_copy_target_material(
 
     if not copy_from_path:
         if not create_if_missing:
-            _warn(f"  target material missing; creation disabled: {target_path}")
+            _log(f"  target material unavailable; slot left unchanged: {target_path}")
             return None, target_path, False, "missing"
         if master_mat is None:
-            _warn(f"  target material missing and no master: {target_path}")
+            _log(
+                "  target material and master unavailable; slot left unchanged: "
+                + target_path
+            )
             return None, target_path, False, "missing"
         target_folder, target_name = target_path.rsplit("/", 1)
         unreal.EditorAssetLibrary.make_directory(target_folder)
@@ -1844,7 +2181,7 @@ def _load_or_copy_target_material(
         _log(f"  MI create: {target_path}")
         return mi, target_path, True, "new"
     if not unreal.EditorAssetLibrary.does_asset_exist(copy_from_path):
-        _warn(f"  copy source material missing: {copy_from_path} -> {target_path}")
+        _log(f"  copy source material unavailable: {copy_from_path} -> {target_path}")
         return None, target_path, False, "missing"
 
     target_folder, target_name = target_path.rsplit("/", 1)
@@ -2318,32 +2655,55 @@ def _surface_layer_param(param: str) -> str:
     return LAYER_PARAM_BY_LEGACY_PARAM.get(str(param or ""), str(param or ""))
 
 
-def _assign_layer_zero_textures(mi, param_tex_map: dict) -> bool:
+def _assign_layer_zero_textures(
+    mi,
+    param_tex_map: dict,
+    clear_missing_managed: bool = False,
+) -> bool:
     """Fallback for stale editors: Python can address only material layer index 0."""
     changed = False
+    accepted_names = set()
     association = unreal.MaterialParameterAssociation.LAYER_PARAMETER
     for param, tex_path in param_tex_map.items():
-        tex = unreal.load_asset(tex_path)
-        if tex is None:
-            continue
         try:
+            tex = unreal.load_asset(tex_path)
+            if not _is_texture2d(tex):
+                continue
             current = unreal.MaterialEditingLibrary.get_material_instance_texture_parameter_value(
                 mi,
                 param,
                 association,
             )
-        except Exception:
-            current = None
-        if current is not None and current.get_path_name() == tex.get_path_name():
+            if current is not None and current.get_path_name() == tex.get_path_name():
+                accepted_names.add(str(param))
+                continue
+            unreal.MaterialEditingLibrary.set_material_instance_texture_parameter_value(
+                mi,
+                param,
+                tex,
+                association,
+            )
+        except Exception as exc:
+            _warn(
+                f"  layer[0] texture role left empty: {param} ({exc}); "
+                "handoff continues"
+            )
             continue
-        unreal.MaterialEditingLibrary.set_material_instance_texture_parameter_value(
-            mi,
-            param,
-            tex,
-            association,
-        )
+        accepted_names.add(str(param))
         _log(f"  layer[0] {param} -> {tex_path.split('/')[-1]} (python fallback)")
         changed = True
+    if clear_missing_managed:
+        changed |= _prune_managed_texture_parameter_overrides(
+            mi,
+            KNOWN_PARAMS,
+            set(param_tex_map),
+            managed_bindings={
+                (name, "LAYER_PARAMETER", 0) for name in KNOWN_PARAMS
+            },
+            keep_bindings={
+                (name, "LAYER_PARAMETER", 0) for name in accepted_names
+            },
+        )
     return changed
 
 
@@ -2466,7 +2826,11 @@ def reimport_textures_from_json(json_path: str) -> int:
     return imported
 
 
-def _assign_surface_layer_textures(mi, layer_maps) -> bool:
+def _assign_surface_layer_textures(
+    mi,
+    layer_maps,
+    clear_missing_managed: bool = False,
+) -> bool:
     """Assign imported textures to a material instance using shared layer params.
 
     The Unreal Python API can address layer parameters by association but not by
@@ -2476,22 +2840,48 @@ def _assign_surface_layer_textures(mi, layer_maps) -> bool:
     helper = getattr(unreal, "CodexMaterialToolsLibrary", None)
     if helper and hasattr(helper, "set_material_instance_layer_texture_parameter_value"):
         changed = False
+        keep_bindings = set()
+        layer_indices = {
+            int(layer.get("index", 0)) for layer in layer_maps
+        }
         for layer in layer_maps:
             for param, tex_path in layer.get("textures", {}).items():
-                tex = unreal.load_asset(tex_path)
-                if tex is None:
+                layer_index = int(layer.get("index", 0))
+                try:
+                    tex = unreal.load_asset(tex_path)
+                    if not _is_texture2d(tex):
+                        continue
+                    role_changed = helper.set_material_instance_layer_texture_parameter_value(
+                        mi,
+                        str(param),
+                        tex,
+                        layer_index,
+                    )
+                except Exception as exc:
+                    _warn(
+                        f"  layer[{layer_index}] texture role left empty: "
+                        f"{param} ({exc}); handoff continues"
+                    )
                     continue
-                if helper.set_material_instance_layer_texture_parameter_value(
-                    mi,
-                    str(param),
-                    tex,
-                    int(layer.get("index", 0)),
-                ):
+                keep_bindings.add((str(param), "LAYER_PARAMETER", layer_index))
+                if role_changed:
                     _log(
-                        f"  layer[{int(layer.get('index', 0))}] {param} -> "
+                        f"  layer[{layer_index}] {param} -> "
                         f"{tex_path.split('/')[-1]}"
                     )
                     changed = True
+        if clear_missing_managed:
+            changed |= _prune_managed_texture_parameter_overrides(
+                mi,
+                KNOWN_PARAMS,
+                {name for name, _association, _index in keep_bindings},
+                managed_bindings={
+                    (name, "LAYER_PARAMETER", layer_index)
+                    for name in KNOWN_PARAMS
+                    for layer_index in layer_indices
+                },
+                keep_bindings=keep_bindings,
+            )
         return changed
 
     if len(layer_maps) > 1 or any(int(layer.get("index", 0)) != 0 for layer in layer_maps):
@@ -2500,7 +2890,11 @@ def _assign_surface_layer_textures(mi, layer_maps) -> bool:
         (layer.get("textures", {}) for layer in layer_maps if int(layer.get("index", 0)) == 0),
         {},
     )
-    return _assign_layer_zero_textures(mi, first_layer)
+    return _assign_layer_zero_textures(
+        mi,
+        first_layer,
+        clear_missing_managed=clear_missing_managed,
+    )
 
 
 def _first_layer_textures(layer_maps) -> dict:
@@ -2510,28 +2904,53 @@ def _first_layer_textures(layer_maps) -> dict:
     )
 
 
-def _assign_flat_textures(mi, layer_maps, param_map: dict, label: str) -> bool:
+def _assign_flat_textures(
+    mi,
+    layer_maps,
+    param_map: dict,
+    label: str,
+    clear_missing_managed: bool = False,
+) -> bool:
     changed = False
+    keep_names = set()
     for layer_param, tex_path in _first_layer_textures(layer_maps).items():
         flat_param = param_map.get(layer_param)
         if not flat_param:
             continue
-        tex = unreal.load_asset(tex_path)
-        if tex is None:
-            continue
         try:
+            tex = unreal.load_asset(tex_path)
+            if not _is_texture2d(tex):
+                continue
             current = unreal.MaterialEditingLibrary.get_material_instance_texture_parameter_value(
                 mi, flat_param
             )
-        except Exception:
-            current = None
-        if current is not None and current.get_path_name() == tex.get_path_name():
+            if current is not None and current.get_path_name() == tex.get_path_name():
+                keep_names.add(flat_param)
+                continue
+            unreal.MaterialEditingLibrary.set_material_instance_texture_parameter_value(
+                mi, flat_param, tex
+            )
+        except Exception as exc:
+            _warn(
+                f"  {label} texture role left empty: {flat_param} ({exc}); "
+                "handoff continues"
+            )
             continue
-        unreal.MaterialEditingLibrary.set_material_instance_texture_parameter_value(
-            mi, flat_param, tex
-        )
+        keep_names.add(flat_param)
         _log(f"  {label} {flat_param} <- {tex_path.split('/')[-1]}")
         changed = True
+    if clear_missing_managed:
+        changed |= _prune_managed_texture_parameter_overrides(
+            mi,
+            set(param_map.values()),
+            keep_names,
+            managed_bindings={
+                (name, "GLOBAL_PARAMETER", -1) for name in param_map.values()
+            },
+            keep_bindings={
+                (name, "GLOBAL_PARAMETER", -1) for name in keep_names
+            },
+        )
     return changed
 
 
@@ -2546,31 +2965,92 @@ def _texture_parameter_name(parameter_value):
             return ""
 
 
-def _prune_texture_parameter_overrides(mi, keep_names: set, update: bool = True) -> bool:
+def _parameter_association_key(value) -> str:
+    text = str(value or "GLOBAL_PARAMETER")
+    return text.rsplit(".", 1)[-1].strip().upper()
+
+
+def _texture_parameter_binding(parameter_value):
+    name = _texture_parameter_name(parameter_value)
     try:
-        values = list(mi.get_editor_property("texture_parameter_values"))
+        info = parameter_value.get_editor_property("parameter_info")
+    except Exception:
+        info = None
+    association = "GLOBAL_PARAMETER"
+    index = -1
+    if info is not None:
+        try:
+            association = _parameter_association_key(
+                info.get_editor_property("association")
+            )
+        except Exception:
+            pass
+        try:
+            index = int(info.get_editor_property("index"))
+        except Exception:
+            pass
+    return name, association, index
+
+
+def _prune_managed_texture_parameter_overrides(
+    asset,
+    managed_names: set,
+    keep_names: set,
+    update: bool = True,
+    managed_bindings: set = None,
+    keep_bindings: set = None,
+) -> bool:
+    """Clear stale pipeline-owned texture roles without touching artist roles."""
+    managed_names = {str(name) for name in managed_names if str(name or "")}
+    keep_names = {str(name) for name in keep_names if str(name or "")}
+    if not managed_names:
+        return False
+    try:
+        values = list(asset.get_editor_property("texture_parameter_values"))
     except Exception:
         return False
-    kept = [
-        value
-        for value in values
-        if _texture_parameter_name(value) in keep_names
-    ]
-    if len(kept) == len(values):
+
+    if managed_bindings is not None:
+        managed_bindings = {
+            (str(name), _parameter_association_key(association), int(index))
+            for name, association, index in managed_bindings
+        }
+        keep_bindings = {
+            (str(name), _parameter_association_key(association), int(index))
+            for name, association, index in (keep_bindings or set())
+        }
+        removed = [
+            value
+            for value in values
+            if _texture_parameter_binding(value) in managed_bindings
+            and _texture_parameter_binding(value) not in keep_bindings
+        ]
+    else:
+        removed = [
+            value
+            for value in values
+            if _texture_parameter_name(value) in managed_names
+            and _texture_parameter_name(value) not in keep_names
+        ]
+    if not removed:
         return False
-    mi.set_editor_property("texture_parameter_values", kept)
+    removed_ids = {id(value) for value in removed}
+    try:
+        asset.set_editor_property(
+            "texture_parameter_values",
+            [value for value in values if id(value) not in removed_ids],
+        )
+    except Exception as exc:
+        _warn(f"  managed texture override clear unavailable: {exc}")
+        return False
     if update:
         try:
-            unreal.MaterialEditingLibrary.update_material_instance(mi)
+            unreal.MaterialEditingLibrary.update_material_instance(asset)
         except Exception:
             pass
     _log(
-        "  stale texture overrides pruned: "
-        + ", ".join(
-            _texture_parameter_name(value)
-            for value in values
-            if _texture_parameter_name(value) not in keep_names
-        )
+        "  stale managed texture overrides cleared: "
+        + ", ".join(_texture_parameter_name(value) for value in removed)
     )
     return True
 
@@ -2886,7 +3366,14 @@ def _call_set_material_instance_background_layer(helper, mi, layer_asset):
     return bool(helper.set_material_instance_background_layer(mi, layer_asset)), []
 
 
-def _assign_material_layer_instance(mi, mat_base: str, layer_maps, preset: dict, entry: dict) -> bool:
+def _assign_material_layer_instance(
+    mi,
+    mat_base: str,
+    layer_maps,
+    preset: dict,
+    entry: dict,
+    clear_missing_managed: bool = False,
+) -> bool:
     helper = getattr(unreal, "CodexMaterialToolsLibrary", None)
     if not helper or not hasattr(helper, "create_or_update_material_layer_instance"):
         _warn("  CodexMaterialTools layer instance helper missing; MYI assignment skipped")
@@ -2965,10 +3452,61 @@ def _assign_material_layer_instance(mi, mat_base: str, layer_maps, preset: dict,
                 )
             raise
 
+    layer_overrides_pruned = False
+    if clear_missing_managed:
+        layer_overrides_pruned = _prune_managed_texture_parameter_overrides(
+            layer_asset,
+            set(remap.values()),
+            set(texture_params),
+            update=False,
+            managed_bindings={
+                (name, "GLOBAL_PARAMETER", -1) for name in remap.values()
+            },
+            keep_bindings={
+                (name, "GLOBAL_PARAMETER", -1) for name in texture_params
+            },
+        )
+        if layer_overrides_pruned:
+            for method_name in ("update_parameter_set", "post_edit_change"):
+                method = getattr(layer_asset, method_name, None)
+                if callable(method):
+                    try:
+                        method()
+                    except Exception:
+                        pass
+            try:
+                layer_saved = unreal.EditorAssetLibrary.save_asset(
+                    layer_path,
+                    only_if_is_dirty=False,
+                )
+            except Exception as exc:
+                _warn(
+                    "material layer instance save failed after stale-role clear: "
+                    f"{layer_path} ({exc}); handoff continues"
+                )
+            else:
+                if not layer_saved:
+                    _warn(
+                        "material layer instance save failed after stale-role clear: "
+                        f"{layer_path}; handoff continues"
+                    )
+
     # Remove stale flat/layer overrides before the C++ helper persists the MI.
     # Do not trigger a live material preview update here; UE 5.8 can assert
     # while compiling a newly-created Material Layer Instance thumbnail.
-    overrides_pruned = _prune_texture_parameter_overrides(mi, set(), update=False)
+    managed_mi_names = (
+        set(KNOWN_PARAMS)
+        | set(FLAT_PARAM_BY_LAYER_PARAM.values())
+        | set(COAT_PARAM_BY_LAYER_PARAM.values())
+        | set(ASSET_SURFACE_PARAM_BY_LAYER_PARAM.values())
+        | set(remap.values())
+    )
+    overrides_pruned = _prune_managed_texture_parameter_overrides(
+        mi,
+        managed_mi_names,
+        set(),
+        update=False,
+    )
     changed, background_errors = _call_set_material_instance_background_layer(
         helper, mi, layer_asset
     )
@@ -2980,25 +3518,89 @@ def _assign_material_layer_instance(mi, mat_base: str, layer_maps, preset: dict,
     if not changed:
         _warn(f"  background MYI assignment not verified: {layer_path}")
         return False
-    changed = overrides_pruned or changed
+    changed = layer_overrides_pruned or overrides_pruned or changed
     _log(f"  background MYI <- {layer_path}")
     return changed
 
 
-def _assign_master_textures(mi, layer_maps, assignment: str, preset: dict = None, entry: dict = None, mat_base: str = "") -> bool:
+def _assign_master_textures_impl(
+    mi,
+    layer_maps,
+    assignment: str,
+    preset: dict = None,
+    entry: dict = None,
+    mat_base: str = "",
+    clear_missing_managed: bool = False,
+) -> bool:
     preset = preset or {}
     entry = entry or {}
     if assignment == "none":
         return False
     if assignment == "layer":
-        return _assign_surface_layer_textures(mi, layer_maps)
+        return _assign_surface_layer_textures(
+            mi,
+            layer_maps,
+            clear_missing_managed=clear_missing_managed,
+        )
     if assignment == "material_layer_instance":
-        return _assign_material_layer_instance(mi, mat_base, layer_maps, preset, entry)
+        return _assign_material_layer_instance(
+            mi,
+            mat_base,
+            layer_maps,
+            preset,
+            entry,
+            clear_missing_managed=clear_missing_managed,
+        )
     if assignment == "asset_surface_flat":
-        return _assign_flat_textures(mi, layer_maps, ASSET_SURFACE_PARAM_BY_LAYER_PARAM, "asset_surface")
+        return _assign_flat_textures(
+            mi,
+            layer_maps,
+            ASSET_SURFACE_PARAM_BY_LAYER_PARAM,
+            "asset_surface",
+            clear_missing_managed=clear_missing_managed,
+        )
     if assignment == "coat_flat":
-        return _assign_flat_textures(mi, layer_maps, COAT_PARAM_BY_LAYER_PARAM, "coat")
-    return _assign_flat_textures(mi, layer_maps, FLAT_PARAM_BY_LAYER_PARAM, "prop")
+        return _assign_flat_textures(
+            mi,
+            layer_maps,
+            COAT_PARAM_BY_LAYER_PARAM,
+            "coat",
+            clear_missing_managed=clear_missing_managed,
+        )
+    return _assign_flat_textures(
+        mi,
+        layer_maps,
+        FLAT_PARAM_BY_LAYER_PARAM,
+        "prop",
+        clear_missing_managed=clear_missing_managed,
+    )
+
+
+def _assign_master_textures(
+    mi,
+    layer_maps,
+    assignment: str,
+    preset: dict = None,
+    entry: dict = None,
+    mat_base: str = "",
+    clear_missing_managed: bool = False,
+) -> bool:
+    """Apply the safe texture subset without turning failures into a gate."""
+    try:
+        return _assign_master_textures_impl(
+            mi,
+            layer_maps,
+            assignment,
+            preset=preset,
+            entry=entry,
+            mat_base=mat_base,
+            clear_missing_managed=clear_missing_managed,
+        )
+    except Exception as exc:
+        _warn(f"  texture parameter handoff incomplete; continuing: {exc}")
+        # A role may already have been applied before the failure. Let callers
+        # persist that safe subset instead of discarding the whole MI update.
+        return True
 
 
 def _material_instance_base_name(mat_name: str) -> str:
@@ -3146,13 +3748,30 @@ def _delete_wrong_generated_hair_materials(mat_name: str, entry: dict, preset: d
     return deleted
 
 
-def _load_or_create_hair_material(asset_tools, mat_name: str, entry: dict, preset: dict):
+def _load_or_create_hair_material(
+    asset_tools,
+    mat_name: str,
+    entry: dict,
+    preset: dict,
+    preserve_existing: bool = False,
+):
     target_path = _hair_target_material_path(mat_name, entry, preset)
     if not target_path:
         _warn(f"  hair material target path incomplete for '{mat_name}'")
         return None, None, False
 
+    existing = _load_exact_material_instance(target_path)
+    if existing is not None and preserve_existing:
+        _log(f"  user-owned hair MI reused unchanged: {target_path}")
+        return existing, target_path, False
+    if existing is None and not _entry_create_if_missing(entry, preset):
+        _log(f"  requested hair MI is unavailable; slot left unchanged: {target_path}")
+        return None, target_path, False
+
     master = _load_master_material(preset)
+    if existing is not None and master is None:
+        _log(f"  existing hair MI reused without parent mutation: {target_path}")
+        return existing, target_path, False
     if master is None:
         return None, target_path, False
     mi, _path, created, _source = _load_or_copy_target_material(
@@ -3178,17 +3797,40 @@ def _assign_hair_tool_parameters(
     entry: dict,
     layer_maps,
     initialize_instance_owned_parameters: bool = True,
+    clear_missing_managed: bool = False,
 ) -> bool:
     changed = False
+    keep_texture_names = set()
     for param, tex_path in _first_layer_textures(layer_maps).items():
-        texture = unreal.load_asset(tex_path)
-        if texture is None:
+        try:
+            texture = unreal.load_asset(tex_path)
+            if not _is_texture2d(texture):
+                continue
+            unreal.MaterialEditingLibrary.set_material_instance_texture_parameter_value(
+                mi, param, texture
+            )
+        except Exception as exc:
+            _warn(
+                f"  hair texture role left empty: {param} ({exc}); "
+                "handoff continues"
+            )
             continue
-        unreal.MaterialEditingLibrary.set_material_instance_texture_parameter_value(
-            mi, param, texture
-        )
+        keep_texture_names.add(str(param))
         _log(f"  hair texture {param} <- {tex_path.split('/')[-1]}")
         changed = True
+
+    if clear_missing_managed:
+        changed |= _prune_managed_texture_parameter_overrides(
+            mi,
+            KNOWN_PARAMS,
+            keep_texture_names,
+            managed_bindings={
+                (name, "GLOBAL_PARAMETER", -1) for name in KNOWN_PARAMS
+            },
+            keep_bindings={
+                (name, "GLOBAL_PARAMETER", -1) for name in keep_texture_names
+            },
+        )
 
     hair_tool = entry.get("hair_tool") or {}
     for name, value in (hair_tool.get("scalar_parameters") or {}).items():
@@ -3436,13 +4078,14 @@ def _material_pipeline_mutation_paths(mesh_path: str, data: dict) -> list:
         if entry.get("translucent"):
             continue
         preset = _master_preset(data, entry, mesh_path)
-        master_path = str(preset.get("master") or "").split(".")[0]
-        if master_path:
-            paths.append(master_path)
-        parent_layer = _layer_parent_path(preset, entry)
-        if parent_layer:
-            paths.append(parent_layer)
-
+        profile_paths = _instance_profile_material_paths(entry, preset)
+        if (
+            profile_paths
+            and unreal.EditorAssetLibrary.does_asset_exist(
+                profile_paths["target_path"]
+            )
+        ):
+            continue
         target_path = _entry_target_material_path(entry)
         if preset.get("key") == "hair":
             target_path = target_path or _hair_target_material_path(
@@ -3455,6 +4098,22 @@ def _material_pipeline_mutation_paths(mesh_path: str, data: dict) -> list:
             mi_folder = str(preset.get("mi_folder") or "").rstrip("/")
             if mat_base and mi_folder:
                 target_path = f"{mi_folder}/MI_{mat_base}"
+        if (
+            target_path
+            and _entry_reuses_material_instance_unchanged(entry, preset)
+            and (
+                unreal.EditorAssetLibrary.does_asset_exist(target_path)
+                or not _entry_create_if_missing(entry, preset)
+            )
+        ):
+            continue
+
+        master_path = str(preset.get("master") or "").split(".")[0]
+        if master_path:
+            paths.append(master_path)
+        parent_layer = _layer_parent_path(preset, entry)
+        if parent_layer:
+            paths.append(parent_layer)
         if target_path:
             paths.append(target_path)
 
@@ -3530,15 +4189,52 @@ def preflight_mesh_materials(
         instance_profile_targets,
     )
 
+    mutable_layer_entries = []
+    for entry in data.get("materials", []):
+        preset = _master_preset(data, entry, mesh_path)
+        if preset.get("assignment") != "material_layer_instance":
+            continue
+        mat_name = str(entry.get("name", ""))
+        profile_paths = _instance_profile_material_paths(entry, preset)
+        if (
+            profile_paths
+            and unreal.EditorAssetLibrary.does_asset_exist(
+                profile_paths["target_path"]
+            )
+        ):
+            continue
+        target_path = _entry_target_material_path(entry)
+        if preset.get("key") == "hair":
+            target_path = target_path or _hair_target_material_path(
+                mat_name,
+                entry,
+                preset,
+            )
+        if not target_path:
+            mat_base = _material_instance_base_name(mat_name)
+            mi_folder = str(preset.get("mi_folder") or "").rstrip("/")
+            if mat_base and mi_folder:
+                target_path = f"{mi_folder}/MI_{mat_base}"
+        if (
+            target_path
+            and _entry_reuses_material_instance_unchanged(entry, preset)
+            and (
+                unreal.EditorAssetLibrary.does_asset_exist(target_path)
+                or not _entry_create_if_missing(entry, preset)
+            )
+        ):
+            continue
+        mutable_layer_entries.append((entry, preset))
+
+    if not mutable_layer_entries:
+        return False
+
     helper = getattr(unreal, "CodexMaterialToolsLibrary", None)
     if helper is None:
         raise RuntimeError("CodexMaterialTools material preflight helper missing")
 
     normalized = False
-    for entry in data.get("materials", []):
-        preset = _master_preset(data, entry, mesh_path)
-        if preset.get("assignment") != "material_layer_instance":
-            continue
+    for entry, preset in mutable_layer_entries:
         master_path = str(preset.get("master") or "")
         parent_layer = _layer_parent_path(preset, entry)
         if master_path:
@@ -3708,27 +4404,55 @@ def process_mesh(
                 continue
             slot_index = int(entry.get("slot_index", 0))
 
+        profile_target = instance_profile_targets.get(entry_index)
+        if (
+            profile_target
+            and profile_target.get("target_existed")
+            and profile_target.get("asset") is not None
+        ):
+            assigned_mi = profile_target["asset"]
+            _log(
+                f"  existing profile '{profile_target['profile']}' -> "
+                f"{profile_target['target_path']} (reused without base or texture work)"
+            )
+            if _is_skeletal_mesh(mesh):
+                skeletal_slot_assignments[slot_index] = (slot_name, assigned_mi)
+            if _assign_slot(mesh, slot_index, assigned_mi, slot_name):
+                changed = True
+            continue
+
         preset = _master_preset(data, entry, mesh_path)
         if preset.get("key") == "hair":
+            reuse_unchanged = _entry_reuses_material_instance_unchanged(
+                entry,
+                preset,
+            )
             mi, mi_path, mi_created = _load_or_create_hair_material(
-                asset_tools, mat_name, entry, preset
+                asset_tools,
+                mat_name,
+                entry,
+                preset,
+                preserve_existing=reuse_unchanged,
             )
             if mi is None:
                 continue
-            if _is_skeletal_mesh(mesh):
+            reuse_unchanged = bool(reuse_unchanged and not mi_created)
+            if _is_skeletal_mesh(mesh) and not reuse_unchanged:
                 _ensure_hair_master_skeletal_mesh_usage(mi)
-            layer_maps = _import_layer_textures(
-                _entry_layers(entry, preset),
-                tex_cache,
-                virtual_texture_streaming=preset.get("virtual_textures"),
-            )
-            if _assign_hair_tool_parameters(
-                mi,
-                entry,
-                layer_maps,
-                initialize_instance_owned_parameters=mi_created,
-            ):
-                unreal.EditorAssetLibrary.save_asset(mi_path, only_if_is_dirty=False)
+            if not reuse_unchanged:
+                layer_maps = _import_layer_textures(
+                    _entry_layers(entry, preset),
+                    tex_cache,
+                    virtual_texture_streaming=preset.get("virtual_textures"),
+                )
+                if _assign_hair_tool_parameters(
+                    mi,
+                    entry,
+                    layer_maps,
+                    initialize_instance_owned_parameters=mi_created,
+                    clear_missing_managed=True,
+                ):
+                    _save_material_texture_update(mi_path)
             _log(f"  hair slot[{slot_index}] '{mat_name}' -> {mi_path}")
             if _is_skeletal_mesh(mesh):
                 skeletal_slot_assignments[slot_index] = (slot_name, mi)
@@ -3752,20 +4476,37 @@ def process_mesh(
         preset = _master_preset(data, entry, mesh_path)
         if target_material_path:
             copy_from_path = _entry_copy_source_material_path(entry)
-            selected_master = master_mat or _load_master_material(preset)
-            if selected_master is None and not copy_from_path:
-                continue
-            mi, mi_path, mi_created, mi_source = _load_or_copy_target_material(
-                asset_tools,
-                target_material_path,
-                copy_from_path,
-                selected_master,
-                create_if_missing=_entry_create_if_missing(entry, preset),
+            existing_mi = _load_exact_material_instance(target_material_path)
+            reuse_unchanged = bool(
+                existing_mi is not None
+                and _entry_reuses_material_instance_unchanged(entry, preset)
             )
+            if reuse_unchanged:
+                mi = existing_mi
+                mi_path = target_material_path
+                mi_created = False
+                mi_source = "existing_assignment_only"
+                selected_master = None
+                _log(f"  existing target MI reused unchanged: {mi_path}")
+            else:
+                selected_master = master_mat or _load_master_material(preset)
+                if (
+                    existing_mi is None
+                    and selected_master is None
+                    and not copy_from_path
+                ):
+                    continue
+                mi, mi_path, mi_created, mi_source = _load_or_copy_target_material(
+                    asset_tools,
+                    target_material_path,
+                    copy_from_path,
+                    selected_master,
+                    create_if_missing=_entry_create_if_missing(entry, preset),
+                )
             if mi is None:
                 continue
             parent_changed = False
-            if selected_master is not None:
+            if selected_master is not None and not reuse_unchanged:
                 try:
                     current_parent = mi.get_editor_property("parent")
                 except Exception:
@@ -3778,23 +4519,26 @@ def process_mesh(
                 f"  slot[{slot_index}] '{mat_name}' -> {mi_path} "
                 f"(master: {preset['key']})"
             )
-            layers = _entry_layers(entry, preset)
-            layer_maps = _import_layer_textures(
-                layers,
-                tex_cache,
-                virtual_texture_streaming=preset.get("virtual_textures"),
-            )
-            mat_base = _material_instance_base_name(mat_name)
-            params_changed = _assign_master_textures(
-                mi,
-                layer_maps,
-                preset["assignment"],
-                preset=preset,
-                entry=entry,
-                mat_base=mat_base,
-            )
+            params_changed = False
+            if not reuse_unchanged:
+                layers = _entry_layers(entry, preset)
+                layer_maps = _import_layer_textures(
+                    layers,
+                    tex_cache,
+                    virtual_texture_streaming=preset.get("virtual_textures"),
+                )
+                mat_base = _material_instance_base_name(mat_name)
+                params_changed = _assign_master_textures(
+                    mi,
+                    layer_maps,
+                    preset["assignment"],
+                    preset=preset,
+                    entry=entry,
+                    mat_base=mat_base,
+                    clear_missing_managed=True,
+                )
             if (mi_created or parent_changed or params_changed) and preset["assignment"] != "material_layer_instance":
-                unreal.EditorAssetLibrary.save_asset(mi_path)
+                _save_material_texture_update(mi_path)
                 changed = True
             elif mi_created or parent_changed or params_changed:
                 changed = True
@@ -3805,9 +4549,18 @@ def process_mesh(
             continue
 
         mat_base = _material_instance_base_name(mat_name)
-        selected_master = master_mat or _load_master_material(preset)
-        if selected_master is None:
-            continue
+        manage_existing = _entry_manages_existing_material_instance(entry)
+        generated_mi_path = (
+            f"{str(preset['mi_folder']).rstrip('/')}/MI_{mat_base}"
+        )
+        existing_unchanged = None
+        if not manage_existing:
+            existing_unchanged = _load_exact_material_instance(generated_mi_path)
+        selected_master = (
+            None
+            if existing_unchanged is not None
+            else master_mat or _load_master_material(preset)
+        )
 
         _log(
             f"  슬롯[{slot_index}] '{mat_name}' 처리 "
@@ -3819,35 +4572,62 @@ def process_mesh(
         layer_maps = None
 
         # 2. MI 생성/로드
-        mi, mi_path, mi_created, parent_changed, mi_source = _create_or_load_mi(
-            asset_tools,
-            selected_master,
-            mat_base,
-            preset["mi_folder"],
-        )
+        if existing_unchanged is not None:
+            mi = existing_unchanged
+            mi_path = generated_mi_path
+            mi_created = False
+            parent_changed = False
+            mi_source = "existing"
+        else:
+            mi, mi_path, mi_created, parent_changed, mi_source = _create_or_load_mi(
+                asset_tools,
+                selected_master,
+                mat_base,
+                preset["mi_folder"],
+                manage_existing=manage_existing,
+            )
         if mi is None:
+            profile_target = instance_profile_targets.get(entry_index)
+            if profile_target and profile_target.get("asset") is not None:
+                assigned_mi = profile_target["asset"]
+                _log(
+                    f"  user-managed profile '{profile_target['profile']}' -> "
+                    f"{profile_target['target_path']} (base unavailable; reused unchanged)"
+                )
+                if _is_skeletal_mesh(mesh):
+                    skeletal_slot_assignments[slot_index] = (slot_name, assigned_mi)
+                if _assign_slot(mesh, slot_index, assigned_mi, slot_name):
+                    changed = True
             continue
 
-        # 3. Assign textures using the selected master material contract.
-        layers = _entry_layers(entry, preset)
-        layer_maps = _import_layer_textures(
-            layers,
-            tex_cache,
-            virtual_texture_streaming=preset.get("virtual_textures"),
-        )
-        params_changed = _assign_master_textures(
-            mi,
-            layer_maps,
-            preset["assignment"],
-            preset=preset,
-            entry=entry,
-            mat_base=mat_base,
-        )
+        # 3. An exact existing MI wins by default. Texture discovery and managed
+        # override mutation only apply to a newly created/copied MI, or to an
+        # existing MI whose contract explicitly declares pipeline ownership.
+        reuse_unchanged = bool(mi_source == "existing" and not manage_existing)
+        params_changed = False
+        if reuse_unchanged:
+            _log(f"  existing MI reused unchanged: {mi_path}")
+        else:
+            layers = _entry_layers(entry, preset)
+            layer_maps = _import_layer_textures(
+                layers,
+                tex_cache,
+                virtual_texture_streaming=preset.get("virtual_textures"),
+            )
+            params_changed = _assign_master_textures(
+                mi,
+                layer_maps,
+                preset["assignment"],
+                preset=preset,
+                entry=entry,
+                mat_base=mat_base,
+                clear_missing_managed=True,
+            )
         if mi_created:
             _save_and_mark_new_material_asset(mi_path)
             changed = True
         elif (parent_changed or params_changed) and preset["assignment"] != "material_layer_instance":
-            unreal.EditorAssetLibrary.save_asset(mi_path)
+            _save_material_texture_update(mi_path)
             changed = True
         elif parent_changed or params_changed:
             changed = True
