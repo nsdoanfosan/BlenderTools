@@ -203,6 +203,93 @@ class TestMaterialPipelineExactSidecar(unittest.TestCase):
             else:
                 sys.modules[api_name] = previous_api
 
+    def test_refresh_auto_prefixes_only_live_export_materials(self):
+        package_name = "ue_unique_export_names_addon"
+        api_name = f"{package_name}.api"
+        constants_name = f"{package_name}.constants"
+        utils_name = f"{package_name}.utils"
+        module_names = (package_name, api_name, constants_name, utils_name)
+        previous = {name: sys.modules.get(name) for name in module_names}
+        package = types.ModuleType(package_name)
+        package.__path__ = []
+        api = types.ModuleType(api_name)
+        constants = types.ModuleType(constants_name)
+        constants.MATERIAL_PREFIX = "M_"
+        utils = types.ModuleType(utils_name)
+        utils.clean_token = lambda value: str(value).replace(" ", "_")
+        live = types.SimpleNamespace(name="Bark_ivy_01")
+        unrelated = types.SimpleNamespace(name="Bark_unrelated_01")
+        refresh_calls = []
+        api.collect_handoff_data = lambda context, scope: {"materials": [live]}
+        api.refresh_handoff_json = lambda context, scope: (
+            refresh_calls.append((context, scope, live.name))
+            or {"errors": [], "json_paths": ["D:/SK_Ivy.json"]}
+        )
+        package.api = api
+        sys.modules.update(
+            {
+                package_name: package,
+                api_name: api,
+                constants_name: constants,
+                utils_name: utils,
+            }
+        )
+        self.module.bpy.data.materials = [live, unrelated]
+        try:
+            result = self.extension._refresh_unreal_handoff_json_or_error(
+                types.SimpleNamespace(name="SK_Ivy")
+            )
+        finally:
+            for name, value in previous.items():
+                if value is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = value
+
+        self.assertEqual(live.name, "M_Bark_ivy_01")
+        self.assertEqual(unrelated.name, "Bark_unrelated_01")
+        self.assertEqual(
+            refresh_calls,
+            [(self.module.bpy.context, "EXPORT_COLLECTION", "M_Bark_ivy_01")],
+        )
+        self.assertEqual(result["errors"], [])
+
+    def test_material_prefix_repair_avoids_existing_name_collision(self):
+        package_name = "ue_unique_export_names_addon"
+        constants_name = f"{package_name}.constants"
+        utils_name = f"{package_name}.utils"
+        previous = {
+            name: sys.modules.get(name)
+            for name in (constants_name, utils_name)
+        }
+        constants = types.ModuleType(constants_name)
+        constants.MATERIAL_PREFIX = "M_"
+        utils = types.ModuleType(utils_name)
+        utils.clean_token = lambda value: str(value)
+        sys.modules[constants_name] = constants
+        sys.modules[utils_name] = utils
+        live = types.SimpleNamespace(name="Bark_ivy_01")
+        existing = types.SimpleNamespace(name="M_Bark_ivy_01")
+        self.module.bpy.data.materials = [live, existing]
+        api = types.SimpleNamespace(
+            collect_handoff_data=lambda context, scope: {"materials": [live]}
+        )
+        try:
+            renamed = self.extension._normalize_export_material_names(api)
+        finally:
+            for name, value in previous.items():
+                if value is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = value
+
+        self.assertEqual(live.name, "M_Bark_ivy_01_02")
+        self.assertEqual(existing.name, "M_Bark_ivy_01")
+        self.assertEqual(
+            renamed,
+            [("Bark_ivy_01", "M_Bark_ivy_01_02")],
+        )
+
     def test_export_sidecar_persists_expected_name_and_content_sha(self):
         package_name = "ue_unique_export_names_addon"
         api_name = f"{package_name}.api"
