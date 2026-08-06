@@ -143,6 +143,15 @@ class MaterialPipelineExtension(ExtensionBase):
         try:
             from ue_unique_export_names_addon import api as handoff_api
 
+            renamed_materials = self._normalize_export_material_names(handoff_api)
+            if renamed_materials:
+                print(
+                    "[material_pipeline] normalized export material names: "
+                    + ", ".join(
+                        f"{old_name} -> {new_name}"
+                        for old_name, new_name in renamed_materials
+                    )
+                )
             result = handoff_api.refresh_handoff_json(
                 bpy.context,
                 scope="EXPORT_COLLECTION",
@@ -169,6 +178,56 @@ class MaterialPipelineExtension(ExtensionBase):
                 "Could not validate Unreal handoff before Send to Unreal.",
                 f' Target: "{target.name}". {exc}',
             )
+
+    def _normalize_export_material_names(self, handoff_api):
+        """Apply Unreal material naming to the current live export scope.
+
+        Send2UE runs against a disposable Blender process in the batch pipeline,
+        so this repairs the FBX/JSON handoff without saving the source blend.
+        Only materials that the handoff API reports as reachable from the current
+        Export collection are touched.
+        """
+        from ue_unique_export_names_addon.constants import MATERIAL_PREFIX
+        from ue_unique_export_names_addon.utils import clean_token
+
+        data = handoff_api.collect_handoff_data(
+            bpy.context,
+            scope="EXPORT_COLLECTION",
+        )
+        materials = list(data.get("materials") or [])
+        all_materials = list(getattr(bpy.data, "materials", ()) or ())
+        used_names = {
+            str(material.name).casefold(): material for material in all_materials
+        }
+        renamed = []
+
+        for material in materials:
+            old_name = str(material.name)
+            clean_name = clean_token(old_name)
+            base_name = (
+                clean_name
+                if clean_name.startswith(MATERIAL_PREFIX)
+                else f"{MATERIAL_PREFIX}{clean_name}"
+            )
+            candidate = base_name
+            suffix = 2
+            while (
+                candidate.casefold() in used_names
+                and used_names[candidate.casefold()] is not material
+            ):
+                candidate = f"{base_name}_{suffix:02d}"
+                suffix += 1
+
+            if candidate == old_name:
+                continue
+            if used_names.get(old_name.casefold()) is material:
+                used_names.pop(old_name.casefold(), None)
+            material.name = candidate
+            actual_name = str(material.name)
+            used_names[actual_name.casefold()] = material
+            renamed.append((old_name, actual_name))
+
+        return renamed
 
     def _load_json_sidecar_for_export(
         self,
