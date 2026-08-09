@@ -2643,6 +2643,26 @@ def _normalize_skeletal_material_slots(mesh, assignments: dict) -> bool:
                 break
     materials_changed = not unchanged
     section_remap = _complete_skeletal_section_remap(material_entries, ordered)
+    # When the FBX contains duplicate material sections for the same canonical
+    # sidecar slots, keep the imported section index domain intact.  Replacing
+    # four entries with two forces a destructive render-section rebuild; the
+    # equivalent and safer result is to assign each duplicate entry the
+    # canonical slot material while preserving indices 0..N.
+    preserve_section_domain = (
+        len(material_entries) > len(ordered)
+        and len(section_remap) == len(material_entries)
+    )
+    if preserve_section_domain:
+        canonical_by_old = dict(section_remap)
+        expanded_entries = []
+        for old_index, old_entry in enumerate(material_entries):
+            new_index = canonical_by_old[old_index]
+            _source_index, slot_name, material = ordered[new_index]
+            expanded_entries.append(
+                _new_skeletal_material_entry(slot_name, material, old_entry)
+            )
+        mesh.set_editor_property("materials", expanded_entries)
+        return True
     if materials_changed:
         new_entries = []
         for old_index, slot_name, material in ordered:

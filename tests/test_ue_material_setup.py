@@ -2256,8 +2256,15 @@ class TestSkeletalMaterialSectionRemap(unittest.TestCase):
         )
 
         self.assertTrue(changed)
-        self.assertEqual(self.calls[0]["old"], [0, 1, 2, 3])
-        self.assertEqual(self.calls[0]["new"], [0, 1, 0, 1])
+        self.assertEqual(self.calls, [])
+        self.assertEqual(len(mesh.materials), 4)
+        self.assertEqual(
+            [
+                str(entry.get_editor_property("material_slot_name"))
+                for entry in mesh.materials
+            ],
+            ["M_Branch", "M_Bark", "M_Branch", "M_Bark"],
+        )
 
 
 class TestGeneratedSkeletonDependencySave(unittest.TestCase):
