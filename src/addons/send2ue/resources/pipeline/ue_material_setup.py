@@ -2554,6 +2554,10 @@ def _complete_skeletal_section_remap(material_entries, ordered):
                     names.add(value.rsplit("/", 1)[-1].split(".", 1)[0].casefold())
         names.discard("")
         desired_names.append(names)
+    desired_tree_parts = [
+        _tree_part_key({"name": " ".join(sorted(names))})
+        for names in desired_names
+    ]
 
     remap = []
     for old_index, entry in enumerate(material_entries):
@@ -2571,6 +2575,17 @@ def _complete_skeletal_section_remap(material_entries, ordered):
             ]
             if len(matches) == 1:
                 new_index = matches[0]
+            if new_index is None:
+                old_tree_part = _tree_part_key(
+                    {"name": " ".join(sorted(old_names))}
+                )
+                tree_part_matches = [
+                    index
+                    for index, tree_part in enumerate(desired_tree_parts)
+                    if old_tree_part and tree_part == old_tree_part
+                ]
+                if len(tree_part_matches) == 1:
+                    new_index = tree_part_matches[0]
         if new_index is not None:
             remap.append((old_index, new_index))
     return remap

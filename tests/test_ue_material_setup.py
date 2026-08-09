@@ -2266,6 +2266,41 @@ class TestSkeletalMaterialSectionRemap(unittest.TestCase):
             ["M_Branch", "M_Bark", "M_Branch", "M_Bark"],
         )
 
+    def test_stale_species_slots_map_by_unambiguous_tree_part(self):
+        mesh = FakeSkeletalMesh(
+            [
+                FakeSkeletalMaterial("M_Branch_black_locast_01"),
+                FakeSkeletalMaterial("M_bark_black_locast_02"),
+                FakeSkeletalMaterial("M_branch_NothofagusSolandri_03"),
+                FakeSkeletalMaterial("M_branch_NothofagusSolandri_04"),
+            ]
+        )
+        branch = FakeMaterialInstanceConstant("/Game/MI/MI_Branch_black_locast_01")
+        bark = FakeMaterialInstanceConstant("/Game/MI/MI_bark_black_locast_02")
+
+        changed = self.module._normalize_skeletal_material_slots(
+            mesh,
+            {
+                0: ("M_Branch_black_locast_01", branch),
+                1: ("M_bark_black_locast_02", bark),
+            },
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(
+            [
+                str(entry.get_editor_property("material_slot_name"))
+                for entry in mesh.materials
+            ],
+            [
+                "M_Branch_black_locast_01",
+                "M_bark_black_locast_02",
+                "M_Branch_black_locast_01",
+                "M_Branch_black_locast_01",
+            ],
+        )
+
 
 class TestGeneratedSkeletonDependencySave(unittest.TestCase):
     def setUp(self):
