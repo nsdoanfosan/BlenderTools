@@ -2494,8 +2494,8 @@ def _remap_skeletal_material_sections(mesh, ordered) -> bool:
         raise RuntimeError(
             "CodexMaterialTools skeletal material-section remap helper is missing"
         )
-    old_indices = [int(old_index) for old_index, _slot_name, _material in ordered]
-    new_indices = list(range(len(ordered)))
+    old_indices = [int(old_index) for old_index, _new_index in ordered]
+    new_indices = [int(new_index) for _old_index, new_index in ordered]
     result = method(mesh, old_indices, new_indices, True)
     values = result if isinstance(result, tuple) else (result,)
     explicit_success = next(
@@ -2532,6 +2532,48 @@ def _remap_skeletal_material_sections(mesh, ordered) -> bool:
             + (" | " + payload_text if payload_text else "")
         )
     return bool(payload.get("changed"))
+
+
+def _complete_skeletal_section_remap(material_entries, ordered):
+    """Map duplicate imported slots onto the canonical sidecar slot domain."""
+    direct = {
+        int(old_index): new_index
+        for new_index, (old_index, _slot_name, _material) in enumerate(ordered)
+    }
+    desired_names = []
+    for _old_index, slot_name, material in ordered:
+        names = {str(slot_name or "").strip().casefold()}
+        if material is not None:
+            for getter in ("get_name", "get_path_name"):
+                try:
+                    value = str(getattr(material, getter)() or "").strip()
+                except Exception:
+                    value = ""
+                if value:
+                    names.add(value.casefold())
+                    names.add(value.rsplit("/", 1)[-1].split(".", 1)[0].casefold())
+        names.discard("")
+        desired_names.append(names)
+
+    remap = []
+    for old_index, entry in enumerate(material_entries):
+        new_index = direct.get(old_index)
+        if new_index is None:
+            old_names = {
+                str(value or "").strip().casefold()
+                for value in _static_material_name_values(entry)
+                if str(value or "").strip()
+            }
+            matches = [
+                index
+                for index, names in enumerate(desired_names)
+                if old_names & names
+            ]
+            if len(matches) == 1:
+                new_index = matches[0]
+        if new_index is not None:
+            remap.append((old_index, new_index))
+    return remap
 
 
 def _assign_skeletal_slot(mesh, slot_index: int, material, slot_name: str = None) -> bool:
@@ -2600,6 +2642,7 @@ def _normalize_skeletal_material_slots(mesh, assignments: dict) -> bool:
                 unchanged = False
                 break
     materials_changed = not unchanged
+    section_remap = _complete_skeletal_section_remap(material_entries, ordered)
     if materials_changed:
         new_entries = []
         for old_index, slot_name, material in ordered:
@@ -2608,7 +2651,7 @@ def _normalize_skeletal_material_slots(mesh, assignments: dict) -> bool:
         mesh.set_editor_property("materials", new_entries)
 
     try:
-        sections_changed = _remap_skeletal_material_sections(mesh, ordered)
+        sections_changed = _remap_skeletal_material_sections(mesh, section_remap)
     except Exception:
         if materials_changed:
             mesh.set_editor_property("materials", material_entries)

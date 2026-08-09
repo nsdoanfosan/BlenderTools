@@ -2235,6 +2235,30 @@ class TestSkeletalMaterialSectionRemap(unittest.TestCase):
             ["M_BarkA", "M_BarkB"],
         )
 
+    def test_duplicate_imported_slots_map_to_the_canonical_slots(self):
+        mesh = FakeSkeletalMesh(
+            [
+                FakeSkeletalMaterial("M_Branch"),
+                FakeSkeletalMaterial("M_Bark"),
+                FakeSkeletalMaterial("M_Branch"),
+                FakeSkeletalMaterial("M_Bark"),
+            ]
+        )
+        branch = FakeMaterialInstanceConstant("/Game/MI/MI_Branch")
+        bark = FakeMaterialInstanceConstant("/Game/MI/MI_Bark")
+
+        changed = self.module._normalize_skeletal_material_slots(
+            mesh,
+            {
+                0: ("M_Branch", branch),
+                1: ("M_Bark", bark),
+            },
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(self.calls[0]["old"], [0, 1, 2, 3])
+        self.assertEqual(self.calls[0]["new"], [0, 1, 0, 1])
+
 
 class TestGeneratedSkeletonDependencySave(unittest.TestCase):
     def setUp(self):
