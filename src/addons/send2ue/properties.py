@@ -60,6 +60,15 @@ class Send2UeAddonProperties:
             "in Unreal."
         )
     ) # type: ignore
+    multicast_bind_address: bpy.props.StringProperty(
+        name="Multicast Bind Address",
+        default="",
+        description=(
+            "IPv4 address of the local adapter used for Unreal Remote Execution multicast. "
+            "This must match Unreal's Remote Execution Multicast Bind Address. Leave blank "
+            "to use the host from Command Endpoint for backward compatibility."
+        )
+    ) # type: ignore
     command_endpoint: bpy.props.StringProperty(
         name="Command Endpoint",
         default="127.0.0.1:6776" if sys.platform == 'win32' else "0.0.0.0:6776",

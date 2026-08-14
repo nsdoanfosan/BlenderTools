@@ -22,6 +22,8 @@ if os.environ.get('TEST_ENVIRONMENT'):
 
 unreal_response = ''
 _COMMAND_RECORDING_STACK = []
+REMOTE_EXECUTION_CONNECTION_TIMEOUT = 60.0
+REMOTE_EXECUTION_POLL_INTERVAL = 0.1
 
 
 @contextmanager
@@ -104,48 +106,100 @@ def print_python(commands):
         sys.stdout.write(f'{dashes}{"-" * len(label)}{dashes}\n')
 
 
-def run_unreal_python_commands(remote_exec, commands, failed_connection_attempts=0):
+def _get_remote_execution_connection_timeout():
+    """Use the existing Blender response timeout for discovery as well."""
+    try:
+        import bpy
+        from .. import __package__ as base_package
+        preferences = bpy.context.preferences.addons[base_package].preferences
+        return max(float(preferences.rpc_response_timeout), 0.1)
+    except (ImportError, KeyError, AttributeError, TypeError, ValueError):
+        return REMOTE_EXECUTION_CONNECTION_TIMEOUT
+
+
+def _remote_execution_endpoint_summary(remote_exec):
+    config = getattr(remote_exec, '_config', None)
+    if not config:
+        return 'endpoints unavailable'
+    return (
+        f'multicast={getattr(config, "multicast_group_endpoint", "unknown")}, '
+        f'bind={getattr(config, "multicast_bind_address", "unknown")}, '
+        f'command={getattr(config, "command_endpoint", "unknown")}'
+    )
+
+
+def run_unreal_python_commands(
+    remote_exec,
+    commands,
+    connection_timeout=None,
+    poll_interval=REMOTE_EXECUTION_POLL_INTERVAL,
+):
     """
     Finds the open unreal editor with remote connection enabled, and sends it python commands.
 
     :param object remote_exec: A RemoteExecution instance.
     :param list commands: A list of python commands that will be run by unreal engine.
-    :param int failed_connection_attempts: A counter that keeps track of how many times an editor connection attempt
-    was made.
+    :param float connection_timeout: Maximum seconds to wait for discovery and a command connection.
+    :param float poll_interval: Seconds between discovery polls.
     """
-    if failed_connection_attempts == 0:
-        print_python(commands)
+    print_python(commands)
+    if connection_timeout is None:
+        connection_timeout = _get_remote_execution_connection_timeout()
+    connection_timeout = max(float(connection_timeout), 0.1)
+    poll_interval = max(float(poll_interval), 0.01)
+    deadline = time.monotonic() + connection_timeout
+    discovered_node_ids = set()
+    last_connection_error = None
 
-    # wait a tenth of a second before attempting to connect
-    time.sleep(0.1)
-    try:
-        # try to connect to an editor
-        for node in remote_exec.remote_nodes:
-            remote_exec.open_command_connection(node.get("node_id"))
+    while True:
+        for node in list(remote_exec.remote_nodes):
+            node_id = node.get('node_id')
+            if not node_id:
+                continue
+            discovered_node_ids.add(node_id)
+            try:
+                remote_exec.open_command_connection(node_id)
+            except Exception as error:
+                last_connection_error = error
+                try:
+                    remote_exec.close_command_connection()
+                except Exception:
+                    pass
+                continue
 
-        # if a connection is made
-        if remote_exec.has_command_connection():
-            # run the import commands and save the response in the global unreal_response variable
-            global unreal_response
-            unreal_response = remote_exec.run_command('\n'.join(commands), unattended=False)
+            if not remote_exec.has_command_connection():
+                continue
 
-        # otherwise make an other attempt to connect to the engine
-        else:
-            if failed_connection_attempts < 50:
-                run_unreal_python_commands(remote_exec, commands, failed_connection_attempts + 1)
-            else:
-                remote_exec.stop()
-                raise ConnectionError("Could not find an open Unreal Editor instance!")
+            try:
+                global unreal_response
+                unreal_response = remote_exec.run_command(
+                    '\n'.join(commands),
+                    unattended=False,
+                )
+            except Exception as error:
+                raise ConnectionError(
+                    'Connected to Unreal Remote Execution, but the Python '
+                    'command failed. The command was not retried to avoid '
+                    'running an import twice.'
+                ) from error
+            return get_response()
 
-    # catch all errors
-    except:
-        raise ConnectionError("Could not find an open Unreal Editor instance!")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(poll_interval, remaining))
 
-    # shutdown the connection
-    finally:
-        remote_exec.stop()
-
-    return get_response()
+    message = (
+        'Could not find an open Unreal Editor instance with Python Remote '
+        f'Execution enabled after {connection_timeout:.1f}s '
+        f'({_remote_execution_endpoint_summary(remote_exec)}; '
+        f'discovered_nodes={len(discovered_node_ids)}). Check that Blender '
+        'and Unreal use the same Multicast Group Endpoint and Multicast Bind '
+        'Address.'
+    )
+    if last_connection_error:
+        raise ConnectionError(message) from last_connection_error
+    raise ConnectionError(message)
 
 
 def run_commands(commands):
@@ -168,8 +222,13 @@ def run_commands(commands):
     remote_exec = remote_execution.RemoteExecution()
     remote_exec.start()
 
-    # send over the python code as a string and run it
-    return run_unreal_python_commands(remote_exec, commands)
+    # Send over the Python code and clean up the session exactly once. The
+    # command itself is never retried after dispatch because imports are not
+    # generally idempotent.
+    try:
+        return run_unreal_python_commands(remote_exec, commands)
+    finally:
+        remote_exec.stop()
 
 
 def is_connected():
