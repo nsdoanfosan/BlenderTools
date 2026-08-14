@@ -482,6 +482,10 @@ def create_mesh_data(mesh_objects, rig_objects, properties):
                 'sockets': get_asset_sockets(mesh_object.name, properties),
                 'skip': False
             }
+            if mesh_object.get(hair_tool_export.TEMP_PROPERTY):
+                mesh_data[asset_id]['_hair_tool_payload'] = (
+                    hair_tool_export.get_rfaos_payload_contract()
+                )
             previous_asset_names.append(asset_name)
 
     return mesh_data

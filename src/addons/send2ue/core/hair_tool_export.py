@@ -3,6 +3,7 @@
 import math
 
 import bpy
+from mathutils import Matrix
 from . import armature_modifier_fix, utilities
 from ..constants import BlenderTypes, ToolInfo
 
@@ -15,6 +16,23 @@ RFAOS_NANITE_UV_RG = 'HairTool_RFAOS_RG'
 RFAOS_NANITE_UV_BA = 'HairTool_RFAOS_BA'
 RFAOS_NANITE_UV_TAG = 2.0
 RFAOS_NANITE_UV_START_INDEX = 2
+RFAOS_PAYLOAD_VERSION = 1
+RFAOS_MINIMUM_RANGE = 1.0 / 255.0
+
+
+def _warn(message):
+    print(f'[send2ue][hair_tool] WARNING: {message}')
+
+
+def _set_neutral_ao(mesh):
+    """Install a neutral AO fallback without stopping an automated export."""
+    existing = mesh.attributes.get('AO')
+    if existing:
+        mesh.attributes.remove(existing)
+    attribute = mesh.attributes.new(name='AO', type='FLOAT', domain='CORNER')
+    for item in attribute.data:
+        item.value = 1.0
+    return attribute
 
 
 def is_hair_tool_object(scene_object):
@@ -153,24 +171,25 @@ def _pack_rfaos(mesh):
     loop_to_polygon = _loop_to_polygon_indices(mesh)
 
     if factor_attribute is None:
-        raise RuntimeError(
+        _warn(
             f'Hair Tool mesh "{mesh.name}" has no "Factor" attribute. '
-            'Root/Tip ranges cannot be exported without a strand gradient.'
+            'Using a neutral 0.5 fallback; Root/Tip ranges will not vary.'
         )
-
-    factor_values = [
-        _attribute_component(
-            mesh,
-            factor_attribute,
-            loop_index,
-            loop_to_polygon=loop_to_polygon,
-        )
-        for loop_index in range(len(mesh.loops))
-    ]
-    if factor_values and max(factor_values) - min(factor_values) <= (1.0 / 255.0):
-        raise RuntimeError(
+        factor_values = [0.5] * len(mesh.loops)
+    else:
+        factor_values = [
+            _attribute_component(
+                mesh,
+                factor_attribute,
+                loop_index,
+                loop_to_polygon=loop_to_polygon,
+            )
+            for loop_index in range(len(mesh.loops))
+        ]
+    if factor_values and max(factor_values) - min(factor_values) <= RFAOS_MINIMUM_RANGE:
+        _warn(
             f'Hair Tool mesh "{mesh.name}" has a constant "Factor" attribute. '
-            'Root/Tip ranges require a varying 0-1 strand gradient.'
+            'Root/Tip ranges will not vary for this export.'
         )
 
     existing_rfaos = mesh.attributes.get(RFAOS_NAME)
@@ -183,9 +202,10 @@ def _pack_rfaos(mesh):
         domain='CORNER',
     )
     packed_values = []
+    invalid_channels = set()
     channel_names = ('Random', 'Factor', 'AO', 'SystemColor Alpha')
     for loop_index in range(len(mesh.loops)):
-        packed = (
+        packed = [
             _attribute_component(
                 mesh, random_attribute, loop_index,
                 loop_to_polygon=loop_to_polygon,
@@ -194,20 +214,26 @@ def _pack_rfaos(mesh):
             _attribute_component(
                 mesh, ao_attribute, loop_index,
                 loop_to_polygon=loop_to_polygon,
+                default=1.0,
             ),
             _attribute_component(
                 mesh, system_color_attribute, loop_index,
                 component_index=3,
                 loop_to_polygon=loop_to_polygon,
             ),
-        )
-        for channel_name, value in zip(channel_names, packed):
+        ]
+        fallback_values = (0.0, 0.5, 1.0, 0.0)
+        for channel_index, (channel_name, value) in enumerate(zip(channel_names, packed)):
             if not math.isfinite(value) or value < -1.0e-5 or value > 1.00001:
-                raise RuntimeError(
-                    f'Hair Tool mesh "{mesh.name}" has invalid {channel_name} '
-                    f'value {value!r} at loop {loop_index}; RFAOS data must be finite 0-1.'
-                )
+                invalid_channels.add(channel_name)
+                packed[channel_index] = fallback_values[channel_index]
         packed_values.append(tuple(min(max(value, 0.0), 1.0) for value in packed))
+
+    if invalid_channels:
+        _warn(
+            f'Hair Tool mesh "{mesh.name}" had invalid values in '
+            f'{", ".join(sorted(invalid_channels))}; safe fallbacks were used.'
+        )
 
     for color_item, packed in zip(rfaos.data, packed_values):
         # BYTE_COLOR exposes ``color`` in scene-linear space, while FBX writes
@@ -232,33 +258,27 @@ def _pack_rfaos(mesh):
 def _ensure_payload_uv(mesh, name, index):
     uv_layers = mesh.uv_layers
     layer = uv_layers.get(name)
-    if layer is None:
-        if len(uv_layers) > index:
-            raise RuntimeError(
-                f'Hair Tool Nanite payload UV{index} is occupied by '
-                f'"{uv_layers[index].name}" on "{mesh.name}".'
-            )
-        if len(uv_layers) != index:
-            raise RuntimeError(
-                f'Hair Tool Nanite payload requires UV{index}, but '
-                f'"{mesh.name}" currently has {len(uv_layers)} UV channels.'
-            )
-        layer = uv_layers.new(name=name)
+    if layer is not None:
+        layer_index = next(
+            (layer_index for layer_index, candidate in enumerate(uv_layers) if candidate == layer),
+            -1,
+        )
+        if layer_index != index:
+            uv_layers.remove(layer)
+            layer = None
 
-    layer_index = next(
-        (layer_index for layer_index, candidate in enumerate(uv_layers) if candidate == layer),
-        -1,
-    )
-    if layer_index != index:
-        raise RuntimeError(
-            f'Hair Tool Nanite payload "{name}" must be UV{index}, '
-            f'not UV{layer_index}, on "{mesh.name}".'
-        )
-    if len(layer.data) != len(mesh.loops):
-        raise RuntimeError(
-            f'Hair Tool Nanite payload "{name}" loop count does not match '
-            f'"{mesh.name}".'
-        )
+    while len(uv_layers) <= index:
+        uv_layers.new(name=f'HairTool_Reserved_UV{len(uv_layers)}')
+    if layer is None:
+        layer = uv_layers[index]
+        if layer.name != name:
+            if not layer.name.startswith('HairTool_Reserved_UV'):
+                _warn(
+                    f'Hair Tool Nanite payload replaced "{layer.name}" at '
+                    f'UV{index} on "{mesh.name}" with "{name}".'
+                )
+            layer.name = name
+
     return layer
 
 
@@ -330,36 +350,124 @@ def _remove_empty_material_slots(scene_object):
 
 
 def _evaluate_combined_ao(scene_object, state):
-    """Evaluate Hair Tool AO once, after all systems for an asset are joined."""
+    """Evaluate Hair Tool AO in applied world space after systems are joined."""
     node_group = bpy.data.node_groups.get('HT_Mesh_AO')
     if not node_group:
-        raise RuntimeError(
+        _warn(
             'Hair Tool node group "HT_Mesh_AO" was not found. '
-            'Load the Hair Tool AO node group before exporting.'
+            'Export continues with neutral AO=1.'
         )
+        _set_neutral_ao(scene_object.data)
+        state.setdefault('ao_stats', {})[scene_object.name] = {
+            'minimum': 1.0,
+            'maximum': 1.0,
+            'fallback': True,
+        }
+        return
 
-    modifier = scene_object.modifiers.new(name='__S2U_HAIR_AO', type='NODES')
-    modifier.node_group = node_group
-    if 'Input_7' in modifier:
-        modifier['Input_7'] = 'AO'
+    original_mesh = scene_object.data
+    original_world_matrix = scene_object.matrix_world.copy()
+    world_mesh = None
+    evaluated_mesh = None
+    modifier = None
 
-    depsgraph = bpy.context.evaluated_depsgraph_get()
-    depsgraph.update()
-    evaluated_object = scene_object.evaluated_get(depsgraph)
-    evaluated_mesh = bpy.data.meshes.new_from_object(evaluated_object)
+    try:
+        # Geometry Nodes evaluates distances in object space. Bake the complete
+        # world transform into a disposable mesh first so HT_Mesh_AO sees the
+        # same scale and relative placement that Unreal receives. The result is
+        # transformed back afterward, preserving the object's export transform.
+        world_mesh = original_mesh.copy()
+        world_mesh.transform(original_world_matrix)
+        existing_ao = world_mesh.attributes.get('AO')
+        if existing_ao:
+            world_mesh.attributes.remove(existing_ao)
+        scene_object.data = world_mesh
+        scene_object.matrix_world = Matrix.Identity(4)
 
-    old_mesh = scene_object.data
-    scene_object.data = evaluated_mesh
-    scene_object.modifiers.remove(modifier)
-    if old_mesh.users == 0:
-        bpy.data.meshes.remove(old_mesh)
+        modifier = scene_object.modifiers.new(name='__S2U_HAIR_AO', type='NODES')
+        modifier.node_group = node_group
+        if 'Input_7' in modifier:
+            modifier['Input_7'] = 'AO'
 
-    if not evaluated_mesh.attributes.get('AO'):
-        raise RuntimeError(
-            f'Hair Tool AO evaluation produced no "AO" attribute for "{scene_object.name}".'
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        depsgraph.update()
+        evaluated_object = scene_object.evaluated_get(depsgraph)
+        evaluated_mesh = bpy.data.meshes.new_from_object(evaluated_object)
+
+        ao_attribute = evaluated_mesh.attributes.get('AO')
+        if not ao_attribute:
+            _warn(
+                f'Hair Tool AO evaluation produced no "AO" attribute for '
+                f'"{scene_object.name}"; export continues with neutral AO=1.'
+            )
+            ao_attribute = _set_neutral_ao(evaluated_mesh)
+
+        loop_to_polygon = _loop_to_polygon_indices(evaluated_mesh)
+        ao_values = [
+            _attribute_component(
+                evaluated_mesh,
+                ao_attribute,
+                loop_index,
+                loop_to_polygon=loop_to_polygon,
+            )
+            for loop_index in range(len(evaluated_mesh.loops))
+        ]
+        invalid_ao = any(
+            not math.isfinite(value) or value < -1.0e-5 or value > 1.00001
+            for value in ao_values
         )
+        if not ao_values or invalid_ao:
+            _warn(
+                f'Hair Tool AO evaluation produced values outside finite 0-1 '
+                f'for "{scene_object.name}"; export continues with neutral AO=1.'
+            )
+            ao_attribute = _set_neutral_ao(evaluated_mesh)
+            ao_values = [1.0] * len(evaluated_mesh.loops)
 
-    state['temporary_mesh_names'].add(evaluated_mesh.name)
+        ao_min = min(ao_values)
+        ao_max = max(ao_values)
+        if ao_max - ao_min <= RFAOS_MINIMUM_RANGE:
+            _warn(
+                f'Hair Tool AO evaluation produced a constant value '
+                f'({ao_min:.6f}) for "{scene_object.name}". Export continues.'
+            )
+
+        evaluated_mesh.transform(original_world_matrix.inverted_safe())
+        scene_object.modifiers.remove(modifier)
+        modifier = None
+        scene_object.data = evaluated_mesh
+        scene_object.matrix_world = original_world_matrix
+        state.setdefault('ao_stats', {})[scene_object.name] = {
+            'minimum': ao_min,
+            'maximum': ao_max,
+        }
+        state['temporary_mesh_names'].add(evaluated_mesh.name)
+        evaluated_mesh = None
+
+        if original_mesh.users == 0:
+            bpy.data.meshes.remove(original_mesh)
+        if world_mesh.users == 0:
+            bpy.data.meshes.remove(world_mesh)
+        world_mesh = None
+    except Exception as error:
+        if modifier and modifier.name in scene_object.modifiers:
+            scene_object.modifiers.remove(modifier)
+        scene_object.data = original_mesh
+        scene_object.matrix_world = original_world_matrix
+        for mesh in (evaluated_mesh, world_mesh):
+            if mesh and mesh.users == 0:
+                bpy.data.meshes.remove(mesh)
+        _set_neutral_ao(original_mesh)
+        state.setdefault('ao_stats', {})[scene_object.name] = {
+            'minimum': 1.0,
+            'maximum': 1.0,
+            'fallback': True,
+            'error': str(error),
+        }
+        _warn(
+            f'Hair Tool AO evaluation failed for "{scene_object.name}": '
+            f'{error}. Export continues with neutral AO=1.'
+        )
 
 
 def _write_uv_layer(mesh, source_attribute_name, target_uv_name):
@@ -388,12 +496,35 @@ def _write_uv_layer(mesh, source_attribute_name, target_uv_name):
 
 def _write_hair_tool_uvs(mesh):
     if not _write_uv_layer(mesh, 'UVMapGN', 'UVMap'):
-        raise RuntimeError(
+        _warn(
             f'Hair Tool mesh "{mesh.name}" has no usable UVMapGN corner attribute.'
+            ' Existing UV0 will be used.'
         )
+        if not mesh.uv_layers:
+            mesh.uv_layers.new(name='UVMap')
     _write_uv_layer(mesh, 'UVHelperGN', 'HairTool_UV')
-    mesh.uv_layers.active = mesh.uv_layers.get('UVMap')
-    mesh.uv_layers['UVMap'].active_render = True
+    render_uv = mesh.uv_layers.get('UVMap') or mesh.uv_layers[0]
+    mesh.uv_layers.active = render_uv
+    render_uv.active_render = True
+
+
+def get_rfaos_payload_contract():
+    """Return the JSON-safe contract consumed by the Unreal importer."""
+    return {
+        'version': RFAOS_PAYLOAD_VERSION,
+        'encoding': 'RFAOS_TAGGED_UV',
+        'vertex_color_name': RFAOS_NAME,
+        'uv_rg_index': RFAOS_NANITE_UV_START_INDEX,
+        'uv_ba_index': RFAOS_NANITE_UV_START_INDEX + 1,
+        'uv_tag': RFAOS_NANITE_UV_TAG,
+        'fbx_inverts_v': True,
+        'nanite_max_uv_index': 3,
+        'material_master': '/Game/Material/HairTool/Master/M_HT_HairCards',
+        'material_texcoord_indices': [
+            RFAOS_NANITE_UV_START_INDEX,
+            RFAOS_NANITE_UV_START_INDEX + 1,
+        ],
+    }
 
 
 def _evaluated_mesh_objects(source_object, state):
