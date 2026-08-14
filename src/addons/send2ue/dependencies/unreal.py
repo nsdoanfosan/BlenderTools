@@ -942,16 +942,201 @@ class UnrealImportAsset(Unreal):
             self._options.mesh_type_to_import = unreal.FBXImportType.FBXIT_SKELETAL_MESH
             self._options.skeletal_mesh_import_data.import_mesh_lo_ds = False
             import_data = unreal.FbxSkeletalMeshImportData()
+            skeletal_settings = self._property_data[
+                'unreal'
+            ]['import_method']['fbx']['skeletal_mesh_import_data']
             self.set_settings(
-                self._property_data['unreal']['import_method']['fbx']['skeletal_mesh_import_data'],
+                skeletal_settings,
                 import_data
             )
-            if 'build_nanite' not in self._property_data['unreal']['import_method']['fbx']['skeletal_mesh_import_data']:
+            hair_payload = self._asset_data.get('_hair_tool_payload')
+            if hair_payload:
+                # Vertex colors remain a useful non-Nanite fallback, but UV2/UV3
+                # are the authoritative RFAOS transport for Skeletal Nanite.
+                import_data.set_editor_property(
+                    'vertex_color_import_option',
+                    unreal.VertexColorImportOption.REPLACE,
+                )
+                try:
+                    import_data.set_editor_property('build_nanite', True)
+                except Exception:
+                    pass
+            elif 'build_nanite' not in skeletal_settings:
                 try:
                     import_data.set_editor_property('build_nanite', True)
                 except Exception:
                     pass
             self._options.skeletal_mesh_import_data = import_data
+
+    @staticmethod
+    def _plugin_json(value):
+        """Decode JSON returned by a reflected Codex audit library call."""
+        candidates = value if isinstance(value, tuple) else (value,)
+        for candidate in candidates:
+            if isinstance(candidate, str) and candidate.lstrip().startswith('{'):
+                return json.loads(candidate)
+        raise RuntimeError(f'Unreal audit returned no JSON object: {value!r}')
+
+    @staticmethod
+    def _imported_skeletal_meshes(imported_object_paths):
+        meshes = []
+        for imported_path in imported_object_paths:
+            imported_asset = unreal.load_asset(imported_path)
+            if (
+                imported_asset
+                and imported_asset.get_class().get_name() == 'SkeletalMesh'
+            ):
+                meshes.append((imported_path, imported_asset))
+        return meshes
+
+    def ensure_hair_tool_nanite(self, imported_object_paths):
+        """Enable Skeletal Nanite after import; UE 5.8 can ignore the FBX flag."""
+        if not self._asset_data.get('_hair_tool_payload'):
+            return
+        for asset_path, mesh in self._imported_skeletal_meshes(imported_object_paths):
+            try:
+                settings = mesh.get_editor_property('nanite_settings')
+                if bool(settings.get_editor_property('enabled')):
+                    continue
+                settings.set_editor_property('enabled', True)
+                mesh.set_editor_property('nanite_settings', settings)
+                for method_name in (
+                    'notify_nanite_settings_changed',
+                    'post_edit_change',
+                ):
+                    method = getattr(mesh, method_name, None)
+                    if not callable(method):
+                        continue
+                    try:
+                        method()
+                    except Exception:
+                        pass
+                    break
+                unreal.log(
+                    f'Hair Tool Skeletal Nanite enabled after import: "{asset_path}".'
+                )
+            except Exception as error:
+                unreal.log_warning(
+                    f'Hair Tool Skeletal Nanite could not be enabled for '
+                    f'"{asset_path}": {error}. Import remains successful.'
+                )
+
+    def audit_hair_tool_payload(self, imported_object_paths):
+        """Audit Skeletal-Nanite RFAOS UVs without interrupting automation."""
+        contract = self._asset_data.get('_hair_tool_payload')
+        if not contract:
+            return
+
+        stream_library = getattr(unreal, 'CodexMaterialToolsLibrary', None)
+        stats_library = getattr(unreal, 'CodexGraphDumpToolsLibrary', None)
+        if not stream_library or not stats_library:
+            unreal.log_warning(
+                'Hair Tool RFAOS UV payload could not be verified because the '
+                'Codex mesh-audit libraries are not installed in this Unreal project.'
+            )
+            return
+
+        asset_paths = [
+            asset_path
+            for asset_path, _mesh in self._imported_skeletal_meshes(
+                imported_object_paths
+            )
+        ]
+        if not asset_paths and self._asset_data.get('asset_path'):
+            asset_paths.append(self._asset_data['asset_path'])
+        if not asset_paths:
+            unreal.log_warning(
+                'Hair Tool import returned no Skeletal Mesh asset path; '
+                'RFAOS payload verification was skipped.'
+            )
+            return
+
+        uv_rg_index = int(contract['uv_rg_index'])
+        uv_ba_index = int(contract['uv_ba_index'])
+        required_uv_count = max(uv_rg_index, uv_ba_index) + 1
+        tag = float(contract['uv_tag'])
+        minimum_range = 1.0 / 255.0
+
+        for asset_path in asset_paths:
+            try:
+                stream_data = self._plugin_json(
+                    stream_library.audit_skeletal_mesh_lod0_streams(asset_path)
+                )
+                channel_data = self._plugin_json(
+                    stats_library.dump_skeletal_mesh_lod_vertex_color_stats(
+                        asset_path,
+                        0,
+                    )
+                )
+            except Exception as error:
+                unreal.log_warning(
+                    f'Hair Tool RFAOS payload audit could not inspect '
+                    f'"{asset_path}": {error}. Import remains successful.'
+                )
+                continue
+            issues = []
+            uv_count = int(stream_data.get('uv_channel_count', 0))
+            if uv_count < required_uv_count:
+                issues.append(
+                    f'expected at least {required_uv_count} UV channels '
+                    f'(UV0 plus RFAOS UV{uv_rg_index}/UV{uv_ba_index}), got {uv_count}'
+                )
+
+            sections = channel_data.get('sections') or []
+            if not sections:
+                issues.append('LOD0 has no section UV statistics')
+            for section in sections:
+                section_index = section.get('section_index', '?')
+                uvs = {
+                    int(item['uv_index']): item
+                    for item in section.get('uvs', [])
+                }
+                rg = uvs.get(uv_rg_index)
+                ba = uvs.get(uv_ba_index)
+                if not rg or not ba:
+                    issues.append(
+                        f'section {section_index} is missing RFAOS '
+                        f'UV{uv_rg_index}/UV{uv_ba_index}'
+                    )
+                    continue
+
+                for label, channel in (('Random', rg['u']), ('AO', ba['u'])):
+                    minimum = float(channel['min'])
+                    maximum = float(channel['max'])
+                    if minimum < tag - 0.01 or maximum > tag + 1.01:
+                        issues.append(
+                            f'section {section_index} {label} tag range is '
+                            f'{minimum:.6f}..{maximum:.6f}, expected '
+                            f'{tag:.2f}..{tag + 1.0:.2f}'
+                        )
+
+                factor_range = float(rg['v']['max']) - float(rg['v']['min'])
+                ao_range = float(ba['u']['max']) - float(ba['u']['min'])
+                if factor_range <= minimum_range:
+                    issues.append(
+                        f'section {section_index} Factor is constant '
+                        f'(range {factor_range:.6f})'
+                    )
+                if ao_range <= minimum_range:
+                    issues.append(
+                        f'section {section_index} AO is constant '
+                        f'(range {ao_range:.6f})'
+                    )
+
+            if issues:
+                unreal.log_warning(
+                    f'Hair Tool RFAOS payload audit found an issue for '
+                    f'"{asset_path}": ' + '; '.join(issues)
+                    + '. Import remains successful; re-export the source hair '
+                    'to refresh all grouped Hair Tool meshes.'
+                )
+            else:
+                unreal.log(
+                    f'Hair Tool RFAOS payload verified for "{asset_path}": '
+                    f'UV{uv_rg_index}=Random/Factor, '
+                    f'UV{uv_ba_index}=AO/SystemMask; material contract '
+                    f'"{contract.get("material_master", "unspecified")}".'
+                )
 
     def set_animation_import_options(self):
         """
@@ -1104,7 +1289,12 @@ class UnrealImportAsset(Unreal):
         self._import_task.options = self._options
         unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks([self._import_task])
 
-        return list(self._import_task.get_editor_property('imported_object_paths'))
+        imported_object_paths = list(
+            self._import_task.get_editor_property('imported_object_paths')
+        )
+        self.ensure_hair_tool_nanite(imported_object_paths)
+        self.audit_hair_tool_payload(imported_object_paths)
+        return imported_object_paths
 
 
 class UnrealImportSequence(Unreal):
