@@ -1,0 +1,3 @@
+[submodule "src/addons/unreal_moss_debug"]
+	path = src/addons/unreal_moss_debug
+	url = https://github.com/nsdoanfosan/blender-unreal-moss-debug.git
