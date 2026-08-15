@@ -951,8 +951,8 @@ class UnrealImportAsset(Unreal):
             )
             hair_payload = self._asset_data.get('_hair_tool_payload')
             if hair_payload:
-                # Vertex colors remain a useful non-Nanite fallback, but UV2/UV3
-                # are the authoritative RFAOS transport for Skeletal Nanite.
+                # Vertex colors remain a useful non-Nanite fallback, but the
+                # UV1/UV2/UV3 v3 payload is authoritative for Skeletal Nanite.
                 import_data.set_editor_property(
                     'vertex_color_import_option',
                     unreal.VertexColorImportOption.REPLACE,
@@ -1084,9 +1084,14 @@ class UnrealImportAsset(Unreal):
             )
             return
 
+        payload_version = int(contract.get('version', 0))
+        system_color_uv_index = int(contract.get('system_color_uv_index', 1))
         uv_rg_index = int(contract['uv_rg_index'])
         uv_ba_index = int(contract['uv_ba_index'])
-        required_uv_count = max(uv_rg_index, uv_ba_index) + 1
+        required_indices = [uv_rg_index, uv_ba_index]
+        if payload_version >= 3:
+            required_indices.append(system_color_uv_index)
+        required_uv_count = max(required_indices) + 1
         tag = float(contract['uv_tag'])
         minimum_range = 1.0 / 255.0
 
@@ -1112,7 +1117,8 @@ class UnrealImportAsset(Unreal):
             if uv_count < required_uv_count:
                 issues.append(
                     f'expected at least {required_uv_count} UV channels '
-                    f'(UV0 plus RFAOS UV{uv_rg_index}/UV{uv_ba_index}), got {uv_count}'
+                    f'(UV0 plus HTUE payload UV{system_color_uv_index}/'
+                    f'UV{uv_rg_index}/UV{uv_ba_index}), got {uv_count}'
                 )
 
             sections = channel_data.get('sections') or []
@@ -1126,10 +1132,11 @@ class UnrealImportAsset(Unreal):
                 }
                 rg = uvs.get(uv_rg_index)
                 ba = uvs.get(uv_ba_index)
-                if not rg or not ba:
+                system_rg = uvs.get(system_color_uv_index)
+                if not rg or not ba or (payload_version >= 3 and not system_rg):
                     issues.append(
-                        f'section {section_index} is missing RFAOS '
-                        f'UV{uv_rg_index}/UV{uv_ba_index}'
+                        f'section {section_index} is missing HTUE payload '
+                        f'UV{system_color_uv_index}/UV{uv_rg_index}/UV{uv_ba_index}'
                     )
                     continue
 
@@ -1155,6 +1162,19 @@ class UnrealImportAsset(Unreal):
                         f'section {section_index} AO is constant '
                         f'(range {ao_range:.6f})'
                     )
+                if payload_version >= 3:
+                    for label, channel in (
+                        ('SystemColor.R', system_rg['u']),
+                        ('SystemColor.G', system_rg['v']),
+                        ('SystemColor.B', ba['v']),
+                    ):
+                        minimum = float(channel['min'])
+                        maximum = float(channel['max'])
+                        if minimum < -0.01 or maximum > 1.01:
+                            issues.append(
+                                f'section {section_index} {label} range is '
+                                f'{minimum:.6f}..{maximum:.6f}, expected 0..1'
+                            )
 
             if issues:
                 unreal.log_warning(
@@ -1165,9 +1185,10 @@ class UnrealImportAsset(Unreal):
                 )
             else:
                 unreal.log(
-                    f'Hair Tool RFAOS payload verified for "{asset_path}": '
+                    f'Hair Tool RGB payload verified for "{asset_path}": '
+                    f'UV{system_color_uv_index}=SystemColor.RG, '
                     f'UV{uv_rg_index}=packed Random+Depth/Factor, '
-                    f'UV{uv_ba_index}=AO/SystemMask; material contract '
+                    f'UV{uv_ba_index}=AO/SystemColor.B; material contract '
                     f'"{contract.get("material_master", "unspecified")}".'
                 )
 
