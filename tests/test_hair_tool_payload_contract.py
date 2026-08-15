@@ -133,11 +133,12 @@ class TestHairToolPayloadContract(unittest.TestCase):
         self.importer._asset_data = {
             "asset_path": "/Game/Test/SK_Hair",
             "_hair_tool_payload": {
-                "version": 2,
-                "encoding": "RFAOS_TAGGED_UV",
+                "version": 3,
+                "encoding": "HTUE_RGB_TAGGED_UV",
+                "system_color_uv_index": 1,
                 "uv_rg_index": 2,
                 "uv_ba_index": 3,
-                "uv_tag": 4.0,
+                "uv_tag": 6.0,
                 "uv_rg_u_packing": "UNORM8_PAIR_RANDOM_DEPTH",
                 "requires_full_precision_uvs": True,
                 "material_master": "/Game/Material/HairTool/Master/M_HT_HairCards",
@@ -153,13 +154,18 @@ class TestHairToolPayloadContract(unittest.TestCase):
                     "section_index": 0,
                     "uvs": [
                         {
+                            "uv_index": 1,
+                            "u": {"min": 0.1, "max": 0.9},
+                            "v": {"min": 0.2, "max": 1.0},
+                        },
+                        {
                             "uv_index": 2,
-                            "u": {"min": 4.0, "max": 5.0},
+                            "u": {"min": 6.0, "max": 7.0},
                             "v": {"min": 0.0, "max": 1.0},
                         },
                         {
                             "uv_index": 3,
-                            "u": {"min": 4.0, "max": 5.0},
+                            "u": {"min": 6.0, "max": 7.0},
                             "v": {"min": 0.0, "max": 1.0},
                         },
                     ],
@@ -177,14 +183,15 @@ class TestHairToolPayloadContract(unittest.TestCase):
         self.assertTrue(fake_subsystem.settings.use_full_precision_u_vs)
         self.assertEqual(fake_subsystem.set_calls, [(self.asset, 0)])
 
-    def test_accepts_tagged_uv2_uv3_payload(self):
+    def test_accepts_tagged_uv1_uv2_uv3_rgb_payload(self):
         self.importer.audit_hair_tool_payload(["/Game/Test/SK_Hair"])
         self.assertEqual(fake_unreal.warning_messages, [])
 
     def test_warns_without_failing_when_uv3_payload_is_missing(self):
         AuditLibrary.stream_payload = {"uv_channel_count": 3}
         AuditLibrary.channel_payload["sections"][0]["uvs"] = [
-            AuditLibrary.channel_payload["sections"][0]["uvs"][0]
+            AuditLibrary.channel_payload["sections"][0]["uvs"][0],
+            AuditLibrary.channel_payload["sections"][0]["uvs"][1],
         ]
         self.importer.audit_hair_tool_payload(["/Game/Test/SK_Hair"])
         self.assertTrue(
@@ -192,9 +199,9 @@ class TestHairToolPayloadContract(unittest.TestCase):
         )
 
     def test_warns_without_failing_for_constant_ao(self):
-        ao = AuditLibrary.channel_payload["sections"][0]["uvs"][1]["u"]
-        ao["min"] = 5.0
-        ao["max"] = 5.0
+        ao = AuditLibrary.channel_payload["sections"][0]["uvs"][2]["u"]
+        ao["min"] = 7.0
+        ao["max"] = 7.0
         self.importer.audit_hair_tool_payload(["/Game/Test/SK_Hair"])
         self.assertTrue(any("AO is constant" in item for item in fake_unreal.warning_messages))
 

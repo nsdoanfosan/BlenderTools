@@ -12,11 +12,13 @@ STATE_KEY = 'send2ue_hair_tool_export_state'
 SOURCE_NAME_PROPERTY = '_send2ue_hair_tool_source_name'
 TEMP_PROPERTY = '_send2ue_hair_tool_temp'
 RFAOS_NAME = 'RFAOS'
+SYSTEM_COLOR_UV_RG = 'HairTool_SystemColor_RG'
 RFAOS_NANITE_UV_RG = 'HairTool_RFAOS_RG'
-RFAOS_NANITE_UV_BA = 'HairTool_RFAOS_BA'
-RFAOS_NANITE_UV_TAG = 4.0
+RFAOS_NANITE_UV_BA = 'HairTool_AO_SystemB'
+SYSTEM_COLOR_UV_INDEX = 1
+RFAOS_NANITE_UV_TAG = 6.0
 RFAOS_NANITE_UV_START_INDEX = 2
-RFAOS_PAYLOAD_VERSION = 2
+RFAOS_PAYLOAD_VERSION = 3
 RFAOS_MINIMUM_RANGE = 1.0 / 255.0
 
 
@@ -187,6 +189,11 @@ def _pack_rfaos(mesh):
             )
             for loop_index in range(len(mesh.loops))
         ]
+    if system_color_attribute is None:
+        _warn(
+            f'Hair Tool mesh "{mesh.name}" has no "SystemColor" attribute. '
+            'Using neutral black RGB; the System Color stage will add no color.'
+        )
     if factor_values and max(factor_values) - min(factor_values) <= RFAOS_MINIMUM_RANGE:
         _warn(
             f'Hair Tool mesh "{mesh.name}" has a constant "Factor" attribute. '
@@ -204,7 +211,15 @@ def _pack_rfaos(mesh):
     )
     packed_values = []
     invalid_channels = set()
-    channel_names = ('Random', 'Factor', 'AO', 'SystemColor Alpha', 'Depth')
+    channel_names = (
+        'Random',
+        'Factor',
+        'AO',
+        'Depth',
+        'SystemColor R',
+        'SystemColor G',
+        'SystemColor B',
+    )
     for loop_index in range(len(mesh.loops)):
         packed = [
             _attribute_component(
@@ -218,16 +233,26 @@ def _pack_rfaos(mesh):
                 default=1.0,
             ),
             _attribute_component(
-                mesh, system_color_attribute, loop_index,
-                component_index=3,
-                loop_to_polygon=loop_to_polygon,
-            ),
-            _attribute_component(
                 mesh, depth_attribute, loop_index,
                 loop_to_polygon=loop_to_polygon,
             ),
+            _attribute_component(
+                mesh, system_color_attribute, loop_index,
+                component_index=0,
+                loop_to_polygon=loop_to_polygon,
+            ),
+            _attribute_component(
+                mesh, system_color_attribute, loop_index,
+                component_index=1,
+                loop_to_polygon=loop_to_polygon,
+            ),
+            _attribute_component(
+                mesh, system_color_attribute, loop_index,
+                component_index=2,
+                loop_to_polygon=loop_to_polygon,
+            ),
         ]
-        fallback_values = (0.0, 0.5, 1.0, 0.0, 0.0)
+        fallback_values = (0.0, 0.5, 1.0, 0.0, 0.0, 0.0, 0.0)
         for channel_index, (channel_name, value) in enumerate(zip(channel_names, packed)):
             if not math.isfinite(value) or value < -1.0e-5 or value > 1.00001:
                 invalid_channels.add(channel_name)
@@ -245,10 +270,11 @@ def _pack_rfaos(mesh):
         # the underlying sRGB byte values. RFAOS contains data masks, not
         # display colors, so write the sRGB-facing property to keep the numeric
         # RGBA values unchanged when Unreal imports the FBX vertex colors.
+        vertex_fallback = (packed[0], packed[1], packed[2], 1.0)
         if hasattr(color_item, 'color_srgb'):
-            color_item.color_srgb = packed[:4]
+            color_item.color_srgb = vertex_fallback
         else:
-            color_item.color = packed[:4]
+            color_item.color = vertex_fallback
 
     for color_attribute in list(mesh.color_attributes):
         if color_attribute.name != RFAOS_NAME:
@@ -295,13 +321,19 @@ def _pack_unorm8_pair(first, second):
 
 
 def _pack_rfaos_nanite_uvs(mesh, packed_values):
-    """Mirror RFAOS+Depth into UV2/UV3 because Skeletal Nanite drops colors.
+    """Write the v3 Nanite-safe scalar and SystemColor RGB payload.
 
+    UV1 stores linear SystemColor RG.
     UV2 stores tagged packed Random+Depth in U and Factor in V.
-    UV3 stores tagged AO in U and inverse-transported SystemColor mask in V.
+    UV3 stores tagged AO in U and linear SystemColor B in V.
     The FBX skeletal importer applies ``V = 1 - V``, so Unreal receives the
-    original Factor and SystemColor values in the V components.
+    original G, Factor, and B values in the V components.
     """
+    system_rg_layer = _ensure_payload_uv(
+        mesh,
+        SYSTEM_COLOR_UV_RG,
+        SYSTEM_COLOR_UV_INDEX,
+    )
     rg_layer = _ensure_payload_uv(
         mesh,
         RFAOS_NANITE_UV_RG,
@@ -314,14 +346,18 @@ def _pack_rfaos_nanite_uvs(mesh, packed_values):
     )
 
     for index, packed in enumerate(packed_values):
-        random_value, factor, ao, system_mask, depth = packed
+        random_value, factor, ao, depth, system_r, system_g, system_b = packed
+        system_rg_layer.data[index].uv = (
+            system_r,
+            1.0 - system_g,
+        )
         rg_layer.data[index].uv = (
             RFAOS_NANITE_UV_TAG + _pack_unorm8_pair(random_value, depth),
             1.0 - factor,
         )
         ba_layer.data[index].uv = (
             RFAOS_NANITE_UV_TAG + ao,
-            1.0 - system_mask,
+            1.0 - system_b,
         )
 
 
@@ -514,7 +550,8 @@ def _write_hair_tool_uvs(mesh):
         )
         if not mesh.uv_layers:
             mesh.uv_layers.new(name='UVMap')
-    _write_uv_layer(mesh, 'UVHelperGN', 'HairTool_UV')
+    # Skeletal meshes expose only UV0..UV3. Contract v3 dedicates UV1 to
+    # SystemColor.RG; the previous HairTool_UV helper had no Unreal consumer.
     render_uv = mesh.uv_layers.get('UVMap') or mesh.uv_layers[0]
     mesh.uv_layers.active = render_uv
     render_uv.active_render = True
@@ -524,12 +561,15 @@ def get_rfaos_payload_contract():
     """Return the JSON-safe contract consumed by the Unreal importer."""
     return {
         'version': RFAOS_PAYLOAD_VERSION,
-        'encoding': 'RFAOS_TAGGED_UV',
+        'encoding': 'HTUE_RGB_TAGGED_UV',
         'vertex_color_name': RFAOS_NAME,
+        'system_color_uv_index': SYSTEM_COLOR_UV_INDEX,
         'uv_rg_index': RFAOS_NANITE_UV_START_INDEX,
         'uv_ba_index': RFAOS_NANITE_UV_START_INDEX + 1,
         'uv_tag': RFAOS_NANITE_UV_TAG,
         'uv_rg_u_packing': 'UNORM8_PAIR_RANDOM_DEPTH',
+        'system_color_encoding': 'LINEAR_RGB_UV1_RG_UV3_V',
+        'system_color_alpha_used': False,
         'requires_full_precision_uvs': True,
         'depth_attribute': 'Depth',
         'depth_fallback': 0.0,
@@ -537,6 +577,7 @@ def get_rfaos_payload_contract():
         'nanite_max_uv_index': 3,
         'material_master': '/Game/Material/HairTool/Master/M_HT_HairCards',
         'material_texcoord_indices': [
+            SYSTEM_COLOR_UV_INDEX,
             RFAOS_NANITE_UV_START_INDEX,
             RFAOS_NANITE_UV_START_INDEX + 1,
         ],
