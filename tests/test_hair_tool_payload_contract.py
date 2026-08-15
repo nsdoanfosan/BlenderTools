@@ -37,6 +37,36 @@ class FakeNaniteSettings:
         raise KeyError(name)
 
 
+class FakeLodBuildSettings:
+    def __init__(self, full_precision=False):
+        self.use_full_precision_u_vs = full_precision
+
+    def get_editor_property(self, name):
+        if name == "use_full_precision_u_vs":
+            return self.use_full_precision_u_vs
+        raise KeyError(name)
+
+    def set_editor_property(self, name, value):
+        if name == "use_full_precision_u_vs":
+            self.use_full_precision_u_vs = bool(value)
+            return
+        raise KeyError(name)
+
+
+class FakeSkeletalMeshSubsystem:
+    def __init__(self):
+        self.settings = FakeLodBuildSettings()
+        self.set_calls = []
+
+    def get_lod_build_settings(self, _mesh, index):
+        assert index == 0
+        return self.settings
+
+    def set_lod_build_settings(self, mesh, index, settings):
+        self.settings = settings
+        self.set_calls.append((mesh, index))
+
+
 class FakeAsset:
     def __init__(self):
         self.nanite_settings = FakeNaniteSettings()
@@ -76,6 +106,9 @@ class AuditLibrary:
 fake_unreal = types.ModuleType("unreal")
 fake_unreal.CodexMaterialToolsLibrary = AuditLibrary
 fake_unreal.CodexGraphDumpToolsLibrary = AuditLibrary
+fake_unreal.SkeletalMeshEditorSubsystem = object()
+fake_subsystem = FakeSkeletalMeshSubsystem()
+fake_unreal.get_editor_subsystem = lambda _kind: fake_subsystem
 fake_unreal.load_asset = lambda _path: FakeAsset()
 fake_unreal.log = lambda _message: None
 fake_unreal.warning_messages = []
@@ -100,15 +133,19 @@ class TestHairToolPayloadContract(unittest.TestCase):
         self.importer._asset_data = {
             "asset_path": "/Game/Test/SK_Hair",
             "_hair_tool_payload": {
-                "version": 1,
+                "version": 2,
                 "encoding": "RFAOS_TAGGED_UV",
                 "uv_rg_index": 2,
                 "uv_ba_index": 3,
-                "uv_tag": 2.0,
+                "uv_tag": 4.0,
+                "uv_rg_u_packing": "UNORM8_PAIR_RANDOM_DEPTH",
+                "requires_full_precision_uvs": True,
                 "material_master": "/Game/Material/HairTool/Master/M_HT_HairCards",
             },
         }
         fake_unreal.warning_messages.clear()
+        fake_subsystem.settings = FakeLodBuildSettings()
+        fake_subsystem.set_calls.clear()
         AuditLibrary.stream_payload = {"uv_channel_count": 4}
         AuditLibrary.channel_payload = {
             "sections": [
@@ -117,12 +154,12 @@ class TestHairToolPayloadContract(unittest.TestCase):
                     "uvs": [
                         {
                             "uv_index": 2,
-                            "u": {"min": 2.0, "max": 3.0},
+                            "u": {"min": 4.0, "max": 5.0},
                             "v": {"min": 0.0, "max": 1.0},
                         },
                         {
                             "uv_index": 3,
-                            "u": {"min": 2.0, "max": 3.0},
+                            "u": {"min": 4.0, "max": 5.0},
                             "v": {"min": 0.0, "max": 1.0},
                         },
                     ],
@@ -134,6 +171,11 @@ class TestHairToolPayloadContract(unittest.TestCase):
         self.importer.ensure_hair_tool_nanite(["/Game/Test/SK_Hair"])
         self.assertTrue(self.asset.nanite_settings.enabled)
         self.assertTrue(self.asset.notified)
+
+    def test_enables_full_precision_uvs_for_packed_random_depth(self):
+        self.importer.ensure_hair_tool_uv_precision(["/Game/Test/SK_Hair"])
+        self.assertTrue(fake_subsystem.settings.use_full_precision_u_vs)
+        self.assertEqual(fake_subsystem.set_calls, [(self.asset, 0)])
 
     def test_accepts_tagged_uv2_uv3_payload(self):
         self.importer.audit_hair_tool_payload(["/Game/Test/SK_Hair"])
@@ -151,8 +193,8 @@ class TestHairToolPayloadContract(unittest.TestCase):
 
     def test_warns_without_failing_for_constant_ao(self):
         ao = AuditLibrary.channel_payload["sections"][0]["uvs"][1]["u"]
-        ao["min"] = 3.0
-        ao["max"] = 3.0
+        ao["min"] = 5.0
+        ao["max"] = 5.0
         self.importer.audit_hair_tool_payload(["/Game/Test/SK_Hair"])
         self.assertTrue(any("AO is constant" in item for item in fake_unreal.warning_messages))
 

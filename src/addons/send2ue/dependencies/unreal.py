@@ -1021,6 +1021,39 @@ class UnrealImportAsset(Unreal):
                     f'"{asset_path}": {error}. Import remains successful.'
                 )
 
+    def ensure_hair_tool_uv_precision(self, imported_object_paths):
+        """Keep the packed Random+Depth UV payload lossless after mesh build."""
+        contract = self._asset_data.get('_hair_tool_payload') or {}
+        if not contract.get('requires_full_precision_uvs'):
+            return
+        try:
+            subsystem = unreal.get_editor_subsystem(
+                unreal.SkeletalMeshEditorSubsystem
+            )
+        except Exception as error:
+            unreal.log_warning(
+                f'Hair Tool full-precision UV setup is unavailable: {error}. '
+                'Packed Random/Depth data may lose precision.'
+            )
+            return
+
+        for asset_path, mesh in self._imported_skeletal_meshes(imported_object_paths):
+            try:
+                settings = subsystem.get_lod_build_settings(mesh, 0)
+                if bool(settings.get_editor_property('use_full_precision_u_vs')):
+                    continue
+                settings.set_editor_property('use_full_precision_u_vs', True)
+                subsystem.set_lod_build_settings(mesh, 0, settings)
+                unreal.log(
+                    f'Hair Tool full-precision UVs enabled for "{asset_path}".'
+                )
+            except Exception as error:
+                unreal.log_warning(
+                    f'Hair Tool full-precision UVs could not be enabled for '
+                    f'"{asset_path}": {error}. Packed Random/Depth data may '
+                    'lose precision.'
+                )
+
     def audit_hair_tool_payload(self, imported_object_paths):
         """Audit Skeletal-Nanite RFAOS UVs without interrupting automation."""
         contract = self._asset_data.get('_hair_tool_payload')
@@ -1100,7 +1133,7 @@ class UnrealImportAsset(Unreal):
                     )
                     continue
 
-                for label, channel in (('Random', rg['u']), ('AO', ba['u'])):
+                for label, channel in (('Random/Depth', rg['u']), ('AO', ba['u'])):
                     minimum = float(channel['min'])
                     maximum = float(channel['max'])
                     if minimum < tag - 0.01 or maximum > tag + 1.01:
@@ -1133,7 +1166,7 @@ class UnrealImportAsset(Unreal):
             else:
                 unreal.log(
                     f'Hair Tool RFAOS payload verified for "{asset_path}": '
-                    f'UV{uv_rg_index}=Random/Factor, '
+                    f'UV{uv_rg_index}=packed Random+Depth/Factor, '
                     f'UV{uv_ba_index}=AO/SystemMask; material contract '
                     f'"{contract.get("material_master", "unspecified")}".'
                 )
@@ -1292,6 +1325,7 @@ class UnrealImportAsset(Unreal):
         imported_object_paths = list(
             self._import_task.get_editor_property('imported_object_paths')
         )
+        self.ensure_hair_tool_uv_precision(imported_object_paths)
         self.ensure_hair_tool_nanite(imported_object_paths)
         self.audit_hair_tool_payload(imported_object_paths)
         return imported_object_paths

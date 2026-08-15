@@ -3911,11 +3911,15 @@ def _assign_hair_tool_parameters(
         )
 
     hair_tool = entry.get("hair_tool") or {}
+    synced_parameters = {
+        str(name) for name in (hair_tool.get("sync_parameters") or [])
+    }
     for name, value in (hair_tool.get("scalar_parameters") or {}).items():
         name = str(name)
         if (
             not initialize_instance_owned_parameters
             and name in HAIR_INSTANCE_OWNED_SCALAR_PARAMETERS
+            and name not in synced_parameters
         ):
             _log(f"  preserve existing hair MI scalar: {name}")
             continue
@@ -3928,6 +3932,7 @@ def _assign_hair_tool_parameters(
         if (
             not initialize_instance_owned_parameters
             and name in HAIR_INSTANCE_OWNED_VECTOR_PARAMETERS
+            and name not in synced_parameters
         ):
             _log(f"  preserve existing hair MI vector: {name}")
             continue
