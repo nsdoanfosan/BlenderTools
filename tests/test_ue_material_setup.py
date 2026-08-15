@@ -97,6 +97,8 @@ class FakeMaterialInstanceConstant:
         self.parent = parent
         self.texture_parameter_values = list(texture_parameter_values or [])
         self.texture_values_by_name = {}
+        self.scalar_values_by_name = {}
+        self.vector_values_by_name = {}
 
     def get_path_name(self):
         return self.asset_path
@@ -334,6 +336,8 @@ class FakeRuntime:
         self.created_directories = []
         self.parent_changes = []
         self.texture_parameter_sets = []
+        self.scalar_parameter_sets = []
+        self.vector_parameter_sets = []
         self.material_instance_updates = []
         self.delete_calls = []
         self.fail_create_paths = set()
@@ -366,8 +370,15 @@ class FakeRuntime:
             set_material_instance_texture_parameter_value=(
                 self.set_material_instance_texture_parameter_value
             ),
+            set_material_instance_scalar_parameter_value=(
+                self.set_material_instance_scalar_parameter_value
+            ),
+            set_material_instance_vector_parameter_value=(
+                self.set_material_instance_vector_parameter_value
+            ),
             update_material_instance=self.update_material_instance,
         )
+        unreal_module.LinearColor = lambda r, g, b, a: (r, g, b, a)
         unreal_module.MaterialParameterAssociation = types.SimpleNamespace(
             LAYER_PARAMETER="LAYER_PARAMETER"
         )
@@ -403,6 +414,14 @@ class FakeRuntime:
 
     def update_material_instance(self, asset):
         self.material_instance_updates.append(asset.get_path_name())
+
+    def set_material_instance_scalar_parameter_value(self, asset, name, value):
+        asset.scalar_values_by_name[str(name)] = float(value)
+        self.scalar_parameter_sets.append((asset.get_path_name(), str(name), float(value)))
+
+    def set_material_instance_vector_parameter_value(self, asset, name, value):
+        asset.vector_values_by_name[str(name)] = value
+        self.vector_parameter_sets.append((asset.get_path_name(), str(name), value))
 
 
 def _md5(file_path):
@@ -2397,6 +2416,51 @@ class TestGeneratedSkeletonDependencySave(unittest.TestCase):
                 "/Game/Test/SK_Branch.SK_Branch",
             ],
         )
+
+
+class TestHairToolBridgeParameterSync(unittest.TestCase):
+    def setUp(self):
+        self.runtime = FakeRuntime()
+        self.module = _load_module(self.runtime)
+        self.mi = FakeMaterialInstanceConstant(
+            "/Game/Material/HairTool/MI/MI_HT_Default_Material_01"
+        )
+
+    def test_explicit_sync_list_makes_blender_authoritative_for_system_colors(self):
+        entry = {
+            "hair_tool": {
+                "sync_parameters": [
+                    "System Color 01",
+                    "System Color Influence",
+                ],
+                "vector_parameters": {
+                    "System Color 01": [0.1, 0.2, 0.3, 1.0],
+                },
+                "scalar_parameters": {
+                    "System Color Influence": 0.75,
+                    "System Mask Bias": 0.25,
+                    "Root Blend Mode": 2.0,
+                },
+            }
+        }
+
+        changed = self.module._assign_hair_tool_parameters(
+            self.mi,
+            entry,
+            {},
+            initialize_instance_owned_parameters=False,
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(
+            self.mi.vector_values_by_name["System Color 01"],
+            (0.1, 0.2, 0.3, 1.0),
+        )
+        self.assertEqual(
+            self.mi.scalar_values_by_name["System Color Influence"], 0.75
+        )
+        self.assertEqual(self.mi.scalar_values_by_name["Root Blend Mode"], 2.0)
+        self.assertNotIn("System Mask Bias", self.mi.scalar_values_by_name)
 
 
 if __name__ == "__main__":
