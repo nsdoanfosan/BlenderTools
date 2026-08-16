@@ -60,6 +60,63 @@ for name, values in scalar_values.items():
     for item, value in zip(attribute.data, values):
         item.value = value
 
+# A bridge-assigned Export Empty groups a directly linked Hair Tool output
+# without reparenting it. Render-disabled links are intentionally skipped.
+export_collection = bpy.data.collections.new("Export")
+bpy.context.scene.collection.children.link(export_collection)
+inherited_target = bpy.data.objects.new("Hair_Parent_Target_SMOKE", None)
+export_target = bpy.data.objects.new("Hair_Export_Target_SMOKE", None)
+export_collection.objects.link(inherited_target)
+export_collection.objects.link(export_target)
+export_source = bpy.data.objects.new("Hair_Export_Source_SMOKE", mesh)
+export_collection.objects.link(export_source)
+export_source.parent = inherited_target
+upstream_source = bpy.data.objects.new("Hair_Upstream_Source_SMOKE", mesh)
+export_collection.objects.link(upstream_source)
+upstream_source.parent = inherited_target
+setup_group = bpy.data.node_groups.new("Hair_System_Setup_EXPORT_SMOKE", "GeometryNodeTree")
+profile_group = bpy.data.node_groups.new("Hair_System_Profile_EXPORT_SMOKE", "GeometryNodeTree")
+setup_modifier = export_source.modifiers.new("Hair_System_Setup", "NODES")
+setup_modifier.node_group = setup_group
+profile_modifier = export_source.modifiers.new("Profile", "NODES")
+profile_modifier.node_group = profile_group
+upstream_setup = upstream_source.modifiers.new("Hair_System_Setup", "NODES")
+upstream_setup.node_group = setup_group
+upstream_profile = upstream_source.modifiers.new("Profile", "NODES")
+upstream_profile.node_group = profile_group
+setup_modifier["Input_3"] = upstream_source
+export_source[hair_tool_export.EXPORT_TARGET_PROPERTY] = export_target
+upstream_source[hair_tool_export.EXPORT_TARGET_PROPERTY] = inherited_target
+original_parent = export_source.parent
+original_matrix = export_source.matrix_world.copy()
+assert hair_tool_export._asset_group_key(export_source) == export_target
+export_target.name = "Hair_Export_Target_Renamed_SMOKE"
+assert hair_tool_export._asset_group_key(export_source) == export_target
+assert export_source.parent == original_parent
+assert export_source.matrix_world == original_matrix
+assert export_source in hair_tool_export._export_source_candidates(export_collection)
+final_sources = hair_tool_export._final_export_sources(export_collection)
+assert export_source in final_sources
+assert upstream_source not in final_sources
+export_source.hide_render = True
+assert export_source not in hair_tool_export._export_source_candidates(export_collection)
+export_source.hide_render = False
+export_collection.objects.unlink(export_target)
+try:
+    hair_tool_export._asset_group_key(export_source, export_collection)
+except RuntimeError as error:
+    assert "Relink" in str(error)
+else:
+    raise AssertionError("A stale explicit Export assignment must not silently fall back")
+del export_source[hair_tool_export.EXPORT_TARGET_PROPERTY]
+assert hair_tool_export._asset_group_key(export_source, export_collection) == inherited_target
+bpy.data.objects.remove(export_source, do_unlink=True)
+bpy.data.objects.remove(upstream_source, do_unlink=True)
+bpy.data.objects.remove(export_target, do_unlink=True)
+bpy.data.objects.remove(inherited_target, do_unlink=True)
+bpy.data.node_groups.remove(setup_group)
+bpy.data.node_groups.remove(profile_group)
+bpy.data.collections.remove(export_collection)
 system_colors = (
     (0.125, 0.25, 0.375, 0.0),
     (0.5, 0.625, 0.75, 1.0),

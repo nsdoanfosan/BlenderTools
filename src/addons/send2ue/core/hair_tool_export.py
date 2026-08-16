@@ -22,6 +22,7 @@ RFAOS_NANITE_UV_TAG = 6.0
 RFAOS_NANITE_UV_START_INDEX = 2
 RFAOS_PAYLOAD_VERSION = 3
 RFAOS_MINIMUM_RANGE = 1.0 / 255.0
+EXPORT_TARGET_PROPERTY = '_htue_export_target'
 AO_MODIFIER_SETTING_IDS = {
     'samples': 'Input_3',
     'base_color_value': 'Input_13',
@@ -880,10 +881,26 @@ def _link_to_export_collection(scene_object, export_collection):
     export_collection.objects.link(scene_object)
 
 
-def _asset_group_key(scene_object):
-    """Group a Hair Tool system by its nearest exported Empty ancestor."""
-    export_collection = bpy.data.collections.get(ToolInfo.EXPORT_COLLECTION.value)
+def _asset_group_key(scene_object, export_collection=None):
+    """Group a Hair Tool system by its explicit or inherited Export Empty."""
+    export_collection = export_collection or bpy.data.collections.get(
+        ToolInfo.EXPORT_COLLECTION.value
+    )
     exported_objects = set(export_collection.all_objects) if export_collection else set()
+
+    if EXPORT_TARGET_PROPERTY in scene_object:
+        explicit_target = scene_object.get(EXPORT_TARGET_PROPERTY)
+        if (
+            isinstance(explicit_target, bpy.types.Object)
+            and explicit_target.type == 'EMPTY'
+            and export_collection is not None
+            and export_collection in explicit_target.users_collection
+        ):
+            return explicit_target
+        raise RuntimeError(
+            f'Invalid Export Empty target on "{scene_object.name}". '
+            'Relink it from HT Unreal > Export Collection Link.'
+        )
 
     parent = scene_object.parent
     while parent:
@@ -892,6 +909,38 @@ def _asset_group_key(scene_object):
         parent = parent.parent
 
     return scene_object.parent or scene_object
+
+
+def _export_source_candidates(export_collection):
+    """Return direct, visible, render-enabled Hair Tool Export links only."""
+    return [
+        scene_object
+        for scene_object in export_collection.all_objects
+        if (
+            export_collection in scene_object.users_collection
+            and scene_object.visible_get()
+            and not scene_object.hide_render
+            and is_hair_tool_object(scene_object)
+        )
+    ]
+
+
+def _final_export_sources(export_collection):
+    """Return final Hair Tool outputs after global upstream suppression."""
+    source_candidates = _export_source_candidates(export_collection)
+    upstream_sources = {
+        input_object
+        for input_object in (
+            _get_hair_tool_input_object(scene_object)
+            for scene_object in source_candidates
+        )
+        if input_object in source_candidates
+    }
+    return [
+        scene_object
+        for scene_object in source_candidates
+        if scene_object not in upstream_sources
+    ]
 
 
 def prepare():
@@ -949,31 +998,9 @@ def prepare():
     if not export_collection:
         return
 
-    source_candidates = [
-        scene_object
-        for scene_object in export_collection.all_objects
-        if (
-            export_collection in scene_object.users_collection
-            and scene_object.visible_get()
-            and is_hair_tool_object(scene_object)
-        )
-    ]
-    # If an enabled final Hair Tool output consumes another enabled Hair Tool
-    # object, export only the downstream output. The upstream Surface/Curve is
-    # construction data, not an additional hair result.
-    upstream_sources = {
-        input_object
-        for input_object in (
-            _get_hair_tool_input_object(scene_object)
-            for scene_object in source_candidates
-        )
-        if input_object in source_candidates
-    }
-    source_objects = [
-        scene_object
-        for scene_object in source_candidates
-        if scene_object not in upstream_sources
-    ]
+    # Upstream suppression is global, before grouping. The Bridge AO preview
+    # calls the same helper so different target assignments cannot diverge.
+    source_objects = _final_export_sources(export_collection)
     state = {
         'source_names': {scene_object.name for scene_object in source_objects},
         'temporary_object_names': set(),
@@ -984,7 +1011,10 @@ def prepare():
     try:
         grouped_sources = {}
         for source_object in source_objects:
-            grouped_sources.setdefault(_asset_group_key(source_object), []).append(source_object)
+            grouped_sources.setdefault(
+                _asset_group_key(source_object, export_collection),
+                [],
+            ).append(source_object)
 
         for asset_parent, asset_sources in grouped_sources.items():
             ao_configuration = _asset_ao_configuration(asset_parent)
