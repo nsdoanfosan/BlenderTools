@@ -47,6 +47,19 @@ system_color = mesh.attributes.new(name="SystemColor", type="FLOAT_COLOR", domai
 for item, value in zip(system_color.data, system_colors):
     item.color = value
 
+# Per-System mode preserves Hair Tool's AO while evaluated card geometry is
+# joined. Validation must not replace valid values.
+selector_object = bpy.data.objects.new("HTUE_AO_POLICY_SMOKE", mesh)
+selection_state = {"ao_stats": {}}
+selected = hair_tool_export._preserve_per_system_ao(
+    selector_object,
+    selection_state,
+)
+close(selected["mean"], 0.5)
+assert selected["source"] == "per_hair_tool_system"
+assert selected["fallback"] is False
+bpy.data.objects.remove(selector_object, do_unlink=True)
+
 hair_tool_export._write_hair_tool_uvs(mesh)
 hair_tool_export._pack_rfaos(mesh)
 

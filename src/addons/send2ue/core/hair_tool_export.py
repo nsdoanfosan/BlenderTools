@@ -20,6 +20,15 @@ RFAOS_NANITE_UV_TAG = 6.0
 RFAOS_NANITE_UV_START_INDEX = 2
 RFAOS_PAYLOAD_VERSION = 3
 RFAOS_MINIMUM_RANGE = 1.0 / 255.0
+AO_MODIFIER_SETTING_IDS = {
+    'samples': 'Input_3',
+    'base_color_value': 'Input_13',
+    'spread_angle': 'Input_4',
+    'blur_steps': 'Input_8',
+    'first_bounce_factor': 'Input_14',
+    'second_bounce_factor': 'Input_15',
+    'use_custom_normals': 'Socket_0',
+}
 
 
 def _warn(message):
@@ -162,6 +171,41 @@ def _attribute_component(
             return float(vector[component_index])
         return default
     return default
+
+
+def _ao_statistics(mesh):
+    attribute = mesh.attributes.get('AO')
+    if attribute is None or not mesh.loops:
+        return None
+    loop_to_polygon = _loop_to_polygon_indices(mesh)
+    values = [
+        _attribute_component(
+            mesh,
+            attribute,
+            loop_index,
+            loop_to_polygon=loop_to_polygon,
+            default=1.0,
+        )
+        for loop_index in range(len(mesh.loops))
+    ]
+    if any(
+        not math.isfinite(value) or value < -1.0e-5 or value > 1.00001
+        for value in values
+    ):
+        return None
+    ordered = sorted(values)
+
+    def percentile(amount):
+        return ordered[min(len(ordered) - 1, round((len(ordered) - 1) * amount))]
+
+    return {
+        'minimum': ordered[0],
+        'p05': percentile(0.05),
+        'median': percentile(0.5),
+        'mean': sum(values) / len(values),
+        'p95': percentile(0.95),
+        'maximum': ordered[-1],
+    }
 
 
 def _pack_rfaos(mesh):
@@ -397,8 +441,16 @@ def _remove_empty_material_slots(scene_object):
         mesh.materials.append(material)
 
 
-def _evaluate_combined_ao(scene_object, state):
-    """Evaluate Hair Tool AO in applied world space after systems are joined."""
+def _apply_ao_modifier_settings(modifier, ao_settings):
+    if not ao_settings:
+        return
+    for field, identifier in AO_MODIFIER_SETTING_IDS.items():
+        if field in ao_settings:
+            modifier[identifier] = ao_settings[field]
+
+
+def _evaluate_combined_ao(scene_object, state, ao_settings=None):
+    """Evaluate Hair Tool AO once on the final, joined export geometry."""
     node_group = bpy.data.node_groups.get('HT_Mesh_AO')
     if not node_group:
         _warn(
@@ -409,6 +461,7 @@ def _evaluate_combined_ao(scene_object, state):
         state.setdefault('ao_stats', {})[scene_object.name] = {
             'minimum': 1.0,
             'maximum': 1.0,
+            'source': 'combined_export_geometry',
             'fallback': True,
         }
         return
@@ -420,10 +473,9 @@ def _evaluate_combined_ao(scene_object, state):
     modifier = None
 
     try:
-        # Geometry Nodes evaluates distances in object space. Bake the complete
-        # world transform into a disposable mesh first so HT_Mesh_AO sees the
-        # same scale and relative placement that Unreal receives. The result is
-        # transformed back afterward, preserving the object's export transform.
+        # The input is already one realized mesh containing every final Hair
+        # Tool system in this export asset. Bake world space before AO so the
+        # ray distances match the geometry that Unreal receives.
         world_mesh = original_mesh.copy()
         world_mesh.transform(original_world_matrix)
         existing_ao = world_mesh.attributes.get('AO')
@@ -434,6 +486,7 @@ def _evaluate_combined_ao(scene_object, state):
 
         modifier = scene_object.modifiers.new(name='__S2U_HAIR_AO', type='NODES')
         modifier.node_group = node_group
+        _apply_ao_modifier_settings(modifier, ao_settings)
         if 'Input_7' in modifier:
             modifier['Input_7'] = 'AO'
 
@@ -441,6 +494,18 @@ def _evaluate_combined_ao(scene_object, state):
         depsgraph.update()
         evaluated_object = scene_object.evaluated_get(depsgraph)
         evaluated_mesh = bpy.data.meshes.new_from_object(evaluated_object)
+
+        # Combined AO must not change topology. A mismatch means the proxy was
+        # not the final realized export geometry and is unsafe to pack.
+        if (
+            len(evaluated_mesh.vertices) != len(world_mesh.vertices)
+            or len(evaluated_mesh.polygons) != len(world_mesh.polygons)
+        ):
+            raise RuntimeError(
+                'HT_Mesh_AO changed final joined topology: '
+                f'{len(world_mesh.vertices)}->{len(evaluated_mesh.vertices)} vertices, '
+                f'{len(world_mesh.polygons)}->{len(evaluated_mesh.polygons)} polygons'
+            )
 
         ao_attribute = evaluated_mesh.attributes.get('AO')
         if not ao_attribute:
@@ -469,11 +534,16 @@ def _evaluate_combined_ao(scene_object, state):
                 f'Hair Tool AO evaluation produced values outside finite 0-1 '
                 f'for "{scene_object.name}"; export continues with neutral AO=1.'
             )
-            ao_attribute = _set_neutral_ao(evaluated_mesh)
+            _set_neutral_ao(evaluated_mesh)
             ao_values = [1.0] * len(evaluated_mesh.loops)
 
         ao_min = min(ao_values)
         ao_max = max(ao_values)
+        ao_stats = _ao_statistics(evaluated_mesh) or {
+            'minimum': ao_min,
+            'maximum': ao_max,
+            'mean': sum(ao_values) / len(ao_values),
+        }
         if ao_max - ao_min <= RFAOS_MINIMUM_RANGE:
             _warn(
                 f'Hair Tool AO evaluation produced a constant value '
@@ -486,8 +556,11 @@ def _evaluate_combined_ao(scene_object, state):
         scene_object.data = evaluated_mesh
         scene_object.matrix_world = original_world_matrix
         state.setdefault('ao_stats', {})[scene_object.name] = {
-            'minimum': ao_min,
-            'maximum': ao_max,
+            **ao_stats,
+            'source': 'combined_export_geometry',
+            'vertices': len(evaluated_mesh.vertices),
+            'polygons': len(evaluated_mesh.polygons),
+            'fallback': False,
         }
         state['temporary_mesh_names'].add(evaluated_mesh.name)
         evaluated_mesh = None
@@ -509,6 +582,7 @@ def _evaluate_combined_ao(scene_object, state):
         state.setdefault('ao_stats', {})[scene_object.name] = {
             'minimum': 1.0,
             'maximum': 1.0,
+            'source': 'combined_export_geometry',
             'fallback': True,
             'error': str(error),
         }
@@ -516,6 +590,28 @@ def _evaluate_combined_ao(scene_object, state):
             f'Hair Tool AO evaluation failed for "{scene_object.name}": '
             f'{error}. Export continues with neutral AO=1.'
         )
+
+
+def _preserve_per_system_ao(scene_object, state):
+    """Validate the Hair Tool AO preserved before final geometry joining."""
+    stats = _ao_statistics(scene_object.data)
+    fallback = stats is None
+    if fallback:
+        _warn(
+            f'Hair Tool systems for "{scene_object.name}" produced no valid AO; '
+            'using neutral AO=1.'
+        )
+        _set_neutral_ao(scene_object.data)
+        stats = _ao_statistics(scene_object.data)
+    result = {
+        **stats,
+        'source': 'per_hair_tool_system',
+        'vertices': len(scene_object.data.vertices),
+        'polygons': len(scene_object.data.polygons),
+        'fallback': fallback,
+    }
+    state.setdefault('ao_stats', {})[scene_object.name] = result
+    return result
 
 
 def _write_uv_layer(mesh, source_attribute_name, target_uv_name):
@@ -584,40 +680,115 @@ def get_rfaos_payload_contract():
     }
 
 
-def _evaluated_mesh_objects(source_object, state):
+def _evaluated_mesh_objects(
+    source_object,
+    state,
+    include_system_ao=False,
+    ao_settings=None,
+):
     depsgraph = bpy.context.evaluated_depsgraph_get()
     created_objects = []
 
-    for instance in depsgraph.object_instances:
-        parent = instance.parent
-        original_object = instance.object.original
-        original_parent = parent.original if parent else None
-        if instance.object.type != 'MESH':
-            continue
-        if original_object != source_object and original_parent != source_object:
-            continue
-
-        instance_matrix = instance.matrix_world.copy()
-        mesh = bpy.data.meshes.new_from_object(instance.object)
-        if not mesh.vertices or not mesh.polygons:
-            bpy.data.meshes.remove(mesh)
-            continue
-
-        mesh_object = bpy.data.objects.new(
-            f'__S2U_HAIR_PART_{source_object.name}',
-            mesh,
+    ao_modifiers = [
+        modifier
+        for modifier in source_object.modifiers
+        if (
+            modifier.type == 'NODES'
+            and modifier.node_group
+            and modifier.node_group.name.startswith('HT_Mesh_AO')
         )
-        bpy.context.scene.collection.objects.link(mesh_object)
-        mesh_object.matrix_world = instance_matrix
-        created_objects.append(mesh_object)
-        state['temporary_object_names'].add(mesh_object.name)
+    ] if include_system_ao else []
+    ao_viewport_states = [modifier.show_viewport for modifier in ao_modifiers]
+    ao_setting_states = []
+    for modifier in ao_modifiers:
+        modifier_state = {}
+        for identifier in AO_MODIFIER_SETTING_IDS.values():
+            modifier_state[identifier] = (
+                identifier in modifier,
+                modifier.get(identifier),
+            )
+        ao_setting_states.append(modifier_state)
+        _apply_ao_modifier_settings(modifier, ao_settings)
+    for modifier in ao_modifiers:
+        modifier.show_viewport = True
+    if ao_modifiers:
+        depsgraph.update()
+
+    try:
+        for instance in depsgraph.object_instances:
+            parent = instance.parent
+            original_object = instance.object.original
+            original_parent = parent.original if parent else None
+            if instance.object.type != 'MESH':
+                continue
+            # A direct evaluated result or an actual GN instance is valid. A
+            # plain child mesh is construction data, not an AO occluder.
+            if original_object != source_object and not (
+                instance.is_instance and original_parent == source_object
+            ):
+                continue
+
+            instance_matrix = instance.matrix_world.copy()
+            mesh = bpy.data.meshes.new_from_object(instance.object)
+            if not mesh.vertices or not mesh.polygons:
+                bpy.data.meshes.remove(mesh)
+                continue
+            if include_system_ao and mesh.attributes.get('AO') is None:
+                _set_neutral_ao(mesh)
+
+            mesh_object = bpy.data.objects.new(
+                f'__S2U_HAIR_PART_{source_object.name}',
+                mesh,
+            )
+            bpy.context.scene.collection.objects.link(mesh_object)
+            mesh_object.matrix_world = instance_matrix
+            created_objects.append(mesh_object)
+            state['temporary_object_names'].add(mesh_object.name)
+    finally:
+        for modifier, viewport_state, modifier_state in zip(
+            ao_modifiers,
+            ao_viewport_states,
+            ao_setting_states,
+        ):
+            for identifier, (existed, value) in modifier_state.items():
+                if existed:
+                    modifier[identifier] = value
+                elif identifier in modifier:
+                    del modifier[identifier]
+            modifier.show_viewport = viewport_state
+        if ao_modifiers:
+            depsgraph.update()
 
     return created_objects
 
 
+def _asset_ao_configuration(asset_parent):
+    settings = getattr(asset_parent, 'htue_ao_settings', None)
+    if settings is None:
+        return {'evaluation_mode': 'PER_SYSTEM'}
+    return {
+        'evaluation_mode': str(settings.evaluation_mode),
+        **{
+            field: getattr(settings, field)
+            for field in AO_MODIFIER_SETTING_IDS
+        },
+    }
+
+
 def _join_objects(objects):
+    """Join disposable evaluated parts in world space without touching sources."""
     if not objects:
         return None
+    # Normalize only temporary copies. This removes active-object and
+    # non-uniform source-transform dependence from the combined AO evaluation.
+    for scene_object in objects:
+        world_matrix = scene_object.matrix_world.copy()
+        negative_handedness = world_matrix.to_3x3().determinant() < 0.0
+        scene_object.data.transform(world_matrix)
+        if negative_handedness:
+            scene_object.data.flip_normals()
+        scene_object.data.update()
+        scene_object.matrix_world = Matrix.Identity(4)
     if len(objects) == 1:
         return objects[0]
 
@@ -679,6 +850,21 @@ def prepare():
     """Create export-only mesh copies for Hair Tool systems in the Export collection."""
     cleanup()
 
+    # A Bridge AO preview is a disposable display cache, not an export source.
+    # Restore the untouched live Hair Tool systems before discovering outputs.
+    try:
+        from hair_tool_unreal_bridge import deformer_sync
+
+        preview_objects = [
+            scene_object
+            for scene_object in bpy.data.objects
+            if scene_object.get(deformer_sync.COMBINED_PREVIEW_PROPERTY)
+        ]
+        for preview_object in preview_objects:
+            deformer_sync.remove_combined_ao_preview(preview_object)
+    except ImportError:
+        pass
+
     # The UE Groom path reads evaluated Curves directly. Only the Cards and
     # Cards + Groom modes need temporary evaluated mesh copies.
     from . import ue_groom_adapter
@@ -727,16 +913,24 @@ def prepare():
             grouped_sources.setdefault(_asset_group_key(source_object), []).append(source_object)
 
         for asset_parent, asset_sources in grouped_sources.items():
+            ao_configuration = _asset_ao_configuration(asset_parent)
             parts = []
             for source_object in asset_sources:
-                source_parts = _evaluated_mesh_objects(source_object, state)
+                source_parts = _evaluated_mesh_objects(
+                    source_object,
+                    state,
+                    include_system_ao=(
+                        ao_configuration['evaluation_mode'] == 'PER_SYSTEM'
+                    ),
+                    ao_settings=ao_configuration,
+                )
                 parts.extend(source_parts)
 
             if not parts:
                 continue
 
-            # Joining before AO is intentional: nearby cards and all Hair Tool
-            # systems in the final asset must occlude each other.
+            # Only actually generated card meshes are joined. AO evaluation
+            # order is the explicit per-asset mode stored on the export Empty.
             temporary_object = _join_objects(parts)
             asset_name = asset_parent.name if asset_parent != asset_sources[0] else asset_sources[0].name
             temporary_object.name = f'{asset_name}__S2U_HAIR'
@@ -757,7 +951,17 @@ def prepare():
                 )
                 temporary_object.matrix_world = world_matrix
 
-            _evaluate_combined_ao(temporary_object, state)
+            if ao_configuration['evaluation_mode'] == 'COMBINED':
+                _evaluate_combined_ao(
+                    temporary_object,
+                    state,
+                    ao_settings=ao_configuration,
+                )
+            else:
+                _preserve_per_system_ao(temporary_object, state)
+            temporary_object['_htue_ao_evaluation_mode'] = ao_configuration[
+                'evaluation_mode'
+            ]
             _write_hair_tool_uvs(temporary_object.data)
             _pack_rfaos(temporary_object.data)
             _remove_empty_material_slots(temporary_object)
