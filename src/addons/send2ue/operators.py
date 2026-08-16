@@ -186,6 +186,11 @@ class Send2Ue(bpy.types.Operator):
         # restore the previous state of the scene and its objects
         utilities.set_context(self.state.get('context', {}))
 
+        # The captured context can contain the hidden-source state of an AO
+        # display preview. Rebuild that disposable preview only after context
+        # restoration so live Hair Tool sources never remain hidden by mistake.
+        hair_tool_export.restore_bridge_previews()
+
 
 class SettingsDialog(bpy.types.Operator, dialog.Send2UnrealDialog):
     """Open the settings dialog to modify the tool properties"""
