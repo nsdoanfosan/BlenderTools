@@ -1,5 +1,6 @@
 # Copyright Epic Games, Inc. All Rights Reserved.
 
+import json
 import math
 
 import bpy
@@ -9,6 +10,7 @@ from ..constants import BlenderTypes, ToolInfo
 
 
 STATE_KEY = 'send2ue_hair_tool_export_state'
+PREVIEW_RESTORE_KEY = 'send2ue_hair_tool_preview_restore_state'
 SOURCE_NAME_PROPERTY = '_send2ue_hair_tool_source_name'
 TEMP_PROPERTY = '_send2ue_hair_tool_temp'
 RFAOS_NAME = 'RFAOS'
@@ -901,13 +903,39 @@ def prepare():
     try:
         from hair_tool_unreal_bridge import deformer_sync
 
+        bpy.app.driver_namespace.pop(PREVIEW_RESTORE_KEY, None)
         preview_objects = [
             scene_object
             for scene_object in bpy.data.objects
             if scene_object.get(deformer_sync.COMBINED_PREVIEW_PROPERTY)
         ]
+        preview_restore_states = []
         for preview_object in preview_objects:
+            try:
+                source_states = json.loads(
+                    str(
+                        preview_object.get(
+                            deformer_sync.COMBINED_PREVIEW_SOURCES_PROPERTY,
+                            "[]",
+                        )
+                    )
+                )
+            except (TypeError, ValueError):
+                source_states = []
+            preview_restore_states.append(
+                {
+                    'root_name': str(
+                        preview_object.get(
+                            deformer_sync.COMBINED_PREVIEW_ROOT_PROPERTY,
+                            '',
+                        )
+                    ),
+                    'source_states': source_states,
+                }
+            )
             deformer_sync.remove_combined_ao_preview(preview_object)
+        if preview_restore_states:
+            bpy.app.driver_namespace[PREVIEW_RESTORE_KEY] = preview_restore_states
     except ImportError:
         pass
 
@@ -1060,6 +1088,41 @@ def cleanup():
         mesh = bpy.data.meshes.get(mesh_name)
         if mesh and mesh.users == 0:
             bpy.data.meshes.remove(mesh)
+
+
+def restore_bridge_previews():
+    """Rebuild display previews after Send2UE restores its captured context."""
+    preview_states = bpy.app.driver_namespace.pop(PREVIEW_RESTORE_KEY, None)
+    if not preview_states:
+        return []
+    try:
+        from hair_tool_unreal_bridge import deformer_sync
+    except ImportError:
+        return []
+
+    restored = []
+    for preview_state in preview_states:
+        root = bpy.data.objects.get(preview_state.get('root_name', ''))
+        if root is None:
+            continue
+        for source_state in preview_state.get('source_states', []):
+            if isinstance(source_state, str):
+                source_state = {'name': source_state}
+            source = bpy.data.objects.get(str(source_state.get('name', '')))
+            if source is None:
+                continue
+            source.hide_set(bool(source_state.get('hidden', False)))
+            source.hide_render = bool(source_state.get('hide_render', False))
+        bpy.context.view_layer.update()
+        try:
+            result = deformer_sync.build_combined_ao_preview(None, root)
+            restored.append(result['preview'].name)
+        except Exception as error:
+            _warn(
+                f'Could not restore the AO preview for "{root.name}": {error}. '
+                'The live Hair Tool sources remain available.'
+            )
+    return restored
 
 
 def get_asset_source_name(mesh_object):
