@@ -29,6 +29,7 @@ AO_MODIFIER_SETTING_IDS = {
     'second_bounce_factor': 'Input_15',
     'use_custom_normals': 'Socket_0',
 }
+COMBINED_MAX_RAY_DISTANCE_DEFAULT = 0.011
 
 
 def _warn(message):
@@ -449,6 +450,38 @@ def _apply_ao_modifier_settings(modifier, ao_settings):
             modifier[identifier] = ao_settings[field]
 
 
+def _combined_ao_node_group(source_group, ao_settings=None):
+    """Copy HT_Mesh_AO and set its unlinked ray-distance inputs safely."""
+    maximum_distance = float(
+        (ao_settings or {}).get(
+            'combined_max_ray_distance',
+            COMBINED_MAX_RAY_DISTANCE_DEFAULT,
+        )
+    )
+    temporary_group = source_group.copy()
+    temporary_group.name = '__S2U_HT_Mesh_AO'
+    adjusted_nodes = 0
+    for node in temporary_group.nodes:
+        child_group = getattr(node, 'node_tree', None)
+        if (
+            node.type != 'GROUP'
+            or child_group is None
+            or not child_group.name.startswith('AO_With_Bounces')
+        ):
+            continue
+        ray_distance = node.inputs.get('Max Ray Dist')
+        if ray_distance is None or ray_distance.is_linked:
+            continue
+        ray_distance.default_value = maximum_distance
+        adjusted_nodes += 1
+    if adjusted_nodes == 0:
+        _warn(
+            'The temporary HT_Mesh_AO copy has no adjustable '
+            'AO_With_Bounces Max Ray Dist inputs.'
+        )
+    return temporary_group
+
+
 def _evaluate_combined_ao(scene_object, state, ao_settings=None):
     """Evaluate Hair Tool AO once on the final, joined export geometry."""
     node_group = bpy.data.node_groups.get('HT_Mesh_AO')
@@ -471,6 +504,7 @@ def _evaluate_combined_ao(scene_object, state, ao_settings=None):
     world_mesh = None
     evaluated_mesh = None
     modifier = None
+    temporary_node_group = None
 
     try:
         # The input is already one realized mesh containing every final Hair
@@ -484,8 +518,9 @@ def _evaluate_combined_ao(scene_object, state, ao_settings=None):
         scene_object.data = world_mesh
         scene_object.matrix_world = Matrix.Identity(4)
 
+        temporary_node_group = _combined_ao_node_group(node_group, ao_settings)
         modifier = scene_object.modifiers.new(name='__S2U_HAIR_AO', type='NODES')
-        modifier.node_group = node_group
+        modifier.node_group = temporary_node_group
         _apply_ao_modifier_settings(modifier, ao_settings)
         if 'Input_7' in modifier:
             modifier['Input_7'] = 'AO'
@@ -553,6 +588,8 @@ def _evaluate_combined_ao(scene_object, state, ao_settings=None):
         evaluated_mesh.transform(original_world_matrix.inverted_safe())
         scene_object.modifiers.remove(modifier)
         modifier = None
+        bpy.data.node_groups.remove(temporary_node_group)
+        temporary_node_group = None
         scene_object.data = evaluated_mesh
         scene_object.matrix_world = original_world_matrix
         state.setdefault('ao_stats', {})[scene_object.name] = {
@@ -573,6 +610,8 @@ def _evaluate_combined_ao(scene_object, state, ao_settings=None):
     except Exception as error:
         if modifier and modifier.name in scene_object.modifiers:
             scene_object.modifiers.remove(modifier)
+        if temporary_node_group and temporary_node_group.users == 0:
+            bpy.data.node_groups.remove(temporary_node_group)
         scene_object.data = original_mesh
         scene_object.matrix_world = original_world_matrix
         for mesh in (evaluated_mesh, world_mesh):
@@ -768,6 +807,13 @@ def _asset_ao_configuration(asset_parent):
         return {'evaluation_mode': 'PER_SYSTEM'}
     return {
         'evaluation_mode': str(settings.evaluation_mode),
+        'combined_max_ray_distance': float(
+            getattr(
+                settings,
+                'combined_max_ray_distance',
+                COMBINED_MAX_RAY_DISTANCE_DEFAULT,
+            )
+        ),
         **{
             field: getattr(settings, field)
             for field in AO_MODIFIER_SETTING_IDS

@@ -15,6 +15,28 @@ def close(actual, expected, tolerance=1.0e-6):
     assert math.isclose(actual, expected, abs_tol=tolerance), (actual, expected)
 
 
+# Combined mode changes only a disposable copy of the Hair Tool AO group.
+ao_child = bpy.data.node_groups.new("AO_With_Bounces_SMOKE", "ShaderNodeTree")
+ao_child.interface.new_socket(
+    name="Max Ray Dist",
+    in_out="INPUT",
+    socket_type="NodeSocketFloat",
+)
+ao_parent = bpy.data.node_groups.new("HT_Mesh_AO_SMOKE", "ShaderNodeTree")
+ao_node = ao_parent.nodes.new("ShaderNodeGroup")
+ao_node.node_tree = ao_child
+ao_node.inputs["Max Ray Dist"].default_value = 50.0
+ao_copy = hair_tool_export._combined_ao_node_group(
+    ao_parent,
+    {"combined_max_ray_distance": 0.011},
+)
+close(ao_parent.nodes[0].inputs["Max Ray Dist"].default_value, 50.0)
+close(ao_copy.nodes[0].inputs["Max Ray Dist"].default_value, 0.011)
+bpy.data.node_groups.remove(ao_copy)
+bpy.data.node_groups.remove(ao_parent)
+bpy.data.node_groups.remove(ao_child)
+
+
 mesh = bpy.data.meshes.new("HTUE_RGB_PAYLOAD_SMOKE")
 mesh.from_pydata(
     [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)],
