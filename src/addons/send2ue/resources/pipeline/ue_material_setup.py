@@ -1760,6 +1760,80 @@ def _entry_reuses_material_instance_unchanged(entry: dict, preset: dict) -> bool
     return True
 
 
+def _material_instance_has_empty_background_layer(mi, entry: dict, preset: dict) -> bool:
+    """Return True only for a provably uninitialized material-layer MI.
+
+    Existing material instances remain assignment-only by default.  A generated
+    tree MI whose background layer is empty is the narrow exception: preserving
+    it unchanged leaves a gray/black material even when the sidecar contains a
+    complete MYI texture contract.  Non-empty artist layers are never replaced
+    by this implicit repair.
+    """
+    if mi is None or preset.get("assignment") != "material_layer_instance":
+        return False
+    material_layer = entry.get("material_layer")
+    if not isinstance(material_layer, dict):
+        return False
+    declared_textures = [
+        texture
+        for layer in (entry.get("layers") or [])
+        for texture in (layer.get("textures") or [])
+        if texture.get("file") or texture.get("asset_name")
+    ]
+    if not declared_textures:
+        declared_textures = [
+            texture
+            for texture in (entry.get("textures") or [])
+            if texture.get("file") or texture.get("asset_name")
+        ]
+    if not declared_textures:
+        return False
+    desired_layer = str(
+        material_layer.get("instance_path")
+        or _layer_instance_path(
+            _material_instance_base_name(str(entry.get("name") or "")),
+            preset,
+            entry,
+        )
+        or ""
+    ).split(".")[0]
+    if not desired_layer:
+        return False
+    helper = getattr(unreal, "CodexMaterialToolsLibrary", None)
+    if helper is None or not hasattr(helper, "dump_material_layers"):
+        return False
+    try:
+        result = helper.dump_material_layers(mi.get_path_name())
+    except Exception:
+        return False
+    report_text = ""
+    ok = False
+    if isinstance(result, tuple):
+        if result and isinstance(result[0], bool):
+            ok = bool(result[0])
+            report_text = str(result[1] if len(result) > 1 else "")
+        elif result and isinstance(result[0], str):
+            report_text = str(result[0])
+            ok = True
+    elif isinstance(result, str):
+        report_text = result
+        ok = True
+    try:
+        report = json.loads(report_text) if report_text else {}
+    except Exception:
+        return False
+    if not bool(report.get("ok", ok)):
+        return False
+    layers = list(report.get("layers") or [])
+    if not report.get("has_layers") or not layers:
+        return True
+    background = next(
+        (row for row in layers if int(row.get("index", -1)) == 0),
+        layers[0],
+    )
+    return not str(background.get("path") or "").strip()
+
+
 def _entry_instance_profile(entry: dict) -> str:
     profile = str(entry.get("instance_profile") or "").strip()
     if not profile:
@@ -2658,26 +2732,11 @@ def _normalize_skeletal_material_slots(mesh, assignments: dict) -> bool:
                 break
     materials_changed = not unchanged
     section_remap = _complete_skeletal_section_remap(material_entries, ordered)
-    # When the FBX contains duplicate material sections for the same canonical
-    # sidecar slots, keep the imported section index domain intact.  Replacing
-    # four entries with two forces a destructive render-section rebuild; the
-    # equivalent and safer result is to assign each duplicate entry the
-    # canonical slot material while preserving indices 0..N.
-    preserve_section_domain = (
-        len(material_entries) > len(ordered)
-        and len(section_remap) == len(material_entries)
-    )
-    if preserve_section_domain:
-        canonical_by_old = dict(section_remap)
-        expanded_entries = []
-        for old_index, old_entry in enumerate(material_entries):
-            new_index = canonical_by_old[old_index]
-            _source_index, slot_name, material = ordered[new_index]
-            expanded_entries.append(
-                _new_skeletal_material_entry(slot_name, material, old_entry)
-            )
-        mesh.set_editor_property("materials", expanded_entries)
-        return True
+    # The sidecar is the canonical slot domain.  Reimport can append duplicate
+    # FBX slots, and retaining those indices makes every later Assembly build
+    # treat the drift as authored data.  Compact first, then remap every proven
+    # imported section through the editor helper so repeated reimports are
+    # idempotent instead of accumulating aliases.
     if materials_changed:
         new_entries = []
         for old_index, slot_name, material in ordered:
@@ -2797,7 +2856,10 @@ def _tree_texture_param_allowed(param: str, preset: dict = None) -> bool:
     param = str(param or "").strip().casefold()
     if param == "transmission":
         return False
-    if param == "subsurface" and preset.get("tree_shading") == "wood":
+    if (
+        preset.get("tree_shading") == "wood"
+        and param in {"alpha", "opacity", "opacity map", "subsurface"}
+    ):
         return False
     return True
 
@@ -4181,15 +4243,18 @@ def _material_pipeline_mutation_paths(mesh_path: str, data: dict) -> list:
             mi_folder = str(preset.get("mi_folder") or "").rstrip("/")
             if mat_base and mi_folder:
                 target_path = f"{mi_folder}/MI_{mat_base}"
-        if (
-            target_path
-            and _entry_reuses_material_instance_unchanged(entry, preset)
-            and (
-                unreal.EditorAssetLibrary.does_asset_exist(target_path)
-                or not _entry_create_if_missing(entry, preset)
+        if target_path and _entry_reuses_material_instance_unchanged(entry, preset):
+            target_exists = unreal.EditorAssetLibrary.does_asset_exist(target_path)
+            target_asset = unreal.load_asset(target_path) if target_exists else None
+            needs_empty_layer_repair = _material_instance_has_empty_background_layer(
+                target_asset,
+                entry,
+                preset,
             )
-        ):
-            continue
+            if not needs_empty_layer_repair and (
+                target_exists or not _entry_create_if_missing(entry, preset)
+            ):
+                continue
 
         master_path = str(preset.get("master") or "").split(".")[0]
         if master_path:
@@ -4560,9 +4625,15 @@ def process_mesh(
         if target_material_path:
             copy_from_path = _entry_copy_source_material_path(entry)
             existing_mi = _load_exact_material_instance(target_material_path)
+            initialize_empty_layer = _material_instance_has_empty_background_layer(
+                existing_mi,
+                entry,
+                preset,
+            )
             reuse_unchanged = bool(
                 existing_mi is not None
                 and _entry_reuses_material_instance_unchanged(entry, preset)
+                and not initialize_empty_layer
             )
             if reuse_unchanged:
                 mi = existing_mi
@@ -4639,9 +4710,19 @@ def process_mesh(
         existing_unchanged = None
         if not manage_existing:
             existing_unchanged = _load_exact_material_instance(generated_mi_path)
+        initialize_empty_layer = _material_instance_has_empty_background_layer(
+            existing_unchanged,
+            entry,
+            preset,
+        )
+        if initialize_empty_layer:
+            _log(
+                f"  existing MI has an empty background layer; initializing: "
+                f"{generated_mi_path}"
+            )
         selected_master = (
             None
-            if existing_unchanged is not None
+            if existing_unchanged is not None and not initialize_empty_layer
             else master_mat or _load_master_material(preset)
         )
 
@@ -4655,7 +4736,7 @@ def process_mesh(
         layer_maps = None
 
         # 2. MI 생성/로드
-        if existing_unchanged is not None:
+        if existing_unchanged is not None and not initialize_empty_layer:
             mi = existing_unchanged
             mi_path = generated_mi_path
             mi_created = False
@@ -4667,7 +4748,7 @@ def process_mesh(
                 selected_master,
                 mat_base,
                 preset["mi_folder"],
-                manage_existing=manage_existing,
+                manage_existing=(manage_existing or initialize_empty_layer),
             )
         if mi is None:
             profile_target = instance_profile_targets.get(entry_index)
@@ -4686,7 +4767,11 @@ def process_mesh(
         # 3. An exact existing MI wins by default. Texture discovery and managed
         # override mutation only apply to a newly created/copied MI, or to an
         # existing MI whose contract explicitly declares pipeline ownership.
-        reuse_unchanged = bool(mi_source == "existing" and not manage_existing)
+        reuse_unchanged = bool(
+            mi_source == "existing"
+            and not manage_existing
+            and not initialize_empty_layer
+        )
         params_changed = False
         if reuse_unchanged:
             _log(f"  existing MI reused unchanged: {mi_path}")
