@@ -1552,6 +1552,10 @@ class TestUeMaterialTextureImport(unittest.TestCase):
             self.assertFalse(
                 self.module._tree_texture_param_allowed("Transmission", preset)
             )
+            wood_preset = dict(preset, tree_shading="wood")
+            self.assertFalse(
+                self.module._tree_texture_param_allowed("Opacity Map", wood_preset)
+            )
         finally:
             self.module._SPEEDTREE_HANDOFF_API = cached_api
 
@@ -2036,6 +2040,121 @@ class TestRuntimeTolerantMaterialProcess(unittest.TestCase):
         self.assertEqual(self.runtime.import_tasks, [])
         self.assertNotIn(target_path, self.runtime.save_calls)
 
+    def test_empty_background_generated_mi_is_initialized_from_sidecar(self):
+        target_path = "/Game/Material/MI/MI_Test"
+        master_path = "/Game/Material/M_Master"
+        existing = FakeMaterialInstanceConstant(target_path)
+        master = FakeMaterialInstanceConstant(master_path)
+        self.runtime.assets[target_path] = existing
+        self.runtime.assets[master_path] = master
+
+        class Helper:
+            @staticmethod
+            def dump_material_layers(_material_path):
+                return True, json.dumps(
+                    {
+                        "ok": True,
+                        "has_layers": True,
+                        "layers": [{"index": 0, "path": ""}],
+                    }
+                )
+
+        self.runtime.unreal_module.CodexMaterialToolsLibrary = Helper()
+        data = {
+            "mesh_name": "SM_Test",
+            "materials": [
+                {
+                    "name": "M_Test",
+                    "slot_index": 0,
+                    "layers": [
+                        {
+                            "name": "Base",
+                            "index": 0,
+                            "textures": [
+                                {
+                                    "param": "Albedo",
+                                    "asset_name": "T_Test_color",
+                                }
+                            ],
+                        }
+                    ],
+                    "material_layer": {
+                        "instance_path": "/Game/Material/MYI/MYI_Test",
+                    },
+                }
+            ],
+        }
+        preset = {
+            "key": "tree",
+            "master": master_path,
+            "mi_folder": "/Game/Material/MI",
+            "assignment": "material_layer_instance",
+            "layer_parent": "/Game/Material/MY_Parent",
+            "layer_instance_folder": "/Game/Material/MYI",
+            "virtual_textures": True,
+        }
+        self.configure_process(data, preset)
+        assigned = []
+        self.module._assign_master_textures = (
+            lambda mi, *args, **kwargs: assigned.append(mi) or True
+        )
+
+        changed = self.module.process_mesh(self.mesh_path)
+
+        self.assertTrue(changed)
+        self.assertEqual(assigned, [existing])
+        self.assertIs(existing.parent, master)
+        self.assertEqual(self.assignments[0][1], existing)
+
+    def test_nonempty_artist_background_remains_assignment_only(self):
+        existing = FakeMaterialInstanceConstant("/Game/Material/MI/MI_Test")
+
+        class Helper:
+            @staticmethod
+            def dump_material_layers(_material_path):
+                return True, json.dumps(
+                    {
+                        "ok": True,
+                        "has_layers": True,
+                        "layers": [
+                            {
+                                "index": 0,
+                                "path": "/Game/User/MYI/MYI_ArtistLayer.MYI_ArtistLayer",
+                            }
+                        ],
+                    }
+                )
+
+        self.runtime.unreal_module.CodexMaterialToolsLibrary = Helper()
+        entry = {
+            "name": "M_Test",
+            "layers": [
+                {
+                    "textures": [
+                        {
+                            "param": "Albedo",
+                            "asset_name": "T_Test_color",
+                        }
+                    ]
+                }
+            ],
+            "material_layer": {
+                "instance_path": "/Game/Material/MYI/MYI_Test",
+            },
+        }
+        preset = {
+            "assignment": "material_layer_instance",
+            "layer_instance_folder": "/Game/Material/MYI",
+        }
+
+        self.assertFalse(
+            self.module._material_instance_has_empty_background_layer(
+                existing,
+                entry,
+                preset,
+            )
+        )
+
     def test_existing_generated_mi_removes_material_layer_preflight_gate(self):
         target_path = "/Game/Material/MI/MI_Test"
         self.runtime.assets[target_path] = FakeMaterialInstanceConstant(target_path)
@@ -2275,14 +2394,22 @@ class TestSkeletalMaterialSectionRemap(unittest.TestCase):
         )
 
         self.assertTrue(changed)
-        self.assertEqual(self.calls, [])
-        self.assertEqual(len(mesh.materials), 4)
+        self.assertEqual(
+            self.calls,
+            [{
+                "slot_count": 2,
+                "old": [0, 1, 2, 3],
+                "new": [0, 1, 0, 1],
+                "apply": True,
+            }],
+        )
+        self.assertEqual(len(mesh.materials), 2)
         self.assertEqual(
             [
                 str(entry.get_editor_property("material_slot_name"))
                 for entry in mesh.materials
             ],
-            ["M_Branch", "M_Bark", "M_Branch", "M_Bark"],
+            ["M_Branch", "M_Bark"],
         )
 
     def test_stale_species_slots_map_by_unambiguous_tree_part(self):
@@ -2306,18 +2433,21 @@ class TestSkeletalMaterialSectionRemap(unittest.TestCase):
         )
 
         self.assertTrue(changed)
-        self.assertEqual(self.calls, [])
+        self.assertEqual(
+            self.calls,
+            [{
+                "slot_count": 2,
+                "old": [0, 1, 2, 3],
+                "new": [0, 1, 0, 0],
+                "apply": True,
+            }],
+        )
         self.assertEqual(
             [
                 str(entry.get_editor_property("material_slot_name"))
                 for entry in mesh.materials
             ],
-            [
-                "M_Branch_black_locast_01",
-                "M_bark_black_locast_02",
-                "M_Branch_black_locast_01",
-                "M_Branch_black_locast_01",
-            ],
+            ["M_Branch_black_locast_01", "M_bark_black_locast_02"],
         )
 
 
