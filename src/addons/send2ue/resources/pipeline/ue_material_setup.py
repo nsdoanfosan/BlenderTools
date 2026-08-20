@@ -348,9 +348,11 @@ TEXTURE_PARAM_BY_NAME_SUFFIX = (
 # Virtual Texture Streaming을 쓰므로 모든 텍스처의 인게임 최대 해상도는 제한하지 않는다.
 DEFAULT_MAX_TEXTURE_SIZE = 0
 ENABLE_VIRTUAL_TEXTURE_STREAMING = True
+OPACITY_ALPHA_COVERAGE_THRESHOLD = 0.3333
 # import 되는 StaticMesh 를 자동으로 Nanite 로 등록할지(반투명 머티리얼 메쉬는 자동 제외).
 ENABLE_NANITE = True
 ENABLE_SKELETAL_NANITE_VOXELIZE = True
+ENABLE_HAIR_NANITE_VOXEL_OPACITY = True
 DYNAMIC_WIND_JSON_SUFFIX = "_dynamic_wind_import_from_megaplant_groups.json"
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -610,12 +612,39 @@ def _validate_speedtree_handoff_contract(
     return descriptor
 
 
+def _vector4_components(value):
+    if isinstance(value, (list, tuple)) and len(value) == 4:
+        return tuple(float(component) for component in value)
+    components = []
+    for property_name in ("x", "y", "z", "w"):
+        try:
+            component = getattr(value, property_name)
+        except Exception:
+            try:
+                component = value.get_editor_property(property_name)
+            except Exception:
+                return None
+        components.append(float(component))
+    return tuple(components)
+
+
+def _editor_values_match(current, expected) -> bool:
+    current_vector = _vector4_components(current)
+    expected_vector = _vector4_components(expected)
+    if current_vector is not None and expected_vector is not None:
+        return all(
+            abs(actual - wanted) <= 1.0e-6
+            for actual, wanted in zip(current_vector, expected_vector)
+        )
+    return current == expected
+
+
 def _set_texture_property_if_changed(tex, property_name: str, value) -> bool:
     try:
         current = tex.get_editor_property(property_name)
     except Exception:
         return False
-    if current == value:
+    if _editor_values_match(current, value):
         return False
     tex.set_editor_property(property_name, value)
     return True
@@ -747,7 +776,7 @@ def _desired_texture_settings(
         srgb = True
         compression = unreal.TextureCompressionSettings.TC_DEFAULT
 
-    return {
+    settings = {
         "srgb": srgb,
         "compression_settings": compression,
         "max_texture_size": DEFAULT_MAX_TEXTURE_SIZE,
@@ -760,6 +789,30 @@ def _desired_texture_settings(
             else bool(ENABLE_VIRTUAL_TEXTURE_STREAMING)
         ),
     }
+    if param in {"Opacity", "Opacity Map", "Alpha"}:
+        vector_type = getattr(unreal, "Vector4", None)
+        if vector_type is not None:
+            alpha_thresholds = vector_type(
+                OPACITY_ALPHA_COVERAGE_THRESHOLD,
+                0.0,
+                0.0,
+                0.0,
+            )
+        else:
+            # Unit-test and older Python-wrapper fallback. UE 5.8 exposes Vector4.
+            alpha_thresholds = (
+                OPACITY_ALPHA_COVERAGE_THRESHOLD,
+                0.0,
+                0.0,
+                0.0,
+            )
+        settings.update(
+            {
+                "do_scale_mips_for_alpha_coverage": True,
+                "alpha_coverage_thresholds": alpha_thresholds,
+            }
+        )
+    return settings
 
 
 def _texture_settings_match(tex, settings: dict) -> bool:
@@ -772,7 +825,7 @@ def _texture_settings_match(tex, settings: dict) -> bool:
             return False
         if property_name in {"srgb", "virtual_texture_streaming"}:
             current = bool(current)
-        if current != expected:
+        if not _editor_values_match(current, expected):
             return False
     return True
 
@@ -814,6 +867,17 @@ def _configure_imported_texture(
         else:
             tex.set_editor_property("virtual_texture_streaming", virtual_texture_streaming)
         changed = True
+
+    for property_name in (
+        "do_scale_mips_for_alpha_coverage",
+        "alpha_coverage_thresholds",
+    ):
+        if property_name in settings:
+            changed |= _set_texture_property_if_changed(
+                tex,
+                property_name,
+                settings[property_name],
+            )
 
     return changed
 
@@ -1351,7 +1415,30 @@ def _notify_nanite_settings_changed(mesh):
                 pass
 
 
-def _set_nanite(mesh, enabled: bool, shape_preservation=None) -> bool:
+def _set_nanite_bool(nanite, property_name: str, value) -> bool:
+    if value is None:
+        return False
+    value = bool(value)
+    try:
+        if bool(nanite.get_editor_property(property_name)) == value:
+            return False
+    except Exception:
+        pass
+    try:
+        nanite.set_editor_property(property_name, value)
+        return True
+    except Exception as exc:
+        _warn(f"  Nanite {property_name} set failed: {exc}")
+        return False
+
+
+def _set_nanite(
+    mesh,
+    enabled: bool,
+    shape_preservation=None,
+    voxel_ndf=None,
+    voxel_opacity=None,
+) -> bool:
     """Set mesh Nanite settings. Returns True when any value changed."""
     nanite = mesh.get_editor_property("nanite_settings")
     changed = False
@@ -1360,12 +1447,19 @@ def _set_nanite(mesh, enabled: bool, shape_preservation=None) -> bool:
         changed = True
     if enabled:
         changed = _set_nanite_shape_preservation(nanite, shape_preservation) or changed
+        changed = _set_nanite_bool(nanite, "voxel_ndf", voxel_ndf) or changed
+        changed = _set_nanite_bool(nanite, "voxel_opacity", voxel_opacity) or changed
     if not changed:
         return False
     mesh.set_editor_property("nanite_settings", nanite)
     _notify_nanite_settings_changed(mesh)
     if enabled and shape_preservation is not None:
-        _log("  Nanite enabled + Shape Preservation Voxelize")
+        detail = "  Nanite enabled + Shape Preservation Voxelize"
+        if voxel_ndf:
+            detail += " + Voxel NDF"
+        if voxel_opacity:
+            detail += " + Voxel Opacity"
+        _log(detail)
     else:
         _log("  Nanite enabled" if enabled else "  Nanite disabled")
     return True
@@ -1632,6 +1726,34 @@ def _uses_tree_material_preset(data: dict, mesh_path: str) -> bool:
         for entry in data.get("materials", [])
         if isinstance(entry, dict)
     )
+
+
+def _uses_verified_hair_uv_payload(data: dict, mesh_path: str) -> bool:
+    """True only for tagged Hair Tool v3 data whose UV payload was authored."""
+    if not isinstance(data, dict):
+        return False
+    mesh_name = str(mesh_path or "").rsplit("/", 1)[-1].casefold()
+    if "eyelash" in mesh_name or mesh_name.endswith("_lash"):
+        return False
+    for entry in data.get("materials", []):
+        if not isinstance(entry, dict):
+            continue
+        preset = _master_preset(data, entry, mesh_path)
+        if preset.get("key") != "hair":
+            continue
+        hair_tool = entry.get("hair_tool")
+        if not isinstance(hair_tool, dict):
+            continue
+        payload = hair_tool.get("vertex_uv_payload")
+        if not isinstance(payload, dict):
+            continue
+        if (
+            int(payload.get("version") or 0) >= 3
+            and str(payload.get("encoding") or "").strip().upper()
+            == "HTUE_RGB_TAGGED_UV"
+        ):
+            return True
+    return False
 
 
 def _load_master_material(preset: dict):
@@ -4510,13 +4632,24 @@ def process_mesh(
         if isinstance(mesh, unreal.StaticMesh) and _set_nanite(mesh, nanite_enabled):
             save_mesh_asset()
         elif _is_skeletal_mesh(mesh):
+            uses_tree_voxelize = _uses_tree_material_preset(data, mesh_path)
+            uses_hair_voxel_opacity = (
+                ENABLE_HAIR_NANITE_VOXEL_OPACITY
+                and _uses_verified_hair_uv_payload(data, mesh_path)
+            )
             voxelize = (
                 _nanite_shape_preservation_voxelize()
                 if ENABLE_SKELETAL_NANITE_VOXELIZE
-                and _uses_tree_material_preset(data, mesh_path)
+                and (uses_tree_voxelize or uses_hair_voxel_opacity)
                 else None
             )
-            if _set_nanite(mesh, nanite_enabled, voxelize):
+            if _set_nanite(
+                mesh,
+                nanite_enabled,
+                voxelize,
+                voxel_ndf=True if uses_hair_voxel_opacity else None,
+                voxel_opacity=True if uses_hair_voxel_opacity else None,
+            ):
                 save_mesh_asset()
 
     if data is None:

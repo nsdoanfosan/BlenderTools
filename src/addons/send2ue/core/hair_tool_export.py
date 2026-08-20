@@ -11,6 +11,7 @@ from ..constants import BlenderTypes, ToolInfo
 
 STATE_KEY = 'send2ue_hair_tool_export_state'
 PREVIEW_RESTORE_KEY = 'send2ue_hair_tool_preview_restore_state'
+MATERIAL_HEIGHT_PREVIEW_RESTORE_KEY = 'send2ue_unreal_material_height_preview_restore_state'
 SOURCE_NAME_PROPERTY = '_send2ue_hair_tool_source_name'
 TEMP_PROPERTY = '_send2ue_hair_tool_temp'
 RFAOS_NAME = 'RFAOS'
@@ -947,6 +948,25 @@ def prepare():
     """Create export-only mesh copies for Hair Tool systems in the Export collection."""
     cleanup()
 
+    # M_LayerBlend height in Blender is a clearance/silhouette preview only.
+    # Send to Unreal must export the authored base mesh so Unreal applies Nanite
+    # displacement exactly once. Restore any state left by an interrupted run,
+    # then suspend every Bridge-owned height preview for this operation.
+    try:
+        from hair_tool_unreal_bridge import layerblend_preview
+
+        stale_states = bpy.app.driver_namespace.pop(
+            MATERIAL_HEIGHT_PREVIEW_RESTORE_KEY, None
+        )
+        if stale_states is not None:
+            layerblend_preview.restore_height_previews(stale_states)
+        height_preview_states = layerblend_preview.suspend_height_previews()
+        bpy.app.driver_namespace[
+            MATERIAL_HEIGHT_PREVIEW_RESTORE_KEY
+        ] = height_preview_states
+    except ImportError:
+        pass
+
     # A Bridge AO preview is a disposable display cache, not an export source.
     # Restore the untouched live Hair Tool systems before discovering outputs.
     try:
@@ -1121,16 +1141,29 @@ def cleanup():
 
 
 def restore_bridge_previews():
-    """Rebuild display previews after Send2UE restores its captured context."""
+    """Restore display-only previews after Send2UE restores its captured context."""
+    restored = []
+    height_preview_states = bpy.app.driver_namespace.pop(
+        MATERIAL_HEIGHT_PREVIEW_RESTORE_KEY, None
+    )
+    if height_preview_states is not None:
+        try:
+            from hair_tool_unreal_bridge import layerblend_preview
+
+            restored.extend(
+                layerblend_preview.restore_height_previews(height_preview_states)
+            )
+        except ImportError:
+            pass
+
     preview_states = bpy.app.driver_namespace.pop(PREVIEW_RESTORE_KEY, None)
     if not preview_states:
-        return []
+        return restored
     try:
         from hair_tool_unreal_bridge import deformer_sync
     except ImportError:
-        return []
+        return restored
 
-    restored = []
     for preview_state in preview_states:
         root = bpy.data.objects.get(preview_state.get('root_name', ''))
         if root is None:
