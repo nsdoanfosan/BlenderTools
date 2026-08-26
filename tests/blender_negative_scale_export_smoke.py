@@ -58,6 +58,26 @@ def make_cube(name):
     return scene_object
 
 
+def distinct_corner_normals(scene_object):
+    """How many unique corner normals the exporter would write.
+
+    A flat-shaded cube has 6. If a compensation approach welds them to one per
+    vertex it becomes 8, hard edges are lost, and Unreal imports 8 vertices
+    instead of 24. Set Mesh Normal in FREE mode does exactly that.
+    """
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    depsgraph.update()
+    evaluated = scene_object.evaluated_get(depsgraph)
+    mesh = evaluated.to_mesh()
+    try:
+        return len({
+            tuple(round(value, 4) for value in corner.vector)
+            for corner in mesh.corner_normals
+        })
+    finally:
+        evaluated.to_mesh_clear()
+
+
 def measure(mesh, matrix):
     """Return (winding_outward, shading_outward) means in baked world space.
 
@@ -163,10 +183,38 @@ for label, setup in (
     clear_scene()
     scene_object = setup()
     select_only(scene_object)
+    flat_normals_before = distinct_corner_normals(scene_object)
+    assert flat_normals_before == 6, (label, flat_normals_before)
     with export.compensate_negative_scale_winding():
         winding, shading = evaluated_measurement(scene_object)
+        # Hard edges must survive. Set Mesh Normal in FREE mode reports 8 here.
+        assert distinct_corner_normals(scene_object) == flat_normals_before, (
+            label,
+            "split normals were welded",
+            distinct_corner_normals(scene_object),
+        )
     assert winding == REFERENCE_WINDING, (label, "winding", winding)
     assert shading == REFERENCE_SHADING, (label, "shading", shading)
+
+# A smooth-shaded mesh keeps its per-vertex normals too.
+clear_scene()
+smooth_object = make_cube("SmoothNegativeScale")
+for polygon in smooth_object.data.polygons:
+    polygon.use_smooth = True
+smooth_object.data.update()
+smooth_object.scale = (-1.0, 1.0, 1.0)
+bpy.context.view_layer.update()
+select_only(smooth_object)
+smooth_before = distinct_corner_normals(smooth_object)
+assert smooth_before == 8, smooth_before
+with export.compensate_negative_scale_winding():
+    assert distinct_corner_normals(smooth_object) == smooth_before, (
+        "smooth normals changed",
+        distinct_corner_normals(smooth_object),
+    )
+    winding, shading = evaluated_measurement(smooth_object)
+assert winding == REFERENCE_WINDING, winding
+assert shading == REFERENCE_SHADING, shading
 
 # A Mirror modifier keeps the determinant positive and is already correct, so
 # compensation must not touch it.
@@ -192,37 +240,41 @@ original_corner_normals = [
 ]
 original_loop_order = [loop.vertex_index for loop in scene_object.data.loops]
 original_modifier_count = len(scene_object.modifiers)
+original_mesh = scene_object.data
+original_mesh_name = original_mesh.name
+original_matrix = scene_object.matrix_world.copy()
+mesh_count_before = len(bpy.data.meshes)
 select_only(scene_object)
 with export.compensate_negative_scale_winding():
-    assert len(scene_object.modifiers) == original_modifier_count + 1
-    assert any(
-        group.name.startswith("__Send2UE_FlipNegativeScaleWinding__")
-        for group in bpy.data.node_groups
-    )
+    # The object points at a temporary datablock, not the original.
+    assert scene_object.data is not original_mesh
+    assert scene_object.data.name.endswith("__Send2UE_ReversedWinding")
+    # The object transform is untouched, so sockets/LOD/collision stay valid.
+    assert scene_object.matrix_world == original_matrix
+    assert len(scene_object.modifiers) == original_modifier_count
+assert scene_object.data is original_mesh
+assert scene_object.data.name == original_mesh_name
+assert len(bpy.data.meshes) == mesh_count_before
+assert scene_object.matrix_world == original_matrix
 assert len(scene_object.modifiers) == original_modifier_count
 assert [loop.vertex_index for loop in scene_object.data.loops] == original_loop_order
 assert [
     tuple(round(value, 6) for value in corner.vector)
     for corner in scene_object.data.corner_normals
 ] == original_corner_normals
-assert not any(
-    group.name.startswith("__Send2UE_FlipNegativeScaleWinding__")
-    for group in bpy.data.node_groups
-)
 
 # Temporary state is cleaned up even when the export raises.
 clear_scene()
 scene_object = negative_object_scale()
 select_only(scene_object)
+original_mesh = scene_object.data
+mesh_count_before = len(bpy.data.meshes)
 try:
     with export.compensate_negative_scale_winding():
         raise RuntimeError("export failed")
 except RuntimeError:
     pass
-assert len(scene_object.modifiers) == 0
-assert not any(
-    group.name.startswith("__Send2UE_FlipNegativeScaleWinding__")
-    for group in bpy.data.node_groups
-)
+assert scene_object.data is original_mesh
+assert len(bpy.data.meshes) == mesh_count_before
 
 print("SEND2UE_NEGATIVE_SCALE_EXPORT_SMOKE_OK")

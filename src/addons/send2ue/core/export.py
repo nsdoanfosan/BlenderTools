@@ -51,11 +51,9 @@ def compensate_negative_scale_winding():
 
     Only the winding is wrong. FBX carries explicit normals independently of
     winding, and a mirror transforms them correctly, so the shading normals
-    survive the bake pointing outward. Flipping the faces on their own is
-    therefore not enough: ``Flip Faces`` reverses the winding *and* the normals,
-    which fixes the winding and breaks the normals instead. Measured against a
-    real Unreal 5.8.2 import of the same cube, against a baseline with no
-    negative scale:
+    survive the bake pointing outward. Reversing the winding must therefore
+    leave the normals alone. Measured against a real Unreal 5.8.2 import of the
+    same cube, against a baseline with no negative scale:
 
         baseline          winding outward -1, shading outward +1  (correct)
         no handling       winding outward +1, shading outward +1  (winding bad)
@@ -66,82 +64,75 @@ def compensate_negative_scale_winding():
     left-handed, so a right-handed ``(p1-p0) x (p2-p0)`` points inward on a
     front face.)
 
-    So capture the corner normals first, flip the faces, then write the captured
-    normals back with ``Set Mesh Normal`` in ``FREE`` mode. The result carries
-    reversed winding with the original outward normals, and the importer's bake
-    reverses the winding once more to land on the baseline.
+    Swap in a temporary mesh datablock whose winding is reversed and whose
+    corner normals are the source values, then restore the original datablock.
+    The object transform is never touched, so socket, LOD and collision logic
+    that reads transforms is unaffected, and the source mesh is never modified.
 
-    Temporary modifiers and their shared node group are removed immediately
-    after export, leaving the source objects, their mesh data, their custom
-    normals and their modifier stacks intact.
+    ``Set Mesh Normal`` in ``FREE`` mode is not usable here: measured on Blender
+    5.1.2 it collapses a flat-shaded cube from 6 distinct corner normals to 8
+    regardless of the capture domain, which welds hard edges. Unreal then
+    imported such a cube with 8 vertices instead of 24.
     """
     mirrored_objects = [
         scene_object
         for scene_object in bpy.context.selected_objects
         if scene_object.type == BlenderTypes.MESH
+        and scene_object.library is None
+        and scene_object.data is not None
         and scene_object.matrix_world.to_3x3().determinant() < 0.0
     ]
     if not mirrored_objects:
         yield
         return
 
-    node_group = None
-    modifiers = []
+    swapped = []
     try:
-        node_group = new_geometry_node_group('__Send2UE_FlipNegativeScaleWinding__')
-        group_input = node_group.nodes.new('NodeGroupInput')
-        input_normal = node_group.nodes.new('GeometryNodeInputNormal')
-        capture_normal = node_group.nodes.new('GeometryNodeCaptureAttribute')
-        capture_normal.domain = 'CORNER'
-        capture_normal.capture_items.clear()
-        capture_normal.capture_items.new('VECTOR', 'kept_normal')
-        flip_faces = node_group.nodes.new('GeometryNodeFlipFaces')
-        restore_normal = node_group.nodes.new('GeometryNodeSetMeshNormal')
-        restore_normal.mode = 'FREE'
-        group_output = node_group.nodes.new('NodeGroupOutput')
-
-        # Capture on the CORNER domain so the values travel with their corners
-        # through Flip Faces, which only reorders corners within each face.
-        node_group.links.new(
-            group_input.outputs['Geometry'],
-            capture_normal.inputs['Geometry'],
-        )
-        node_group.links.new(
-            input_normal.outputs['Normal'],
-            capture_normal.inputs['kept_normal'],
-        )
-        node_group.links.new(
-            capture_normal.outputs['Geometry'],
-            flip_faces.inputs['Mesh'],
-        )
-        node_group.links.new(
-            flip_faces.outputs['Mesh'],
-            restore_normal.inputs['Mesh'],
-        )
-        node_group.links.new(
-            capture_normal.outputs['kept_normal'],
-            restore_normal.inputs['Custom Normal'],
-        )
-        node_group.links.new(
-            restore_normal.outputs['Mesh'],
-            group_output.inputs['Geometry'],
-        )
-
         for scene_object in mirrored_objects:
-            modifier = scene_object.modifiers.new(
-                name='__Send2UE_FlipNegativeScaleWinding__',
-                type='NODES',
-            )
-            modifier.node_group = node_group
-            modifiers.append((scene_object, modifier))
+            original_mesh = scene_object.data
+            temporary_mesh = reversed_winding_mesh_copy(original_mesh)
+            if temporary_mesh is None:
+                continue
+            scene_object.data = temporary_mesh
+            swapped.append((scene_object, original_mesh, temporary_mesh))
         bpy.context.view_layer.update()
         yield
     finally:
-        for scene_object, modifier in modifiers:
-            scene_object.modifiers.remove(modifier)
-        if node_group is not None:
-            bpy.data.node_groups.remove(node_group)
+        for scene_object, original_mesh, temporary_mesh in swapped:
+            scene_object.data = original_mesh
+            bpy.data.meshes.remove(temporary_mesh)
         bpy.context.view_layer.update()
+
+
+def reversed_winding_mesh_copy(mesh):
+    """
+    Copies a mesh with reversed face winding but the original corner normals.
+
+    :param bpy.types.Mesh mesh: The source mesh to copy.
+    :return bpy.types.Mesh: The temporary copy, or None when there is nothing to
+        reverse.
+    """
+    if not mesh.polygons:
+        return None
+
+    original_normals = [tuple(corner.vector) for corner in mesh.corner_normals]
+
+    temporary_mesh = mesh.copy()
+    temporary_mesh.name = f'{mesh.name}__Send2UE_ReversedWinding'
+    temporary_mesh.flip_normals()
+    temporary_mesh.update()
+
+    # flip_normals reverses the corner order within each face, so the captured
+    # values have to follow their corners rather than their indices.
+    remapped = [None] * len(temporary_mesh.loops)
+    for polygon in temporary_mesh.polygons:
+        loop_indices = list(polygon.loop_indices)
+        count = len(loop_indices)
+        for position, loop_index in enumerate(loop_indices):
+            source_index = loop_indices[(count - position) % count]
+            remapped[loop_index] = original_normals[source_index]
+    temporary_mesh.normals_split_custom_set(remapped)
+    return temporary_mesh
 
 
 @contextmanager
