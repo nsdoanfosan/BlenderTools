@@ -1886,29 +1886,16 @@ def _material_instance_has_empty_background_layer(mi, entry: dict, preset: dict)
     """Return True only for a provably uninitialized material-layer MI.
 
     Existing material instances remain assignment-only by default.  A generated
-    tree MI whose background layer is empty is the narrow exception: preserving
-    it unchanged leaves a gray/black material even when the sidecar contains a
-    complete MYI texture contract.  Non-empty artist layers are never replaced
-    by this implicit repair.
+    material-layer MI whose background layer is empty is the narrow exception:
+    preserving it unchanged skips the required MYI creation/assignment.  The
+    MYI is structural and must be restored even when every texture is absent;
+    its parameters then remain empty by design.  Non-empty artist layers are
+    never replaced by this implicit repair.
     """
     if mi is None or preset.get("assignment") != "material_layer_instance":
         return False
     material_layer = entry.get("material_layer")
     if not isinstance(material_layer, dict):
-        return False
-    declared_textures = [
-        texture
-        for layer in (entry.get("layers") or [])
-        for texture in (layer.get("textures") or [])
-        if texture.get("file") or texture.get("asset_name")
-    ]
-    if not declared_textures:
-        declared_textures = [
-            texture
-            for texture in (entry.get("textures") or [])
-            if texture.get("file") or texture.get("asset_name")
-        ]
-    if not declared_textures:
         return False
     desired_layer = str(
         material_layer.get("instance_path")

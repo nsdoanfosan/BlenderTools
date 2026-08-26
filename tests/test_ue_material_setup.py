@@ -2254,6 +2254,59 @@ class TestRuntimeTolerantMaterialProcess(unittest.TestCase):
         self.assertIs(existing.parent, master)
         self.assertEqual(self.assignments[0][1], existing)
 
+    def test_empty_background_generated_mi_is_initialized_without_textures(self):
+        target_path = "/Game/Material/MI/MI_Test"
+        master_path = "/Game/Material/M_Master"
+        existing = FakeMaterialInstanceConstant(target_path)
+        master = FakeMaterialInstanceConstant(master_path)
+        self.runtime.assets[target_path] = existing
+        self.runtime.assets[master_path] = master
+
+        class Helper:
+            @staticmethod
+            def dump_material_layers(_material_path):
+                return True, json.dumps(
+                    {
+                        "ok": True,
+                        "has_layers": True,
+                        "layers": [{"index": 0, "path": ""}],
+                    }
+                )
+
+        self.runtime.unreal_module.CodexMaterialToolsLibrary = Helper()
+        data = {
+            "mesh_name": "SM_Test",
+            "materials": [
+                {
+                    "name": "M_Test",
+                    "slot_index": 0,
+                    "material_layer": {
+                        "instance_path": "/Game/Material/MYI/MYI_Test",
+                    },
+                }
+            ],
+        }
+        preset = {
+            "key": "layer",
+            "master": master_path,
+            "mi_folder": "/Game/Material/MI",
+            "assignment": "material_layer_instance",
+            "layer_parent": "/Game/Material/MY_Parent",
+            "layer_instance_folder": "/Game/Material/MYI",
+            "virtual_textures": True,
+        }
+        self.configure_process(data, preset)
+        assigned = []
+        self.module._assign_master_textures = (
+            lambda mi, *args, **kwargs: assigned.append(mi) or True
+        )
+
+        changed = self.module.process_mesh(self.mesh_path)
+
+        self.assertTrue(changed)
+        self.assertEqual(assigned, [existing])
+        self.assertEqual(self.assignments[0][1], existing)
+
     def test_nonempty_artist_background_remains_assignment_only(self):
         existing = FakeMaterialInstanceConstant("/Game/Material/MI/MI_Test")
 
