@@ -35,7 +35,7 @@ def new_geometry_node_group(name):
 
 
 @contextmanager
-def compensate_negative_scale_winding():
+def compensate_negative_scale_winding(enabled=True):
     """
     Keep negatively scaled meshes facing outward in the exported file.
 
@@ -73,7 +73,25 @@ def compensate_negative_scale_winding():
     5.1.2 it collapses a flat-shaded cube from 6 distinct corner normals to 8
     regardless of the capture domain, which welds hard edges. Unreal then
     imported such a cube with 8 vertices instead of 24.
+
+    This applies to StaticMesh exports only. Unreal's *skeletal* importer already
+    corrects the handedness itself, so compensating there inverts the winding
+    instead of fixing it. Measured by importing each variant and exporting it
+    back out of Unreal 5.8.2, with the static column reproducing the direct
+    in-editor measurement and therefore validating the method:
+
+        variant       static          skeletal
+        baseline      correct         correct
+        no handling   winding bad     correct
+        compensated   correct         winding bad
+
+    :param bool enabled: Whether to compensate. Callers pass False for skeletal
+        exports.
     """
+    if not enabled:
+        yield
+        return
+
     mirrored_objects = [
         scene_object
         for scene_object in bpy.context.selected_objects
@@ -500,10 +518,15 @@ def export_mesh(asset_id, mesh_object, properties, lod=0):
     # particle systems are on the mesh. Making them not visible fixes this bug
     existing_display_options = utilities.disable_particles(mesh_object)
     try:
+        # Unreal's skeletal importer already corrects negative-scale handedness,
+        # so compensating there would invert the winding instead of fixing it.
+        is_static_mesh = (
+            utilities.get_mesh_unreal_type(mesh_object) == UnrealTypes.STATIC_MESH
+        )
         # instances are realized first so that the negative-scale compensation
         # runs on the geometry the exporter will actually write
         with realize_selected_geometry_node_instances():
-            with compensate_negative_scale_winding():
+            with compensate_negative_scale_winding(enabled=is_static_mesh):
                 # export selection to a file
                 export_file(properties, lod)
     finally:

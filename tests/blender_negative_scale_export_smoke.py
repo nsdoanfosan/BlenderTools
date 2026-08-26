@@ -135,6 +135,11 @@ def negative_object_scale(name="NegativeObjectScale"):
     return scene_object
 
 
+def clear_armatures():
+    for armature in list(bpy.data.armatures):
+        bpy.data.armatures.remove(armature)
+
+
 def negative_parent_scale():
     parent = bpy.data.objects.new("MirrorParent", None)
     bpy.context.scene.collection.objects.link(parent)
@@ -262,6 +267,51 @@ assert [
     tuple(round(value, 6) for value in corner.vector)
     for corner in scene_object.data.corner_normals
 ] == original_corner_normals
+
+# Skeletal exports must not be compensated. Unreal's skeletal importer already
+# corrects the handedness, so compensating inverts the winding instead. Verified
+# by round-tripping each variant through Unreal 5.8.2; see
+# export.compensate_negative_scale_winding.
+clear_scene()
+scene_object = negative_object_scale("SkeletalNegativeScale")
+armature_data = bpy.data.armatures.new("TestArmature")
+rig = bpy.data.objects.new("TestRig", armature_data)
+bpy.context.scene.collection.objects.link(rig)
+scene_object.parent = rig
+armature_modifier = scene_object.modifiers.new(name="Armature", type="ARMATURE")
+armature_modifier.object = rig
+bpy.context.view_layer.update()
+
+from send2ue.constants import UnrealTypes
+from send2ue.core import utilities as send2ue_utilities
+
+assert (
+    send2ue_utilities.get_mesh_unreal_type(scene_object)
+    == UnrealTypes.SKELETAL_MESH
+)
+original_mesh = scene_object.data
+select_only(scene_object)
+with export.compensate_negative_scale_winding(enabled=False):
+    # Nothing is swapped, so the exporter writes the mesh Unreal expects.
+    assert scene_object.data is original_mesh
+    winding, shading = evaluated_measurement(scene_object)
+# Uncompensated, so the winding still reads inverted in this local model. That is
+# correct here: Unreal's skeletal importer performs the correction itself.
+assert winding == -REFERENCE_WINDING, winding
+assert shading == REFERENCE_SHADING, shading
+
+# A static mesh in the same scene is still compensated.
+clear_scene()
+static_object = negative_object_scale("StaticNegativeScale")
+assert (
+    send2ue_utilities.get_mesh_unreal_type(static_object)
+    == UnrealTypes.STATIC_MESH
+)
+select_only(static_object)
+with export.compensate_negative_scale_winding(enabled=True):
+    winding, shading = evaluated_measurement(static_object)
+assert winding == REFERENCE_WINDING, winding
+assert shading == REFERENCE_SHADING, shading
 
 # Temporary state is cleaned up even when the export raises.
 clear_scene()
