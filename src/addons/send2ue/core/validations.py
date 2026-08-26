@@ -113,6 +113,8 @@ class ValidationManager:
                 evaluated_mesh = evaluated_object.to_mesh()
 
                 if evaluated_mesh is None or len(evaluated_mesh.vertices) <= 0:
+                    if utilities.has_evaluated_mesh_instances(mesh_object, depsgraph):
+                        continue
                     utilities.report_error(
                         f'Mesh "{mesh_object.name}" has no evaluated geometry.'
                     )

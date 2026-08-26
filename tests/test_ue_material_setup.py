@@ -20,6 +20,14 @@ MODULE_PATH = (
 )
 
 
+class FakeVector4:
+    def __init__(self, x=0.0, y=0.0, z=0.0, w=0.0):
+        self.x = float(x)
+        self.y = float(y)
+        self.z = float(z)
+        self.w = float(w)
+
+
 class FakeTexture:
     def __init__(
         self,
@@ -27,12 +35,20 @@ class FakeTexture:
         compression_settings="TC_DEFAULT",
         max_texture_size=2048,
         virtual_texture_streaming=False,
+        do_scale_mips_for_alpha_coverage=False,
+        alpha_coverage_thresholds=None,
     ):
         self.properties = {
             "srgb": srgb,
             "compression_settings": compression_settings,
             "max_texture_size": max_texture_size,
             "virtual_texture_streaming": virtual_texture_streaming,
+            "do_scale_mips_for_alpha_coverage": (
+                do_scale_mips_for_alpha_coverage
+            ),
+            "alpha_coverage_thresholds": (
+                alpha_coverage_thresholds or FakeVector4()
+            ),
         }
 
     def get_editor_property(self, name):
@@ -162,6 +178,42 @@ class FakeSkeletalMesh:
 
 class FakeStaticMesh:
     pass
+
+
+class FakeNaniteSettings:
+    def __init__(self):
+        self.properties = {
+            "enabled": False,
+            "shape_preservation": "NONE",
+            "voxel_ndf": False,
+            "voxel_opacity": False,
+        }
+
+    def get_editor_property(self, name):
+        return self.properties[name]
+
+    def set_editor_property(self, name, value):
+        self.properties[name] = value
+
+
+class FakeNaniteMesh:
+    def __init__(self):
+        self.nanite_settings = FakeNaniteSettings()
+        self.notified = False
+
+    def get_editor_property(self, name):
+        if name == "nanite_settings":
+            return self.nanite_settings
+        raise KeyError(name)
+
+    def set_editor_property(self, name, value):
+        if name == "nanite_settings":
+            self.nanite_settings = value
+            return
+        raise KeyError(name)
+
+    def notify_nanite_settings_changed(self):
+        self.notified = True
 
 
 class FakeAssetData:
@@ -352,6 +404,7 @@ class FakeRuntime:
             TC_MASKS="TC_MASKS",
             TC_GRAYSCALE="TC_GRAYSCALE",
         )
+        unreal_module.Vector4 = FakeVector4
         unreal_module.EditorAssetLibrary = FakeEditorAssetLibrary(self)
         unreal_module.SourceControl = FakeSourceControl(self)
         unreal_module.AssetImportTask = FakeAssetImportTask
@@ -605,6 +658,30 @@ class TestUeMaterialTextureImport(unittest.TestCase):
 
         self.assertTrue(changed)
         self.assertFalse(texture.properties["virtual_texture_streaming"])
+        self.assertTrue(
+            texture.properties["do_scale_mips_for_alpha_coverage"]
+        )
+        self.assertAlmostEqual(
+            texture.properties["alpha_coverage_thresholds"].x,
+            0.3333,
+        )
+
+    def test_only_opacity_roles_receive_alpha_coverage_settings(self):
+        for role in ("Opacity", "Opacity Map", "Alpha"):
+            with self.subTest(role=role):
+                settings = self.module._desired_texture_settings(role)
+                self.assertTrue(settings["do_scale_mips_for_alpha_coverage"])
+                self.assertEqual(
+                    self.module._vector4_components(
+                        settings["alpha_coverage_thresholds"]
+                    ),
+                    (0.3333, 0.0, 0.0, 0.0),
+                )
+        self.assertNotIn(
+            "do_scale_mips_for_alpha_coverage",
+            self.module._desired_texture_settings("Albedo"),
+        )
+
 
     def test_preexisting_user_checkout_is_not_reverted(self):
         texture = FakeTexture(max_texture_size=1024)
@@ -1895,6 +1972,77 @@ class TestUeMaterialTextureImport(unittest.TestCase):
         self.assertIn(layer_path, self.runtime.save_calls)
 
 
+class TestVerifiedHairNaniteSettings(unittest.TestCase):
+    def setUp(self):
+        self.runtime = FakeRuntime()
+        self.module = _load_module(self.runtime)
+
+    @staticmethod
+    def tagged_hair_data(version=3, encoding="HTUE_RGB_TAGGED_UV"):
+        return {
+            "materials": [
+                {
+                    "name": "M_HT_Default_Material_01",
+                    "master_preset": "hair",
+                    "hair_tool": {
+                        "vertex_uv_payload": {
+                            "version": version,
+                            "encoding": encoding,
+                        }
+                    },
+                }
+            ]
+        }
+
+    def test_tagged_v3_hair_is_the_only_voxel_opacity_candidate(self):
+        data = self.tagged_hair_data()
+        self.assertTrue(
+            self.module._uses_verified_hair_uv_payload(
+                data,
+                "/Game/Meshes/Hair_Back_Sibuki_02",
+            )
+        )
+        self.assertFalse(
+            self.module._uses_verified_hair_uv_payload(
+                data,
+                "/Game/Meshes/hair_eyelash_02",
+            )
+        )
+        self.assertFalse(
+            self.module._uses_verified_hair_uv_payload(
+                self.tagged_hair_data(version=2),
+                "/Game/Meshes/Hair_Back_Sibuki_02",
+            )
+        )
+        self.assertFalse(
+            self.module._uses_verified_hair_uv_payload(
+                self.tagged_hair_data(encoding="LEGACY"),
+                "/Game/Meshes/Hair_Back_Sibuki_02",
+            )
+        )
+
+    def test_set_nanite_enables_voxel_ndf_and_voxel_opacity(self):
+        mesh = FakeNaniteMesh()
+
+        changed = self.module._set_nanite(
+            mesh,
+            True,
+            "VOXELIZE",
+            voxel_ndf=True,
+            voxel_opacity=True,
+        )
+
+        self.assertTrue(changed)
+        self.assertTrue(mesh.nanite_settings.properties["enabled"])
+        self.assertEqual(
+            mesh.nanite_settings.properties["shape_preservation"],
+            "VOXELIZE",
+        )
+        self.assertTrue(mesh.nanite_settings.properties["voxel_ndf"])
+        self.assertTrue(mesh.nanite_settings.properties["voxel_opacity"])
+        self.assertTrue(mesh.notified)
+
+
 class TestRuntimeTolerantMaterialProcess(unittest.TestCase):
     def setUp(self):
         self.runtime = FakeRuntime()
@@ -2104,6 +2252,59 @@ class TestRuntimeTolerantMaterialProcess(unittest.TestCase):
         self.assertTrue(changed)
         self.assertEqual(assigned, [existing])
         self.assertIs(existing.parent, master)
+        self.assertEqual(self.assignments[0][1], existing)
+
+    def test_empty_background_generated_mi_is_initialized_without_textures(self):
+        target_path = "/Game/Material/MI/MI_Test"
+        master_path = "/Game/Material/M_Master"
+        existing = FakeMaterialInstanceConstant(target_path)
+        master = FakeMaterialInstanceConstant(master_path)
+        self.runtime.assets[target_path] = existing
+        self.runtime.assets[master_path] = master
+
+        class Helper:
+            @staticmethod
+            def dump_material_layers(_material_path):
+                return True, json.dumps(
+                    {
+                        "ok": True,
+                        "has_layers": True,
+                        "layers": [{"index": 0, "path": ""}],
+                    }
+                )
+
+        self.runtime.unreal_module.CodexMaterialToolsLibrary = Helper()
+        data = {
+            "mesh_name": "SM_Test",
+            "materials": [
+                {
+                    "name": "M_Test",
+                    "slot_index": 0,
+                    "material_layer": {
+                        "instance_path": "/Game/Material/MYI/MYI_Test",
+                    },
+                }
+            ],
+        }
+        preset = {
+            "key": "layer",
+            "master": master_path,
+            "mi_folder": "/Game/Material/MI",
+            "assignment": "material_layer_instance",
+            "layer_parent": "/Game/Material/MY_Parent",
+            "layer_instance_folder": "/Game/Material/MYI",
+            "virtual_textures": True,
+        }
+        self.configure_process(data, preset)
+        assigned = []
+        self.module._assign_master_textures = (
+            lambda mi, *args, **kwargs: assigned.append(mi) or True
+        )
+
+        changed = self.module.process_mesh(self.mesh_path)
+
+        self.assertTrue(changed)
+        self.assertEqual(assigned, [existing])
         self.assertEqual(self.assignments[0][1], existing)
 
     def test_nonempty_artist_background_remains_assignment_only(self):

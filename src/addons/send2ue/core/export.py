@@ -4,8 +4,224 @@ import json
 import math
 import os
 import bpy
+from contextlib import contextmanager
 from . import utilities, validations, settings, ingest, extension, io, hair_tool_export, ue_groom_adapter
 from ..constants import BlenderTypes, UnrealTypes, FileTypes, PreFixToken, ToolInfo, ExtensionTasks
+
+
+def new_geometry_node_group(name):
+    """
+    Creates an empty Geometry Nodes group with a geometry in/out interface.
+
+    :param str name: The name of the new node group.
+    :return bpy.types.GeometryNodeTree: The new node group.
+    """
+    node_group = bpy.data.node_groups.new(name=name, type='GeometryNodeTree')
+    if bpy.app.version[0] >= 4:
+        node_group.interface.new_socket(
+            name='Geometry',
+            in_out='INPUT',
+            socket_type='NodeSocketGeometry',
+        )
+        node_group.interface.new_socket(
+            name='Geometry',
+            in_out='OUTPUT',
+            socket_type='NodeSocketGeometry',
+        )
+    else:
+        node_group.inputs.new('NodeSocketGeometry', 'Geometry')
+        node_group.outputs.new('NodeSocketGeometry', 'Geometry')
+    return node_group
+
+
+@contextmanager
+def compensate_negative_scale_winding():
+    """
+    Keep negatively scaled meshes facing outward in the exported file.
+
+    Mirroring by scaling an object (or its parent) by a negative factor leaves
+    ``matrix_world`` with a negative determinant. Blender negates shading
+    normals for such objects, so the viewport looks correct. The FBX exporter
+    writes the negative transform onto the object's node and leaves the vertex
+    winding in local space untouched, so the file itself is still consistent.
+
+    An importer that bakes the node transform into the vertices - which is what
+    Unreal does on import - reverses the effective winding and the mesh arrives
+    inside out. Measured on Blender 5.1.2 with the export settings this add-on
+    uses: a ``(-1, 1, 1)`` object writes a node with determinant ``-1`` and
+    geometry whose local normal is still ``+Z``; baking that transform yields a
+    ``-Z`` face.
+
+    Pre-flip the faces of those objects so the importer's bake negates the
+    winding a second time and cancels out. ``hair_tool_export._join_objects``
+    already applies the same correction to the meshes it bakes; this extends it
+    to ordinary mesh exports. Temporary modifiers and their shared node group
+    are removed immediately after export, leaving the source objects, their
+    mesh data and their modifier stacks intact.
+    """
+    mirrored_objects = [
+        scene_object
+        for scene_object in bpy.context.selected_objects
+        if scene_object.type == BlenderTypes.MESH
+        and scene_object.matrix_world.to_3x3().determinant() < 0.0
+    ]
+    if not mirrored_objects:
+        yield
+        return
+
+    node_group = None
+    modifiers = []
+    try:
+        node_group = new_geometry_node_group('__Send2UE_FlipNegativeScaleWinding__')
+        group_input = node_group.nodes.new('NodeGroupInput')
+        flip_faces = node_group.nodes.new('GeometryNodeFlipFaces')
+        group_output = node_group.nodes.new('NodeGroupOutput')
+        node_group.links.new(
+            group_input.outputs['Geometry'],
+            flip_faces.inputs['Mesh'],
+        )
+        node_group.links.new(
+            flip_faces.outputs['Mesh'],
+            group_output.inputs['Geometry'],
+        )
+
+        for scene_object in mirrored_objects:
+            modifier = scene_object.modifiers.new(
+                name='__Send2UE_FlipNegativeScaleWinding__',
+                type='NODES',
+            )
+            modifier.node_group = node_group
+            modifiers.append((scene_object, modifier))
+        bpy.context.view_layer.update()
+        yield
+    finally:
+        for scene_object, modifier in modifiers:
+            scene_object.modifiers.remove(modifier)
+        if node_group is not None:
+            bpy.data.node_groups.remove(node_group)
+        bpy.context.view_layer.update()
+
+
+@contextmanager
+def realize_selected_geometry_node_instances():
+    """
+    Make instance-only Geometry Nodes outputs available to file exporters.
+
+    Combine-assets export passes one representative mesh to ``export_mesh``
+    but selects every child mesh for the FBX. The preparation must therefore
+    cover all selected meshes rather than only the representative object.
+
+    A mirror implemented as a Geometry Nodes instance has a negative-handed
+    transform. ``Realize Instances`` bakes that transform into the mesh, but
+    deliberately leaves its face winding unchanged. That is valid while it is
+    an instance, but becomes inward-facing geometry in the FBX. Capture the
+    handedness on the instance domain before realization, then flip only the
+    faces produced by negative-handed instances. Temporary modifiers and their
+    shared node group are removed immediately after export, leaving the source
+    objects and their modifier stacks intact.
+    """
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    depsgraph.update()
+    instance_objects = [
+        scene_object
+        for scene_object in bpy.context.selected_objects
+        if scene_object.type == BlenderTypes.MESH
+        and utilities.has_evaluated_mesh_instances(scene_object, depsgraph)
+    ]
+    if not instance_objects:
+        yield
+        return
+
+    node_group = None
+    modifiers = []
+    try:
+        node_group = new_geometry_node_group('__Send2UE_RealizeSelectedInstances__')
+        group_input = node_group.nodes.new('NodeGroupInput')
+        instance_scale = node_group.nodes.new('GeometryNodeInputInstanceScale')
+        separate_scale = node_group.nodes.new('ShaderNodeSeparateXYZ')
+        multiply_xy = node_group.nodes.new('ShaderNodeMath')
+        multiply_xy.operation = 'MULTIPLY'
+        multiply_xyz = node_group.nodes.new('ShaderNodeMath')
+        multiply_xyz.operation = 'MULTIPLY'
+        is_negative_handedness = node_group.nodes.new('ShaderNodeMath')
+        is_negative_handedness.operation = 'LESS_THAN'
+        is_negative_handedness.inputs[1].default_value = 0.0
+        capture_handedness = node_group.nodes.new('GeometryNodeCaptureAttribute')
+        capture_handedness.domain = 'INSTANCE'
+        capture_handedness.capture_items.clear()
+        capture_handedness.capture_items.new('BOOLEAN', 'negative_handedness')
+        realize_instances = node_group.nodes.new('GeometryNodeRealizeInstances')
+        flip_mirrored_faces = node_group.nodes.new('GeometryNodeFlipFaces')
+        group_output = node_group.nodes.new('NodeGroupOutput')
+
+        # The sign of the product of an instance's decomposed scale is its
+        # handedness. Capture it while the geometry still has an INSTANCE
+        # domain; after realization Blender propagates it to the generated
+        # mesh elements for Flip Faces to use as a selection field.
+        node_group.links.new(
+            instance_scale.outputs['Scale'],
+            separate_scale.inputs['Vector'],
+        )
+        node_group.links.new(
+            separate_scale.outputs['X'],
+            multiply_xy.inputs[0],
+        )
+        node_group.links.new(
+            separate_scale.outputs['Y'],
+            multiply_xy.inputs[1],
+        )
+        node_group.links.new(
+            multiply_xy.outputs[0],
+            multiply_xyz.inputs[0],
+        )
+        node_group.links.new(
+            separate_scale.outputs['Z'],
+            multiply_xyz.inputs[1],
+        )
+        node_group.links.new(
+            multiply_xyz.outputs[0],
+            is_negative_handedness.inputs[0],
+        )
+        node_group.links.new(
+            group_input.outputs['Geometry'],
+            capture_handedness.inputs['Geometry'],
+        )
+        node_group.links.new(
+            is_negative_handedness.outputs[0],
+            capture_handedness.inputs['negative_handedness'],
+        )
+        node_group.links.new(
+            capture_handedness.outputs['Geometry'],
+            realize_instances.inputs['Geometry'],
+        )
+        node_group.links.new(
+            realize_instances.outputs['Geometry'],
+            flip_mirrored_faces.inputs['Mesh'],
+        )
+        node_group.links.new(
+            capture_handedness.outputs['negative_handedness'],
+            flip_mirrored_faces.inputs['Selection'],
+        )
+        node_group.links.new(
+            flip_mirrored_faces.outputs['Mesh'],
+            group_output.inputs['Geometry'],
+        )
+
+        for scene_object in instance_objects:
+            modifier = scene_object.modifiers.new(
+                name='__Send2UE_RealizeSelectedInstances__',
+                type='NODES',
+            )
+            modifier.node_group = node_group
+            modifiers.append((scene_object, modifier))
+        depsgraph.update()
+        yield
+    finally:
+        for scene_object, modifier in modifiers:
+            scene_object.modifiers.remove(modifier)
+        if node_group is not None:
+            bpy.data.node_groups.remove(node_group)
+        bpy.context.view_layer.update()
 
 
 def get_file_path(asset_name, properties, asset_type, lod=False, file_extension='fbx'):
@@ -251,8 +467,12 @@ def export_mesh(asset_id, mesh_object, properties, lod=0):
     # particle systems are on the mesh. Making them not visible fixes this bug
     existing_display_options = utilities.disable_particles(mesh_object)
     try:
-        # export selection to a file
-        export_file(properties, lod)
+        # instances are realized first so that the negative-scale compensation
+        # runs on the geometry the exporter will actually write
+        with realize_selected_geometry_node_instances():
+            with compensate_negative_scale_winding():
+                # export selection to a file
+                export_file(properties, lod)
     finally:
         # restore the particle system display options
         utilities.restore_particles(mesh_object, existing_display_options)

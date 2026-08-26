@@ -439,6 +439,37 @@ def get_mesh_object_for_groom_name(groom_name):
             return scene_object.data.surface
 
 
+def has_evaluated_mesh_instances(mesh_object, depsgraph=None):
+    """
+    Check whether a mesh object generates non-particle mesh instances.
+
+    Geometry Nodes can produce an instance-only result. Blender then reports
+    an empty mesh from ``to_mesh()`` even though the dependency graph contains
+    visible mesh geometry parented to the object.
+
+    :param bpy.types.Object mesh_object: The original mesh object to inspect.
+    :param bpy.types.Depsgraph depsgraph: Optional evaluated dependency graph.
+    :return bool: Whether the object generates at least one non-empty mesh instance.
+    """
+    if not any(
+        modifier.type == 'NODES' and modifier.show_viewport
+        for modifier in mesh_object.modifiers
+    ):
+        return False
+
+    depsgraph = depsgraph or bpy.context.evaluated_depsgraph_get()
+    return any(
+        object_instance.is_instance
+        and getattr(object_instance, 'particle_system', None) is None
+        and object_instance.parent is not None
+        and object_instance.parent.original == mesh_object
+        and object_instance.object.type == BlenderTypes.MESH
+        and object_instance.object.data is not None
+        and len(object_instance.object.data.vertices) > 0
+        for object_instance in depsgraph.object_instances
+    )
+
+
 def get_from_collection(object_type):
     """
     This function fetches the objects inside each collection according to type and returns
