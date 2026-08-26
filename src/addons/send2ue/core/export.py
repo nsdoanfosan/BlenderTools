@@ -9,6 +9,99 @@ from . import utilities, validations, settings, ingest, extension, io, hair_tool
 from ..constants import BlenderTypes, UnrealTypes, FileTypes, PreFixToken, ToolInfo, ExtensionTasks
 
 
+def new_geometry_node_group(name):
+    """
+    Creates an empty Geometry Nodes group with a geometry in/out interface.
+
+    :param str name: The name of the new node group.
+    :return bpy.types.GeometryNodeTree: The new node group.
+    """
+    node_group = bpy.data.node_groups.new(name=name, type='GeometryNodeTree')
+    if bpy.app.version[0] >= 4:
+        node_group.interface.new_socket(
+            name='Geometry',
+            in_out='INPUT',
+            socket_type='NodeSocketGeometry',
+        )
+        node_group.interface.new_socket(
+            name='Geometry',
+            in_out='OUTPUT',
+            socket_type='NodeSocketGeometry',
+        )
+    else:
+        node_group.inputs.new('NodeSocketGeometry', 'Geometry')
+        node_group.outputs.new('NodeSocketGeometry', 'Geometry')
+    return node_group
+
+
+@contextmanager
+def compensate_negative_scale_winding():
+    """
+    Keep negatively scaled meshes facing outward in the exported file.
+
+    Mirroring by scaling an object (or its parent) by a negative factor leaves
+    ``matrix_world`` with a negative determinant. Blender negates shading
+    normals for such objects, so the viewport looks correct. The FBX exporter
+    writes the negative transform onto the object's node and leaves the vertex
+    winding in local space untouched, so the file itself is still consistent.
+
+    An importer that bakes the node transform into the vertices - which is what
+    Unreal does on import - reverses the effective winding and the mesh arrives
+    inside out. Measured on Blender 5.1.2 with the export settings this add-on
+    uses: a ``(-1, 1, 1)`` object writes a node with determinant ``-1`` and
+    geometry whose local normal is still ``+Z``; baking that transform yields a
+    ``-Z`` face.
+
+    Pre-flip the faces of those objects so the importer's bake negates the
+    winding a second time and cancels out. ``hair_tool_export._join_objects``
+    already applies the same correction to the meshes it bakes; this extends it
+    to ordinary mesh exports. Temporary modifiers and their shared node group
+    are removed immediately after export, leaving the source objects, their
+    mesh data and their modifier stacks intact.
+    """
+    mirrored_objects = [
+        scene_object
+        for scene_object in bpy.context.selected_objects
+        if scene_object.type == BlenderTypes.MESH
+        and scene_object.matrix_world.to_3x3().determinant() < 0.0
+    ]
+    if not mirrored_objects:
+        yield
+        return
+
+    node_group = None
+    modifiers = []
+    try:
+        node_group = new_geometry_node_group('__Send2UE_FlipNegativeScaleWinding__')
+        group_input = node_group.nodes.new('NodeGroupInput')
+        flip_faces = node_group.nodes.new('GeometryNodeFlipFaces')
+        group_output = node_group.nodes.new('NodeGroupOutput')
+        node_group.links.new(
+            group_input.outputs['Geometry'],
+            flip_faces.inputs['Mesh'],
+        )
+        node_group.links.new(
+            flip_faces.outputs['Mesh'],
+            group_output.inputs['Geometry'],
+        )
+
+        for scene_object in mirrored_objects:
+            modifier = scene_object.modifiers.new(
+                name='__Send2UE_FlipNegativeScaleWinding__',
+                type='NODES',
+            )
+            modifier.node_group = node_group
+            modifiers.append((scene_object, modifier))
+        bpy.context.view_layer.update()
+        yield
+    finally:
+        for scene_object, modifier in modifiers:
+            scene_object.modifiers.remove(modifier)
+        if node_group is not None:
+            bpy.data.node_groups.remove(node_group)
+        bpy.context.view_layer.update()
+
+
 @contextmanager
 def realize_selected_geometry_node_instances():
     """
@@ -42,25 +135,7 @@ def realize_selected_geometry_node_instances():
     node_group = None
     modifiers = []
     try:
-        node_group = bpy.data.node_groups.new(
-            name='__Send2UE_RealizeSelectedInstances__',
-            type='GeometryNodeTree',
-        )
-        if bpy.app.version[0] >= 4:
-            node_group.interface.new_socket(
-                name='Geometry',
-                in_out='INPUT',
-                socket_type='NodeSocketGeometry',
-            )
-            node_group.interface.new_socket(
-                name='Geometry',
-                in_out='OUTPUT',
-                socket_type='NodeSocketGeometry',
-            )
-        else:
-            node_group.inputs.new('NodeSocketGeometry', 'Geometry')
-            node_group.outputs.new('NodeSocketGeometry', 'Geometry')
-
+        node_group = new_geometry_node_group('__Send2UE_RealizeSelectedInstances__')
         group_input = node_group.nodes.new('NodeGroupInput')
         instance_scale = node_group.nodes.new('GeometryNodeInputInstanceScale')
         separate_scale = node_group.nodes.new('ShaderNodeSeparateXYZ')
@@ -392,9 +467,12 @@ def export_mesh(asset_id, mesh_object, properties, lod=0):
     # particle systems are on the mesh. Making them not visible fixes this bug
     existing_display_options = utilities.disable_particles(mesh_object)
     try:
+        # instances are realized first so that the negative-scale compensation
+        # runs on the geometry the exporter will actually write
         with realize_selected_geometry_node_instances():
-            # export selection to a file
-            export_file(properties, lod)
+            with compensate_negative_scale_winding():
+                # export selection to a file
+                export_file(properties, lod)
     finally:
         # restore the particle system display options
         utilities.restore_particles(mesh_object, existing_display_options)
