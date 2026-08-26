@@ -335,7 +335,9 @@ class TestMaterialPipelineExactSidecar(unittest.TestCase):
             collect_handoff_data=lambda context, scope: {"materials": [live]}
         )
         try:
-            renamed = self.extension._normalize_export_material_names(api)
+            renamed, skipped_linked = (
+                self.extension._normalize_export_material_names(api)
+            )
         finally:
             for name, value in previous.items():
                 if value is None:
@@ -349,6 +351,141 @@ class TestMaterialPipelineExactSidecar(unittest.TestCase):
             renamed,
             [("Bark_ivy_01", "M_Bark_ivy_01_02")],
         )
+        self.assertEqual(skipped_linked, [])
+
+    def test_linked_materials_are_skipped_not_renamed(self):
+        package_name = "ue_unique_export_names_addon"
+        constants_name = f"{package_name}.constants"
+        utils_name = f"{package_name}.utils"
+        previous = {
+            name: sys.modules.get(name)
+            for name in (constants_name, utils_name)
+        }
+        constants = types.ModuleType(constants_name)
+        constants.MATERIAL_PREFIX = "M_"
+        utils = types.ModuleType(utils_name)
+        utils.clean_token = lambda value: str(value).replace(" ", "_")
+        sys.modules[constants_name] = constants
+        sys.modules[utils_name] = utils
+
+        # A linked material is read-only: assigning .name raises AttributeError.
+        class LinkedMaterial:
+            def __init__(self, name, library):
+                object.__setattr__(self, "_name", name)
+                object.__setattr__(self, "library", library)
+
+            @property
+            def name(self):
+                return self._name
+
+            @name.setter
+            def name(self, value):
+                raise AttributeError(
+                    'bpy_struct: attribute "name" from "Material" is read-only'
+                )
+
+        library = types.SimpleNamespace(
+            filepath="//../material_library/wood_materials.blend",
+            name="wood_materials.blend",
+        )
+        linked = LinkedMaterial("LayerBlend_Wood plank 03", library)
+        local = types.SimpleNamespace(name="Bark_ivy_01", library=None)
+        self.module.bpy.data.materials = [linked, local]
+        api = types.SimpleNamespace(
+            collect_handoff_data=lambda context, scope: {
+                "materials": [linked, local]
+            }
+        )
+        try:
+            renamed, skipped_linked = (
+                self.extension._normalize_export_material_names(api)
+            )
+        finally:
+            for name, value in previous.items():
+                if value is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = value
+
+        # The linked material is untouched and reported with the rename the
+        # library owner has to make, plus which library that is.
+        self.assertEqual(linked.name, "LayerBlend_Wood plank 03")
+        self.assertEqual(
+            skipped_linked,
+            [
+                (
+                    "LayerBlend_Wood plank 03",
+                    "M_LayerBlend_Wood_plank_03",
+                    "wood_materials.blend",
+                )
+            ],
+        )
+        # The local material in the same scope is still normalized.
+        self.assertEqual(local.name, "M_Bark_ivy_01")
+        self.assertEqual(renamed, [("Bark_ivy_01", "M_Bark_ivy_01")])
+
+    def test_linked_material_does_not_abort_the_handoff_refresh(self):
+        package_name = "ue_unique_export_names_addon"
+        api_name = f"{package_name}.api"
+        constants_name = f"{package_name}.constants"
+        utils_name = f"{package_name}.utils"
+        module_names = (package_name, api_name, constants_name, utils_name)
+        previous = {name: sys.modules.get(name) for name in module_names}
+        package = types.ModuleType(package_name)
+        package.__path__ = []
+        api = types.ModuleType(api_name)
+        constants = types.ModuleType(constants_name)
+        constants.MATERIAL_PREFIX = "M_"
+        utils = types.ModuleType(utils_name)
+        utils.clean_token = lambda value: str(value)
+
+        class LinkedMaterial:
+            def __init__(self, name, library):
+                object.__setattr__(self, "_name", name)
+                object.__setattr__(self, "library", library)
+
+            @property
+            def name(self):
+                return self._name
+
+            @name.setter
+            def name(self, value):
+                raise AttributeError("read-only")
+
+        linked = LinkedMaterial(
+            "LayerBlend_Wood_plank_03",
+            types.SimpleNamespace(filepath="//lib/wood.blend", name="wood.blend"),
+        )
+        api.collect_handoff_data = lambda context, scope: {"materials": [linked]}
+        api.refresh_handoff_json = lambda context, scope: {
+            "errors": [],
+            "json_paths": ["D:/texture/SK_Ivy.json"],
+        }
+        package.api = api
+        sys.modules.update(
+            {
+                package_name: package,
+                api_name: api,
+                constants_name: constants,
+                utils_name: utils,
+            }
+        )
+        self.module.bpy.data.materials = [linked]
+        try:
+            result = self.extension._refresh_unreal_handoff_json_or_error(
+                types.SimpleNamespace(name="SK_Ivy")
+            )
+        finally:
+            for name, value in previous.items():
+                if value is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = value
+
+        # Previously the read-only assignment raised AttributeError, which the
+        # extension turned into a bare "Could not validate Unreal handoff".
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(result["json_paths"], ["D:/texture/SK_Ivy.json"])
 
     def test_export_sidecar_persists_expected_name_and_content_sha(self):
         package_name = "ue_unique_export_names_addon"

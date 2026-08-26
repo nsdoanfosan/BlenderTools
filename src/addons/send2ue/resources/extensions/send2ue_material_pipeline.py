@@ -31,6 +31,14 @@ HANDOFF_ERROR_REPORT_LIMIT = 10
 _POST_OPERATION_SKELETAL_ASSET_PATHS = []
 
 
+def _library_name(library):
+    """Return the filename of a Blender library, for use in reports."""
+    filepath = str(getattr(library, "filepath", "") or "")
+    if filepath:
+        return Path(filepath.replace("\\", "/")).name
+    return str(getattr(library, "name", "") or "linked")
+
+
 class MaterialPipelineExtension(ExtensionBase):
     name = "material_pipeline"
 
@@ -146,13 +154,26 @@ class MaterialPipelineExtension(ExtensionBase):
         try:
             from ue_unique_export_names_addon import api as handoff_api
 
-            renamed_materials = self._normalize_export_material_names(handoff_api)
+            renamed_materials, linked_materials = (
+                self._normalize_export_material_names(handoff_api)
+            )
             if renamed_materials:
                 print(
                     "[material_pipeline] normalized export material names: "
                     + ", ".join(
                         f"{old_name} -> {new_name}"
                         for old_name, new_name in renamed_materials
+                    )
+                )
+            if linked_materials:
+                # Not an error here. The validator decides whether the name is
+                # acceptable and reports which library has to be edited.
+                print(
+                    "[material_pipeline] linked materials cannot be renamed, "
+                    "prefix not applied: "
+                    + ", ".join(
+                        f"{old_name} (needs {wanted_name}, from {library_name})"
+                        for old_name, wanted_name, library_name in linked_materials
                     )
                 )
             result = handoff_api.refresh_handoff_json(
@@ -217,6 +238,14 @@ class MaterialPipelineExtension(ExtensionBase):
         so this repairs the FBX/JSON handoff without saving the source blend.
         Only materials that the handoff API reports as reachable from the current
         Export collection are touched.
+
+        Materials linked from a library blend are skipped. The handoff reports
+        them on purpose - their texture paths are needed - but a linked
+        datablock is read-only, so assigning ``name`` raises ``AttributeError``.
+        That used to surface as a bare "Could not validate Unreal handoff",
+        naming neither the material nor its library. The validator reports the
+        rename the library owner has to make; this only records the skip so the
+        console shows why the prefix was not applied.
         """
         from ue_unique_export_names_addon.constants import MATERIAL_PREFIX
         from ue_unique_export_names_addon.utils import clean_token
@@ -231,6 +260,7 @@ class MaterialPipelineExtension(ExtensionBase):
             str(material.name).casefold(): material for material in all_materials
         }
         renamed = []
+        skipped_linked = []
 
         for material in materials:
             old_name = str(material.name)
@@ -251,6 +281,13 @@ class MaterialPipelineExtension(ExtensionBase):
 
             if candidate == old_name:
                 continue
+            # The library check is deliberately local rather than imported from
+            # the validator add-on, so this extension keeps working against an
+            # older installed version of it.
+            library = getattr(material, "library", None)
+            if library is not None:
+                skipped_linked.append((old_name, candidate, _library_name(library)))
+                continue
             if used_names.get(old_name.casefold()) is material:
                 used_names.pop(old_name.casefold(), None)
             material.name = candidate
@@ -258,7 +295,7 @@ class MaterialPipelineExtension(ExtensionBase):
             used_names[actual_name.casefold()] = material
             renamed.append((old_name, actual_name))
 
-        return renamed
+        return renamed, skipped_linked
 
     def _load_json_sidecar_for_export(
         self,
