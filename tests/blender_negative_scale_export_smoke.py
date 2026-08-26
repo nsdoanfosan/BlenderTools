@@ -3,18 +3,27 @@
 Mirroring by negative scale leaves ``matrix_world`` with a negative determinant.
 Blender negates shading normals for those objects so the viewport looks right,
 but the FBX exporter writes the negative transform onto the object's node and
-leaves the local winding alone. Any importer that bakes the node transform into
-the vertices - which is what Unreal does - reverses the effective winding.
+leaves the local winding alone. An importer that bakes the node transform into
+the vertices - which is what Unreal does - mirrors the positions and reverses
+the effective winding.
 
-This drives ``export.compensate_negative_scale_winding`` around a real FBX
-export, re-imports the file, and bakes the node transform the way an importer
-would.
+Two independent properties have to survive that bake:
+
+  winding  - the index-buffer order, which the bake reverses
+  normals  - the explicit per-corner normals, which a mirror transforms
+             correctly on its own
+
+Checking only the winding is the trap this test exists to close: a plain
+``Flip Faces`` fixes the winding and inverts the normals, and a winding-only
+assertion passes on that broken output. Verified against a real Unreal 5.8.2
+import; see ``export.compensate_negative_scale_winding``.
 """
 
 from pathlib import Path
 import sys
 
 import bpy
+from mathutils import Vector
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -23,80 +32,84 @@ sys.path.insert(0, str(REPO_ROOT / "src" / "addons"))
 from send2ue.core import export
 
 
-FBX_PATH = Path(bpy.app.tempdir) / "send2ue_negative_scale_smoke.fbx"
-
-# The transform-relevant subset of this add-on's default FBX export settings.
-# bake_space_transform stays off, so the object transform lands on the node.
-EXPORT_SETTINGS = dict(
-    use_selection=True,
-    object_types={"ARMATURE", "MESH", "EMPTY"},
-    global_scale=1.0,
-    apply_scale_options="FBX_SCALE_NONE",
-    axis_forward="Y",
-    axis_up="Z",
-    apply_unit_scale=True,
-    bake_space_transform=False,
-    mesh_smooth_type="FACE",
-    use_mesh_modifiers=True,
-    bake_anim=False,
-)
-
-
 def clear_scene():
     for scene_object in list(bpy.data.objects):
         bpy.data.objects.remove(scene_object, do_unlink=True)
+    for mesh in list(bpy.data.meshes):
+        bpy.data.meshes.remove(mesh)
 
 
-def make_quad(name):
-    """A single quad wound counter-clockwise in XY, so its normal is +Z."""
+def make_cube(name):
+    """A closed cube with outward normals, asymmetric in X so a mirror shows."""
+    verts = [
+        (0.0, -1.0, -1.0), (2.0, -1.0, -1.0), (2.0, 1.0, -1.0), (0.0, 1.0, -1.0),
+        (0.0, -1.0, 1.0), (2.0, -1.0, 1.0), (2.0, 1.0, 1.0), (0.0, 1.0, 1.0),
+    ]
+    faces = [
+        (0, 3, 2, 1), (4, 5, 6, 7), (0, 1, 5, 4),
+        (2, 3, 7, 6), (1, 2, 6, 5), (0, 4, 7, 3),
+    ]
     mesh = bpy.data.meshes.new(f"{name}_mesh")
-    mesh.from_pydata(
-        [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)],
-        [],
-        [(0, 1, 2, 3)],
-    )
+    mesh.from_pydata(verts, [], faces)
+    mesh.validate()
     mesh.update()
     scene_object = bpy.data.objects.new(name, mesh)
     bpy.context.scene.collection.objects.link(scene_object)
     return scene_object
 
 
-def normal_z_after_transform_bake(scene_object):
-    """The face normal once the node transform is baked into the vertices.
+def measure(mesh, matrix):
+    """Return (winding_outward, shading_outward) means in baked world space.
 
-    Winding is untouched by the bake, so a negative-determinant matrix inverts
-    the effective facing. This is the step that makes the mesh arrive inside out.
+    ``matrix`` is the node transform an importer would bake in. Positions are
+    transformed, the index order is left alone, and explicit corner normals are
+    carried through the same rotation/mirror, which mirrors what Unreal does.
     """
-    mesh = scene_object.data.copy()
-    mesh.transform(scene_object.matrix_world)
-    mesh.update()
-    normal_z = mesh.polygons[0].normal.z
-    bpy.data.meshes.remove(mesh)
-    return normal_z
+    normal_matrix = matrix.to_3x3()
+    centre = Vector((0.0, 0.0, 0.0))
+    for vertex in mesh.vertices:
+        centre += matrix @ vertex.co
+    centre /= float(len(mesh.vertices))
+
+    corner_normals = [corner.vector.copy() for corner in mesh.corner_normals]
+
+    winding = 0
+    shading = 0
+    for polygon in mesh.polygons:
+        loop_indices = list(polygon.loop_indices)
+        positions = [
+            matrix @ mesh.vertices[mesh.loops[loop_index].vertex_index].co
+            for loop_index in loop_indices
+        ]
+        centroid = sum(positions, Vector((0.0, 0.0, 0.0))) / float(len(positions))
+        outward = centroid - centre
+
+        geometric = (positions[1] - positions[0]).cross(positions[2] - positions[0])
+        winding += 1 if geometric.dot(outward) >= 0.0 else -1
+
+        explicit = Vector((0.0, 0.0, 0.0))
+        for loop_index in loop_indices:
+            explicit += normal_matrix @ corner_normals[loop_index]
+        shading += 1 if explicit.dot(outward) >= 0.0 else -1
+
+    faces = float(len(mesh.polygons))
+    return winding / faces, shading / faces
 
 
-def export_and_bake(scene_object, compensate):
-    bpy.ops.object.select_all(action="DESELECT")
-    scene_object.select_set(True)
-    bpy.context.view_layer.objects.active = scene_object
-
-    if compensate:
-        with export.compensate_negative_scale_winding():
-            bpy.ops.export_scene.fbx(filepath=str(FBX_PATH), **EXPORT_SETTINGS)
-    else:
-        bpy.ops.export_scene.fbx(filepath=str(FBX_PATH), **EXPORT_SETTINGS)
-
-    clear_scene()
-    bpy.ops.import_scene.fbx(filepath=str(FBX_PATH))
-    imported = next(
-        scene_object for scene_object in bpy.data.objects
-        if scene_object.type == "MESH"
-    )
-    return normal_z_after_transform_bake(imported)
+def evaluated_measurement(scene_object):
+    """Measure the mesh the exporter would write, with the node transform baked."""
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    depsgraph.update()
+    evaluated = scene_object.evaluated_get(depsgraph)
+    mesh = evaluated.to_mesh()
+    try:
+        return measure(mesh, scene_object.matrix_world)
+    finally:
+        evaluated.to_mesh_clear()
 
 
-def negative_object_scale():
-    scene_object = make_quad("NegativeObjectScale")
+def negative_object_scale(name="NegativeObjectScale"):
+    scene_object = make_cube(name)
     scene_object.scale = (-1.0, 1.0, 1.0)
     bpy.context.view_layer.update()
     return scene_object
@@ -106,59 +119,80 @@ def negative_parent_scale():
     parent = bpy.data.objects.new("MirrorParent", None)
     bpy.context.scene.collection.objects.link(parent)
     parent.scale = (-1.0, 1.0, 1.0)
-    scene_object = make_quad("ChildOfMirroredEmpty")
+    scene_object = make_cube("ChildOfMirroredEmpty")
     scene_object.parent = parent
     bpy.context.view_layer.update()
     return scene_object
 
 
-def mirror_modifier():
-    """A Mirror *modifier* keeps the determinant positive and needs no help."""
-    scene_object = make_quad("MirrorModifier")
-    modifier = scene_object.modifiers.new(name="Mirror", type="MIRROR")
-    modifier.use_axis = (True, False, False)
-    bpy.context.view_layer.update()
-    return scene_object
+def select_only(scene_object):
+    bpy.ops.object.select_all(action="DESELECT")
+    scene_object.select_set(True)
+    bpy.context.view_layer.objects.active = scene_object
 
 
-# A positive-determinant object must be left exactly as it was.
+# The reference: no negative scale, nothing to compensate.
 clear_scene()
-positive = make_quad("PositiveScale")
-assert positive.matrix_world.to_3x3().determinant() > 0.0
-assert export_and_bake(positive, compensate=True) > 0.0
+baseline = make_cube("Baseline")
+select_only(baseline)
+with export.compensate_negative_scale_winding():
+    reference = evaluated_measurement(baseline)
+REFERENCE_WINDING, REFERENCE_SHADING = reference
+# Blender is right-handed, so a correct front face has its winding-derived
+# normal pointing outward and the two measures agree here. Unreal reports the
+# winding with the opposite sign after the FBX axis conversion; the invariant
+# that carries across both is "match the no-negative-scale baseline".
+assert REFERENCE_WINDING == 1.0, reference
+assert REFERENCE_SHADING == 1.0, reference
 
 for label, setup in (
     ("negative object scale", negative_object_scale),
     ("negative parent scale", negative_parent_scale),
 ):
-    # Without compensation the bake inverts the face.
+    # Without compensation the bake inverts the winding but not the normals.
     clear_scene()
     scene_object = setup()
     assert scene_object.matrix_world.to_3x3().determinant() < 0.0, label
-    uncompensated = export_and_bake(scene_object, compensate=False)
-    assert uncompensated < 0.0, (label, uncompensated)
+    raw_winding, raw_shading = evaluated_measurement(scene_object)
+    assert raw_winding == -REFERENCE_WINDING, (label, raw_winding)
+    assert raw_shading == REFERENCE_SHADING, (label, raw_shading)
 
-    # With compensation the two negations cancel.
+    # With compensation both match the reference. Asserting the shading value is
+    # what distinguishes this from a bare Flip Faces, which would give
+    # winding == REFERENCE_WINDING but shading == -REFERENCE_SHADING.
     clear_scene()
     scene_object = setup()
-    compensated = export_and_bake(scene_object, compensate=True)
-    assert compensated > 0.0, (label, compensated)
+    select_only(scene_object)
+    with export.compensate_negative_scale_winding():
+        winding, shading = evaluated_measurement(scene_object)
+    assert winding == REFERENCE_WINDING, (label, "winding", winding)
+    assert shading == REFERENCE_SHADING, (label, "shading", shading)
 
-# A Mirror modifier already emits correctly wound geometry, so compensation must
-# not touch it and must not flip it.
+# A Mirror modifier keeps the determinant positive and is already correct, so
+# compensation must not touch it.
 clear_scene()
-mirrored = mirror_modifier()
+mirrored = make_cube("MirrorModifier")
+modifier = mirrored.modifiers.new(name="Mirror", type="MIRROR")
+modifier.use_axis = (True, False, False)
+bpy.context.view_layer.update()
 assert mirrored.matrix_world.to_3x3().determinant() > 0.0
-assert export_and_bake(mirrored, compensate=True) > 0.0
+select_only(mirrored)
+with export.compensate_negative_scale_winding():
+    assert len(mirrored.modifiers) == 1, "compensation must skip positive determinants"
+    winding, shading = evaluated_measurement(mirrored)
+assert winding == REFERENCE_WINDING, winding
+assert shading == REFERENCE_SHADING, shading
 
 # The source object, its mesh data and its modifier stack survive unchanged.
 clear_scene()
 scene_object = negative_object_scale()
-original_normal_z = scene_object.data.polygons[0].normal.z
+original_corner_normals = [
+    tuple(round(value, 6) for value in corner.vector)
+    for corner in scene_object.data.corner_normals
+]
+original_loop_order = [loop.vertex_index for loop in scene_object.data.loops]
 original_modifier_count = len(scene_object.modifiers)
-bpy.ops.object.select_all(action="DESELECT")
-scene_object.select_set(True)
-bpy.context.view_layer.objects.active = scene_object
+select_only(scene_object)
 with export.compensate_negative_scale_winding():
     assert len(scene_object.modifiers) == original_modifier_count + 1
     assert any(
@@ -166,18 +200,20 @@ with export.compensate_negative_scale_winding():
         for group in bpy.data.node_groups
     )
 assert len(scene_object.modifiers) == original_modifier_count
-assert scene_object.data.polygons[0].normal.z == original_normal_z
+assert [loop.vertex_index for loop in scene_object.data.loops] == original_loop_order
+assert [
+    tuple(round(value, 6) for value in corner.vector)
+    for corner in scene_object.data.corner_normals
+] == original_corner_normals
 assert not any(
     group.name.startswith("__Send2UE_FlipNegativeScaleWinding__")
     for group in bpy.data.node_groups
 )
 
-# The temporary state is cleaned up even when the export raises.
+# Temporary state is cleaned up even when the export raises.
 clear_scene()
 scene_object = negative_object_scale()
-bpy.ops.object.select_all(action="DESELECT")
-scene_object.select_set(True)
-bpy.context.view_layer.objects.active = scene_object
+select_only(scene_object)
 try:
     with export.compensate_negative_scale_winding():
         raise RuntimeError("export failed")
@@ -189,5 +225,4 @@ assert not any(
     for group in bpy.data.node_groups
 )
 
-FBX_PATH.unlink(missing_ok=True)
 print("SEND2UE_NEGATIVE_SCALE_EXPORT_SMOKE_OK")

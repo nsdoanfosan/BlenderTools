@@ -46,18 +46,34 @@ def compensate_negative_scale_winding():
     winding in local space untouched, so the file itself is still consistent.
 
     An importer that bakes the node transform into the vertices - which is what
-    Unreal does on import - reverses the effective winding and the mesh arrives
-    inside out. Measured on Blender 5.1.2 with the export settings this add-on
-    uses: a ``(-1, 1, 1)`` object writes a node with determinant ``-1`` and
-    geometry whose local normal is still ``+Z``; baking that transform yields a
-    ``-Z`` face.
+    Unreal does on import - mirrors the positions but leaves the index buffer
+    alone, so the effective winding reverses and the mesh arrives inside out.
 
-    Pre-flip the faces of those objects so the importer's bake negates the
-    winding a second time and cancels out. ``hair_tool_export._join_objects``
-    already applies the same correction to the meshes it bakes; this extends it
-    to ordinary mesh exports. Temporary modifiers and their shared node group
-    are removed immediately after export, leaving the source objects, their
-    mesh data and their modifier stacks intact.
+    Only the winding is wrong. FBX carries explicit normals independently of
+    winding, and a mirror transforms them correctly, so the shading normals
+    survive the bake pointing outward. Flipping the faces on their own is
+    therefore not enough: ``Flip Faces`` reverses the winding *and* the normals,
+    which fixes the winding and breaks the normals instead. Measured against a
+    real Unreal 5.8.2 import of the same cube, against a baseline with no
+    negative scale:
+
+        baseline          winding outward -1, shading outward +1  (correct)
+        no handling       winding outward +1, shading outward +1  (winding bad)
+        Flip Faces only   winding outward -1, shading outward -1  (normals bad)
+        this             winding outward -1, shading outward +1  (correct)
+
+    (The winding sign is negative for a correct mesh because Unreal is
+    left-handed, so a right-handed ``(p1-p0) x (p2-p0)`` points inward on a
+    front face.)
+
+    So capture the corner normals first, flip the faces, then write the captured
+    normals back with ``Set Mesh Normal`` in ``FREE`` mode. The result carries
+    reversed winding with the original outward normals, and the importer's bake
+    reverses the winding once more to land on the baseline.
+
+    Temporary modifiers and their shared node group are removed immediately
+    after export, leaving the source objects, their mesh data, their custom
+    normals and their modifier stacks intact.
     """
     mirrored_objects = [
         scene_object
@@ -74,14 +90,40 @@ def compensate_negative_scale_winding():
     try:
         node_group = new_geometry_node_group('__Send2UE_FlipNegativeScaleWinding__')
         group_input = node_group.nodes.new('NodeGroupInput')
+        input_normal = node_group.nodes.new('GeometryNodeInputNormal')
+        capture_normal = node_group.nodes.new('GeometryNodeCaptureAttribute')
+        capture_normal.domain = 'CORNER'
+        capture_normal.capture_items.clear()
+        capture_normal.capture_items.new('VECTOR', 'kept_normal')
         flip_faces = node_group.nodes.new('GeometryNodeFlipFaces')
+        restore_normal = node_group.nodes.new('GeometryNodeSetMeshNormal')
+        restore_normal.mode = 'FREE'
         group_output = node_group.nodes.new('NodeGroupOutput')
+
+        # Capture on the CORNER domain so the values travel with their corners
+        # through Flip Faces, which only reorders corners within each face.
         node_group.links.new(
             group_input.outputs['Geometry'],
+            capture_normal.inputs['Geometry'],
+        )
+        node_group.links.new(
+            input_normal.outputs['Normal'],
+            capture_normal.inputs['kept_normal'],
+        )
+        node_group.links.new(
+            capture_normal.outputs['Geometry'],
             flip_faces.inputs['Mesh'],
         )
         node_group.links.new(
             flip_faces.outputs['Mesh'],
+            restore_normal.inputs['Mesh'],
+        )
+        node_group.links.new(
+            capture_normal.outputs['kept_normal'],
+            restore_normal.inputs['Custom Normal'],
+        )
+        node_group.links.new(
+            restore_normal.outputs['Mesh'],
             group_output.inputs['Geometry'],
         )
 
