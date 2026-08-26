@@ -254,6 +254,66 @@ class TestMaterialPipelineExactSidecar(unittest.TestCase):
         )
         self.assertEqual(result["errors"], [])
 
+    def test_handoff_validation_reports_scope_and_every_error(self):
+        package_name = "ue_unique_export_names_addon"
+        api_name = f"{package_name}.api"
+        constants_name = f"{package_name}.constants"
+        utils_name = f"{package_name}.utils"
+        module_names = (package_name, api_name, constants_name, utils_name)
+        previous = {name: sys.modules.get(name) for name in module_names}
+        package = types.ModuleType(package_name)
+        package.__path__ = []
+        api = types.ModuleType(api_name)
+        constants = types.ModuleType(constants_name)
+        constants.MATERIAL_PREFIX = "M_"
+        utils = types.ModuleType(utils_name)
+        utils.clean_token = lambda value: str(value)
+        errors = [f"Missing texture file: T_wood_{index:02d}_color" for index in range(12)]
+        api.collect_handoff_data = lambda context, scope: {"materials": []}
+        api.refresh_handoff_json = lambda context, scope: {
+            "errors": list(errors),
+            "json_paths": [],
+        }
+        package.api = api
+        sys.modules.update(
+            {
+                package_name: package,
+                api_name: api,
+                constants_name: constants,
+                utils_name: utils,
+            }
+        )
+        self.module.bpy.data.materials = []
+        reported = []
+        self.module.utilities.report_error = lambda message, details="": (
+            reported.append((message, details))
+            or (_ for _ in ()).throw(RuntimeError(message + details))
+        )
+        try:
+            with self.assertRaises(RuntimeError):
+                self.extension._refresh_unreal_handoff_json_or_error(
+                    types.SimpleNamespace(name="S_side_floor_v_02")
+                )
+        finally:
+            for name, value in previous.items():
+                if value is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = value
+
+        self.assertEqual(len(reported), 1)
+        details = reported[0][1]
+        # The failing material belongs to other assets, so the exported asset
+        # must not read as the owner of the problem.
+        self.assertIn("whole Export collection", details)
+        self.assertIn("S_side_floor_v_02", details)
+        self.assertIn("12 blocking issue(s)", details)
+        # Every error up to the popup limit is listed, not only the first.
+        for index in range(self.module.HANDOFF_ERROR_REPORT_LIMIT):
+            self.assertIn(errors[index], details)
+        self.assertNotIn(errors[self.module.HANDOFF_ERROR_REPORT_LIMIT], details)
+        self.assertIn("and 2 more", details)
+
     def test_material_prefix_repair_avoids_existing_name_collision(self):
         package_name = "ue_unique_export_names_addon"
         constants_name = f"{package_name}.constants"

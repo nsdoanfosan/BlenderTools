@@ -25,6 +25,9 @@ MATERIAL_PIPELINE_JSON_PATH_KEY = "_material_pipeline_json_path"
 MATERIAL_PIPELINE_JSON_FROM_EXPORT_KEY = "_material_pipeline_json_from_export"
 MATERIAL_PIPELINE_EXPECTED_MESH_NAME_KEY = "_material_pipeline_expected_mesh_name"
 MATERIAL_PIPELINE_JSON_SHA256_KEY = "_material_pipeline_json_sha256"
+# Blender's error popup is a single line, so cap what goes into it. The full
+# list always reaches the System Console.
+HANDOFF_ERROR_REPORT_LIMIT = 10
 _POST_OPERATION_SKELETAL_ASSET_PATHS = []
 
 
@@ -158,10 +161,9 @@ class MaterialPipelineExtension(ExtensionBase):
             )
             errors = result.get("errors") or []
             if errors:
-                first = errors[0]
                 utilities.report_error(
                     "Unreal handoff validation failed before Send to Unreal.",
-                    f' Target: "{target.name}". First: {first}',
+                    self._handoff_validation_details(target, errors),
                 )
 
             json_paths = result.get("json_paths") or []
@@ -178,6 +180,35 @@ class MaterialPipelineExtension(ExtensionBase):
                 "Could not validate Unreal handoff before Send to Unreal.",
                 f' Target: "{target.name}". {exc}',
             )
+
+    def _handoff_validation_details(self, target, errors):
+        """Describe every blocking handoff error, not just the first one.
+
+        Validation runs over the whole Export collection, so the material that
+        blocks the export usually belongs to a different asset than the one
+        Send to Unreal happens to be exporting. Reporting ``Target: <asset>``
+        next to ``errors[0]`` read as if that asset owned the problem, and a
+        multi-material failure took one export attempt per material to uncover.
+        Name the scope explicitly and list the errors instead.
+        """
+        for error in errors:
+            print(f"[material_pipeline] handoff validation error: {error}")
+
+        shown = errors[:HANDOFF_ERROR_REPORT_LIMIT]
+        parts = [
+            f'Scope: whole Export collection (not just "{target.name}").',
+            f"{len(errors)} blocking issue(s):",
+        ]
+        parts.extend(
+            f"{index}. {error}"
+            for index, error in enumerate(shown, start=1)
+        )
+        remaining = len(errors) - len(shown)
+        if remaining > 0:
+            parts.append(
+                f"... and {remaining} more; see the System Console for the full list."
+            )
+        return " " + " ".join(parts)
 
     def _normalize_export_material_names(self, handoff_api):
         """Apply Unreal material naming to the current live export scope.
