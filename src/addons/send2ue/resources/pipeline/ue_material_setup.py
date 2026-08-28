@@ -1454,7 +1454,11 @@ def _set_nanite(
     mesh.set_editor_property("nanite_settings", nanite)
     _notify_nanite_settings_changed(mesh)
     if enabled and shape_preservation is not None:
-        detail = "  Nanite enabled + Shape Preservation Voxelize"
+        shape_label = str(shape_preservation)
+        if "." in shape_label:
+            shape_label = shape_label.rsplit(".", 1)[-1]
+        shape_label = shape_label.strip("<> ").split(":", 1)[0]
+        detail = f"  Nanite enabled + Shape Preservation {shape_label}"
         if voxel_ndf:
             detail += " + Voxel NDF"
         if voxel_opacity:
