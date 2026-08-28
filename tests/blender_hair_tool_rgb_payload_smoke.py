@@ -54,6 +54,8 @@ scalar_values = {
     "Factor": (0.25, 0.5, 1.0),
     "AO": (0.25, 0.75, 0.5),
     "Depth": (0.5, 0.0, 1.0),
+    "ChaosWeight": (0.0, 0.25, 1.0),
+    "HairPixelDepthOffset": (1.0, 0.75, 0.125),
 }
 for name, values in scalar_values.items():
     attribute = mesh.attributes.new(name=name, type="FLOAT", domain="POINT")
@@ -155,6 +157,8 @@ for loop_index, loop in enumerate(mesh.loops):
     factor = scalar_values["Factor"][vertex_index]
     ao = scalar_values["AO"][vertex_index]
     depth = scalar_values["Depth"][vertex_index]
+    chaos_weight = scalar_values["ChaosWeight"][vertex_index]
+    pixel_depth_offset = scalar_values["HairPixelDepthOffset"][vertex_index]
     red, green, blue, _alpha = system_colors[vertex_index]
 
     uv1 = mesh.uv_layers[1].data[loop_index].uv
@@ -173,15 +177,20 @@ for loop_index, loop in enumerate(mesh.loops):
 
     color_item = mesh.color_attributes["RFAOS"].data[loop_index]
     color = color_item.color_srgb if hasattr(color_item, "color_srgb") else color_item.color
-    close(color[0], random_value, 1.0 / 255.0 + 1.0e-6)
-    close(color[1], factor, 1.0 / 255.0 + 1.0e-6)
+    close(color[0], pixel_depth_offset, 1.0 / 255.0 + 1.0e-6)
+    close(color[1], chaos_weight, 1.0 / 255.0 + 1.0e-6)
     close(color[2], ao, 1.0 / 255.0 + 1.0e-6)
     close(color[3], 1.0, 1.0 / 255.0 + 1.0e-6)
 
 contract = hair_tool_export.get_rfaos_payload_contract()
-assert contract["version"] == 3
+assert contract["version"] == 5
 assert contract["encoding"] == "HTUE_RGB_TAGGED_UV"
 assert contract["system_color_alpha_used"] is False
 assert contract["material_texcoord_indices"] == [1, 2, 3]
+assert contract["chaos_weight_attribute"] == "ChaosWeight"
+assert contract["chaos_weight_channel"] == "G"
+assert contract["pixel_depth_offset_attribute"] == "HairPixelDepthOffset"
+assert contract["pixel_depth_offset_channel"] == "R"
+assert contract["pixel_depth_offset_fallback"] == 1.0
 
 print("SEND2UE_HAIR_TOOL_RGB_PAYLOAD_SMOKE_OK")

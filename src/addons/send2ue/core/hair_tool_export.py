@@ -21,8 +21,11 @@ RFAOS_NANITE_UV_BA = 'HairTool_AO_SystemB'
 SYSTEM_COLOR_UV_INDEX = 1
 RFAOS_NANITE_UV_TAG = 6.0
 RFAOS_NANITE_UV_START_INDEX = 2
-RFAOS_PAYLOAD_VERSION = 3
+RFAOS_PAYLOAD_VERSION = 5
 RFAOS_MINIMUM_RANGE = 1.0 / 255.0
+CHAOS_WEIGHT_ATTRIBUTE = 'ChaosWeight'
+HAIR_PIXEL_DEPTH_OFFSET_ATTRIBUTE = 'HairPixelDepthOffset'
+LEGACY_CHAOS_DEPTH_MASK_ATTRIBUTE = 'ChaosDepthMask'
 EXPORT_TARGET_PROPERTY = '_htue_export_target'
 AO_MODIFIER_SETTING_IDS = {
     'samples': 'Input_3',
@@ -214,12 +217,27 @@ def _ao_statistics(mesh):
 
 
 def _pack_rfaos(mesh):
-    """Pack RFAOS plus optional Depth into vertex color and Nanite-safe UVs."""
+    """Pack the material PDO mask and cloth Weight into vertex color."""
     random_attribute = mesh.attributes.get('Random')
     factor_attribute = mesh.attributes.get('Factor')
     system_color_attribute = mesh.attributes.get('SystemColor')
     ao_attribute = mesh.attributes.get('AO')
     depth_attribute = mesh.attributes.get('Depth')
+    chaos_weight_attribute = mesh.attributes.get(CHAOS_WEIGHT_ATTRIBUTE)
+    pixel_depth_offset_attribute = mesh.attributes.get(
+        HAIR_PIXEL_DEPTH_OFFSET_ATTRIBUTE
+    )
+    if pixel_depth_offset_attribute is None:
+        pixel_depth_offset_attribute = mesh.attributes.get(
+            LEGACY_CHAOS_DEPTH_MASK_ATTRIBUTE
+        )
+        if pixel_depth_offset_attribute is not None:
+            _warn(
+                f'Hair Tool mesh "{mesh.name}" uses legacy '
+                f'"{LEGACY_CHAOS_DEPTH_MASK_ATTRIBUTE}". Rename it to '
+                f'"{HAIR_PIXEL_DEPTH_OFFSET_ATTRIBUTE}"; this export remains '
+                'compatible.'
+            )
     loop_to_polygon = _loop_to_polygon_indices(mesh)
 
     if factor_attribute is None:
@@ -243,6 +261,18 @@ def _pack_rfaos(mesh):
             f'Hair Tool mesh "{mesh.name}" has no "SystemColor" attribute. '
             'Using neutral black RGB; the System Color stage will add no color.'
         )
+    if chaos_weight_attribute is None:
+        _warn(
+            f'Hair Tool mesh "{mesh.name}" has no "{CHAOS_WEIGHT_ATTRIBUTE}" '
+            'export mask. Unreal vertex color G will use the safe fixed fallback 0.'
+        )
+    if pixel_depth_offset_attribute is None:
+        _warn(
+            f'Hair Tool mesh "{mesh.name}" has no '
+            f'"{HAIR_PIXEL_DEPTH_OFFSET_ATTRIBUTE}" export mask. Unreal vertex '
+            'color R will use the neutral fallback 1, leaving the material PDO '
+            'calculation unchanged.'
+        )
     if factor_values and max(factor_values) - min(factor_values) <= RFAOS_MINIMUM_RANGE:
         _warn(
             f'Hair Tool mesh "{mesh.name}" has a constant "Factor" attribute. '
@@ -259,6 +289,7 @@ def _pack_rfaos(mesh):
         domain='CORNER',
     )
     packed_values = []
+    vertex_color_values = []
     invalid_channels = set()
     channel_names = (
         'Random',
@@ -306,7 +337,43 @@ def _pack_rfaos(mesh):
             if not math.isfinite(value) or value < -1.0e-5 or value > 1.00001:
                 invalid_channels.add(channel_name)
                 packed[channel_index] = fallback_values[channel_index]
-        packed_values.append(tuple(min(max(value, 0.0), 1.0) for value in packed))
+        packed = tuple(min(max(value, 0.0), 1.0) for value in packed)
+        packed_values.append(packed)
+
+        vertex_channels = [
+            _attribute_component(
+                mesh,
+                pixel_depth_offset_attribute,
+                loop_index,
+                loop_to_polygon=loop_to_polygon,
+                default=1.0,
+            ),
+            _attribute_component(
+                mesh,
+                chaos_weight_attribute,
+                loop_index,
+                loop_to_polygon=loop_to_polygon,
+                default=0.0,
+            ),
+            packed[2],
+            1.0,
+        ]
+        vertex_channel_names = (
+            HAIR_PIXEL_DEPTH_OFFSET_ATTRIBUTE,
+            CHAOS_WEIGHT_ATTRIBUTE,
+            'AO vertex fallback',
+            'Reserved Alpha',
+        )
+        vertex_fallbacks = (1.0, 0.0, 1.0, 1.0)
+        for channel_index, (channel_name, value) in enumerate(
+            zip(vertex_channel_names, vertex_channels)
+        ):
+            if not math.isfinite(value) or value < -1.0e-5 or value > 1.00001:
+                invalid_channels.add(channel_name)
+                vertex_channels[channel_index] = vertex_fallbacks[channel_index]
+        vertex_color_values.append(
+            tuple(min(max(value, 0.0), 1.0) for value in vertex_channels)
+        )
 
     if invalid_channels:
         _warn(
@@ -314,16 +381,15 @@ def _pack_rfaos(mesh):
             f'{", ".join(sorted(invalid_channels))}; safe fallbacks were used.'
         )
 
-    for color_item, packed in zip(rfaos.data, packed_values):
+    for color_item, vertex_channels in zip(rfaos.data, vertex_color_values):
         # BYTE_COLOR exposes ``color`` in scene-linear space, while FBX writes
         # the underlying sRGB byte values. RFAOS contains data masks, not
         # display colors, so write the sRGB-facing property to keep the numeric
         # RGBA values unchanged when Unreal imports the FBX vertex colors.
-        vertex_fallback = (packed[0], packed[1], packed[2], 1.0)
         if hasattr(color_item, 'color_srgb'):
-            color_item.color_srgb = vertex_fallback
+            color_item.color_srgb = vertex_channels
         else:
-            color_item.color = vertex_fallback
+            color_item.color = vertex_channels
 
     for color_attribute in list(mesh.color_attributes):
         if color_attribute.name != RFAOS_NAME:
@@ -702,6 +768,19 @@ def get_rfaos_payload_contract():
         'version': RFAOS_PAYLOAD_VERSION,
         'encoding': 'HTUE_RGB_TAGGED_UV',
         'vertex_color_name': RFAOS_NAME,
+        'vertex_color_channels': {
+            'R': HAIR_PIXEL_DEPTH_OFFSET_ATTRIBUTE,
+            'G': CHAOS_WEIGHT_ATTRIBUTE,
+            'B': 'AO',
+            'A': 'ReservedOne',
+        },
+        'chaos_weight_attribute': CHAOS_WEIGHT_ATTRIBUTE,
+        'chaos_weight_channel': 'G',
+        'chaos_weight_fallback': 0.0,
+        'pixel_depth_offset_attribute': HAIR_PIXEL_DEPTH_OFFSET_ATTRIBUTE,
+        'pixel_depth_offset_channel': 'R',
+        'pixel_depth_offset_fallback': 1.0,
+        'pixel_depth_offset_legacy_attribute': LEGACY_CHAOS_DEPTH_MASK_ATTRIBUTE,
         'system_color_uv_index': SYSTEM_COLOR_UV_INDEX,
         'uv_rg_index': RFAOS_NANITE_UV_START_INDEX,
         'uv_ba_index': RFAOS_NANITE_UV_START_INDEX + 1,
