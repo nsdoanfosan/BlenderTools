@@ -39,6 +39,78 @@ AO_MODIFIER_SETTING_IDS = {
 COMBINED_MAX_RAY_DISTANCE_DEFAULT = 0.011
 
 
+def _modifier_input_group(modifier, identifier):
+    """Return one Geometry Nodes interface input on Blender 5.2+."""
+    try:
+        return modifier.properties.inputs[identifier]
+    except (AttributeError, KeyError, TypeError):
+        return None
+
+
+def _modifier_input_get(modifier, identifier, fallback=None):
+    """Read a Geometry Nodes input across Blender API generations."""
+    input_group = _modifier_input_group(modifier, identifier)
+    if input_group is not None:
+        try:
+            return input_group['value']
+        except (KeyError, TypeError):
+            return fallback
+    try:
+        return modifier.get(identifier, fallback)
+    except (AttributeError, TypeError):
+        return fallback
+
+
+def _modifier_input_set(modifier, identifier, value):
+    """Write a Geometry Nodes input across Blender API generations."""
+    input_group = _modifier_input_group(modifier, identifier)
+    if input_group is not None:
+        input_group['value'] = value
+        return
+    modifier[identifier] = value
+
+
+def _modifier_input_has(modifier, identifier):
+    """Return whether an input exists without assuming modifier IDProperties."""
+    if _modifier_input_group(modifier, identifier) is not None:
+        return True
+    try:
+        return identifier in modifier
+    except (AttributeError, TypeError):
+        return False
+
+
+def _modifier_input_delete(modifier, identifier):
+    """Delete a legacy modifier input; 5.2 interface inputs are never ad hoc."""
+    if _modifier_input_group(modifier, identifier) is not None:
+        return
+    try:
+        del modifier[identifier]
+    except (AttributeError, KeyError, TypeError):
+        pass
+
+
+def _modifier_input_values(modifier):
+    """Yield Geometry Nodes input values across Blender API generations."""
+    inputs = getattr(getattr(modifier, 'properties', None), 'inputs', None)
+    if inputs is not None:
+        for identifier in dir(inputs):
+            if identifier.startswith('_'):
+                continue
+            try:
+                input_group = inputs[identifier]
+                if 'value' in input_group:
+                    yield input_group['value']
+            except (KeyError, TypeError):
+                continue
+        return
+    try:
+        for identifier in modifier.keys():
+            yield modifier.get(identifier)
+    except (AttributeError, TypeError):
+        return
+
+
 def _warn(message):
     print(f'[send2ue][hair_tool] WARNING: {message}')
 
@@ -94,12 +166,15 @@ def _get_hair_tool_input_object(scene_object):
             or not modifier.node_group.name.startswith('Hair_System_Setup')
         ):
             continue
-        try:
-            input_object = modifier.get('Input_3')
-        except (KeyError, TypeError):
-            input_object = None
+        input_object = _modifier_input_get(modifier, 'Input_3')
         if isinstance(input_object, bpy.types.Object):
             return input_object
+        # New 5.2 node groups receive Socket_* identifiers instead of the
+        # legacy Input_* names. Hair System Setup has one upstream object
+        # input, so use it when the preserved identifier is unavailable.
+        for input_value in _modifier_input_values(modifier):
+            if isinstance(input_value, bpy.types.Object):
+                return input_value
     return None
 
 
@@ -501,15 +576,21 @@ def _remove_empty_material_slots(scene_object):
         if material is None:
             old_to_new_index[old_index] = fallback_new_index
 
-    for polygon in mesh.polygons:
-        polygon.material_index = old_to_new_index.get(
+    remapped_indices = [
+        old_to_new_index.get(
             polygon.material_index,
             fallback_new_index,
         )
+        for polygon in mesh.polygons
+    ]
 
     mesh.materials.clear()
     for material in valid_materials:
         mesh.materials.append(material)
+    # Clearing the material collection resets every polygon to slot zero.
+    # Restore the remap only after the compacted slot list is in place.
+    for polygon, material_index in zip(mesh.polygons, remapped_indices):
+        polygon.material_index = material_index
 
 
 def _apply_ao_modifier_settings(modifier, ao_settings):
@@ -517,7 +598,7 @@ def _apply_ao_modifier_settings(modifier, ao_settings):
         return
     for field, identifier in AO_MODIFIER_SETTING_IDS.items():
         if field in ao_settings:
-            modifier[identifier] = ao_settings[field]
+            _modifier_input_set(modifier, identifier, ao_settings[field])
 
 
 def _combined_ao_node_group(source_group, ao_settings=None):
@@ -592,8 +673,8 @@ def _evaluate_combined_ao(scene_object, state, ao_settings=None):
         modifier = scene_object.modifiers.new(name='__S2U_HAIR_AO', type='NODES')
         modifier.node_group = temporary_node_group
         _apply_ao_modifier_settings(modifier, ao_settings)
-        if 'Input_7' in modifier:
-            modifier['Input_7'] = 'AO'
+        if _modifier_input_has(modifier, 'Input_7'):
+            _modifier_input_set(modifier, 'Input_7', 'AO')
 
         depsgraph = bpy.context.evaluated_depsgraph_get()
         depsgraph.update()
@@ -826,8 +907,8 @@ def _evaluated_mesh_objects(
         modifier_state = {}
         for identifier in AO_MODIFIER_SETTING_IDS.values():
             modifier_state[identifier] = (
-                identifier in modifier,
-                modifier.get(identifier),
+                _modifier_input_has(modifier, identifier),
+                _modifier_input_get(modifier, identifier),
             )
         ao_setting_states.append(modifier_state)
         _apply_ao_modifier_settings(modifier, ao_settings)
@@ -874,9 +955,9 @@ def _evaluated_mesh_objects(
         ):
             for identifier, (existed, value) in modifier_state.items():
                 if existed:
-                    modifier[identifier] = value
-                elif identifier in modifier:
-                    del modifier[identifier]
+                    _modifier_input_set(modifier, identifier, value)
+                elif _modifier_input_has(modifier, identifier):
+                    _modifier_input_delete(modifier, identifier)
             modifier.show_viewport = viewport_state
         if ao_modifiers:
             depsgraph.update()

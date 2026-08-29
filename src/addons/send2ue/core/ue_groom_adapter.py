@@ -159,7 +159,20 @@ def _modifier_input(modifier, socket_name):
             and getattr(item, 'in_out', None) == 'INPUT'
             and item.name.casefold() == socket_name.casefold()
         ):
-            return modifier.get(item.identifier, getattr(item, 'default_value', None))
+            fallback = getattr(item, 'default_value', None)
+            try:
+                input_group = modifier.properties.inputs[item.identifier]
+            except (AttributeError, KeyError, TypeError):
+                input_group = None
+            if input_group is not None:
+                try:
+                    return input_group['value']
+                except (KeyError, TypeError):
+                    return fallback
+            try:
+                return modifier.get(item.identifier, fallback)
+            except (AttributeError, TypeError):
+                return fallback
     return None
 
 

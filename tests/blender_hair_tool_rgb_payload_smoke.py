@@ -8,11 +8,41 @@ import bpy
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src" / "addons"))
 
-from send2ue.core import hair_tool_export
+from send2ue.core import hair_tool_export, ue_groom_adapter
 
 
 def close(actual, expected, tolerance=1.0e-6):
     assert math.isclose(actual, expected, abs_tol=tolerance), (actual, expected)
+
+
+# Removing an empty slot must preserve the material choice of every polygon.
+slot_mesh = bpy.data.meshes.new("HTUE_MATERIAL_SLOT_SMOKE")
+slot_mesh.from_pydata(
+    [(0, 0, 0), (1, 0, 0), (0, 1, 0),
+     (2, 0, 0), (3, 0, 0), (2, 1, 0),
+     (4, 0, 0), (5, 0, 0), (4, 1, 0)],
+    [],
+    [(0, 1, 2), (3, 4, 5), (6, 7, 8)],
+)
+slot_a = bpy.data.materials.new("HTUE_SLOT_A")
+slot_b = bpy.data.materials.new("HTUE_SLOT_B")
+slot_mesh.materials.append(slot_a)
+slot_mesh.materials.append(None)
+slot_mesh.materials.append(slot_b)
+for polygon, material_index in zip(slot_mesh.polygons, (0, 1, 2)):
+    polygon.material_index = material_index
+slot_object = bpy.data.objects.new("HTUE_MATERIAL_SLOT_SMOKE", slot_mesh)
+bpy.context.scene.collection.objects.link(slot_object)
+hair_tool_export._remove_empty_material_slots(slot_object)
+assert [material.name for material in slot_mesh.materials] == [
+    "HTUE_SLOT_A",
+    "HTUE_SLOT_B",
+]
+assert [polygon.material_index for polygon in slot_mesh.polygons] == [0, 0, 1]
+bpy.data.objects.remove(slot_object, do_unlink=True)
+bpy.data.meshes.remove(slot_mesh)
+bpy.data.materials.remove(slot_a)
+bpy.data.materials.remove(slot_b)
 
 
 # Combined mode changes only a disposable copy of the Hair Tool AO group.
@@ -77,6 +107,11 @@ upstream_source = bpy.data.objects.new("Hair_Upstream_Source_SMOKE", mesh)
 export_collection.objects.link(upstream_source)
 upstream_source.parent = inherited_target
 setup_group = bpy.data.node_groups.new("Hair_System_Setup_EXPORT_SMOKE", "GeometryNodeTree")
+setup_input = setup_group.interface.new_socket(
+    name="Upstream Hair System",
+    in_out="INPUT",
+    socket_type="NodeSocketObject",
+)
 profile_group = bpy.data.node_groups.new("Hair_System_Profile_EXPORT_SMOKE", "GeometryNodeTree")
 setup_modifier = export_source.modifiers.new("Hair_System_Setup", "NODES")
 setup_modifier.node_group = setup_group
@@ -86,7 +121,17 @@ upstream_setup = upstream_source.modifiers.new("Hair_System_Setup", "NODES")
 upstream_setup.node_group = setup_group
 upstream_profile = upstream_source.modifiers.new("Profile", "NODES")
 upstream_profile.node_group = profile_group
-setup_modifier["Input_3"] = upstream_source
+hair_tool_export._modifier_input_set(setup_modifier, setup_input.identifier, upstream_source)
+assert hair_tool_export._modifier_input_has(setup_modifier, setup_input.identifier)
+assert (
+    hair_tool_export._modifier_input_get(setup_modifier, setup_input.identifier)
+    is upstream_source
+)
+assert upstream_source in hair_tool_export._modifier_input_values(setup_modifier)
+assert (
+    ue_groom_adapter._modifier_input(setup_modifier, "Upstream Hair System")
+    is upstream_source
+)
 export_source[hair_tool_export.EXPORT_TARGET_PROPERTY] = export_target
 upstream_source[hair_tool_export.EXPORT_TARGET_PROPERTY] = inherited_target
 original_parent = export_source.parent
