@@ -1365,23 +1365,23 @@ def select_all_children(
     required_collection=None,
 ):
     """
-    Selects all of an objects children.
+    Selects all of an objects children that are in the Export collection hierarchy.
 
     :param object scene_object: A object.
     :param str object_type: The type of object to select.
     :param bool exclude_postfix_tokens: Whether or not to exclude objects that have a postfix token.
-    :param object required_collection: Only select objects directly linked to this collection.
+    :param object required_collection: Only select objects in this collection hierarchy.
     """
     if required_collection is None:
         required_collection = bpy.data.collections.get(ToolInfo.EXPORT_COLLECTION.value)
-
+    required_objects = set(required_collection.all_objects) if required_collection else set()
     children = scene_object.children or get_meshes_using_armature_modifier(scene_object)
     for child_object in children:
         if child_object.type == object_type:
             from . import hair_tool_export
             if hair_tool_export.is_prepared_source(child_object):
                 pass
-            elif required_collection and required_collection not in child_object.users_collection:
+            elif required_objects and child_object not in required_objects:
                 pass
             elif exclude_postfix_tokens and any(
                 child_object.name.startswith(f'{token.value}_')
@@ -1396,7 +1396,7 @@ def select_all_children(
 
         # Parent hierarchy can contain non-export Surface/Guide meshes and
         # curves. Traverse through them, but only select explicitly enabled
-        # objects that satisfy required_collection above.
+        # objects that belong to the requested collection hierarchy.
         if child_object.children:
             select_all_children(
                 child_object,
