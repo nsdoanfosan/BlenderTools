@@ -3497,6 +3497,31 @@ def _layer_texture_remap(preset: dict, entry: dict) -> dict:
     return result
 
 
+def _unreal_helper_result_parts(result):
+    """Extract a return bool, JSON report, and errors regardless of UFUNCTION order."""
+    returned_ok = None
+    report_text = ""
+    errors = []
+    items = result if isinstance(result, tuple) else (result,)
+    for item in items:
+        if isinstance(item, bool) and returned_ok is None:
+            returned_ok = item
+        elif isinstance(item, str):
+            value = item.strip()
+            if value.startswith(("{", "[")) and not report_text:
+                report_text = item
+            elif value:
+                errors.append(item)
+        elif isinstance(item, (list, tuple, set)):
+            errors.extend(str(value) for value in item if value)
+        elif item is not None and hasattr(item, "__iter__"):
+            try:
+                errors.extend(str(value) for value in item if value)
+            except TypeError:
+                pass
+    return returned_ok, report_text, errors
+
+
 def _call_create_or_update_layer_instance(helper, parent_layer, layer_path, texture_params, scalar_params=None, vector_params=None):
     result = helper.create_or_update_material_layer_instance(
         parent_layer,
@@ -3507,17 +3532,21 @@ def _call_create_or_update_layer_instance(helper, parent_layer, layer_path, text
         False,
         True,
     )
-    if isinstance(result, tuple):
-        ok = bool(result[0]) if result else False
+    returned_ok, report_text, errors = _unreal_helper_result_parts(result)
+    try:
+        report = json.loads(report_text) if report_text else {}
+    except Exception:
         report = {}
-        if len(result) > 1 and result[1]:
-            try:
-                report = json.loads(str(result[1]))
-            except Exception:
-                report = {}
-        errors = result[2] if len(result) > 2 else []
-        return ok, errors, report
-    return bool(result), [], {}
+    ok = bool(
+        report.get(
+            "ok",
+            returned_ok
+            if returned_ok is not None
+            else bool(report.get("layer_instance")) and not errors,
+        )
+    )
+    errors.extend(str(item) for item in (report.get("errors") or []))
+    return ok, errors, report
 
 
 def _is_codex_test_asset_path(asset_path: str) -> bool:
@@ -3543,24 +3572,7 @@ def _normalize_material_layer_asset(
         raise RuntimeError(f"CodexMaterialTools {label} normalization helper missing")
 
     result = method(asset_path)
-    report_text = ""
-    errors = []
-    returned_ok = None
-    if isinstance(result, tuple):
-        if result and isinstance(result[0], bool):
-            returned_ok = bool(result[0])
-            if len(result) > 1:
-                report_text = str(result[1] or "")
-            if len(result) > 2:
-                errors = [str(item) for item in (result[2] or [])]
-        elif result and isinstance(result[0], str):
-            report_text = result[0]
-            if len(result) > 1:
-                errors = [str(item) for item in (result[1] or [])]
-    elif isinstance(result, str):
-        report_text = result
-    elif isinstance(result, bool):
-        returned_ok = result
+    returned_ok, report_text, errors = _unreal_helper_result_parts(result)
 
     try:
         report = json.loads(report_text) if report_text else {}
@@ -3581,42 +3593,91 @@ def _normalize_material_layer_asset(
         _log(f"  {label} normalized: {asset_path}")
 
 
+def _normalize_material_layer_dependencies(
+    helper,
+    preset: dict,
+    parent_layer: str,
+    mutation_scope_path: str = "",
+):
+    master_path = str(preset.get("master") or "")
+    if master_path:
+        _normalize_material_layer_asset(
+            helper,
+            "normalize_material_layer_placeholders",
+            master_path,
+            "material master",
+            mutation_scope_path=mutation_scope_path,
+        )
+    # NormalizeMaterialFunctionAttributeNodes repairs the MF_TreeMaterialBase
+    # inputs.  Generic layer/cloth parents use MF_MaterialBase instead and must
+    # never be sent through that destructive, tree-specific precondition.
+    if preset.get("key") == "tree" and parent_layer:
+        _normalize_material_layer_asset(
+            helper,
+            "normalize_material_function_attribute_nodes",
+            parent_layer,
+            "material layer function",
+            mutation_scope_path=mutation_scope_path,
+        )
+
+
+def _material_instance_background_matches(helper, mi, layer_asset):
+    """Return True/False when DumpMaterialLayers can verify the desired MYI."""
+    dump = getattr(helper, "dump_material_layers", None)
+    if dump is None:
+        return None
+    try:
+        result = dump(mi.get_path_name())
+    except Exception:
+        return None
+    returned_ok, report_text, _errors = _unreal_helper_result_parts(result)
+    try:
+        report = json.loads(report_text) if report_text else {}
+    except Exception:
+        return None
+    if not bool(report.get("ok", returned_ok)):
+        return None
+    layers = list(report.get("layers") or [])
+    if not report.get("has_layers") or not layers:
+        return False
+    background = next(
+        (row for row in layers if int(row.get("index", -1)) == 0),
+        layers[0],
+    )
+    actual = str(background.get("path") or "").split(".", 1)[0]
+    desired = str(layer_asset.get_path_name() or "").split(".", 1)[0]
+    return bool(actual and actual == desired)
+
+
 def _call_set_material_instance_background_layer(helper, mi, layer_asset):
     if hasattr(helper, "set_material_instance_background_layer_report"):
         result = helper.set_material_instance_background_layer_report(mi, layer_asset)
-        ok = False
-        report_json = ""
-        errors = []
-        if isinstance(result, tuple):
-            if result and isinstance(result[0], bool):
-                ok = bool(result[0])
-                report_json = str(result[1] if len(result) > 1 else "")
-                if len(result) > 2:
-                    errors = [str(item) for item in (result[2] or [])]
-            elif result and isinstance(result[0], str):
-                report_json = result[0]
-                if len(result) > 1:
-                    errors = [str(item) for item in (result[1] or [])]
-        elif isinstance(result, str):
-            report_json = result
-        else:
-            ok = bool(result)
+        returned_ok, report_json, errors = _unreal_helper_result_parts(result)
         if report_json:
             try:
                 report = json.loads(report_json)
                 errors.extend(str(item) for item in (report.get("errors") or []))
-                ok = bool(report.get("ok", ok) or report.get("desired_is_set"))
+                ok = bool(
+                    report.get("ok", returned_ok)
+                    or report.get("desired_is_set")
+                )
             except Exception as exc:
                 return False, [f"background layer report parse failed: {exc}"]
-        return ok, errors
+            return ok, errors
+        verified = _material_instance_background_matches(helper, mi, layer_asset)
+        if verified is not None:
+            return verified, errors
+        if errors:
+            return False, errors
     if hasattr(helper, "set_material_instance_background_layer_with_errors"):
         result = helper.set_material_instance_background_layer_with_errors(mi, layer_asset)
-        if isinstance(result, tuple):
-            changed = bool(result[0]) if result else False
-            errors = result[1] if len(result) > 1 else []
-            return changed, list(errors or [])
-        return bool(result), []
-    return bool(helper.set_material_instance_background_layer(mi, layer_asset)), []
+        returned_ok, _report_text, errors = _unreal_helper_result_parts(result)
+        changed = bool(returned_ok)
+    else:
+        changed = bool(helper.set_material_instance_background_layer(mi, layer_asset))
+        errors = []
+    verified = _material_instance_background_matches(helper, mi, layer_asset)
+    return (changed if verified is None else verified), errors
 
 
 def _assign_material_layer_instance(
@@ -3645,18 +3706,10 @@ def _assign_material_layer_instance(
         _warn("  material layer instance path is incomplete; MYI assignment skipped")
         return False
 
-    _normalize_material_layer_asset(
+    _normalize_material_layer_dependencies(
         helper,
-        "normalize_material_layer_placeholders",
-        str(preset.get("master") or ""),
-        "material master",
-        mutation_scope_path=layer_path,
-    )
-    _normalize_material_layer_asset(
-        helper,
-        "normalize_material_function_attribute_nodes",
+        preset,
         parent_layer,
-        "material layer function",
         mutation_scope_path=layer_path,
     )
 
@@ -3838,9 +3891,9 @@ def _assign_master_textures(
     mat_base: str = "",
     clear_missing_managed: bool = False,
 ) -> bool:
-    """Apply the safe texture subset without turning failures into a gate."""
+    """Apply texture parameters, gating structural material-layer failures."""
     try:
-        return _assign_master_textures_impl(
+        changed = _assign_master_textures_impl(
             mi,
             layer_maps,
             assignment,
@@ -3850,10 +3903,19 @@ def _assign_master_textures(
             clear_missing_managed=clear_missing_managed,
         )
     except Exception as exc:
+        if assignment == "material_layer_instance":
+            raise RuntimeError(
+                f"material layer instance handoff failed: {exc}"
+            ) from exc
         _warn(f"  texture parameter handoff incomplete; continuing: {exc}")
         # A role may already have been applied before the failure. Let callers
         # persist that safe subset instead of discarding the whole MI update.
         return True
+    if assignment == "material_layer_instance" and not changed:
+        raise RuntimeError(
+            "material layer instance handoff was not created or verified"
+        )
+    return changed
 
 
 def _material_instance_base_name(mat_name: str) -> str:
@@ -4476,11 +4538,22 @@ def preflight_mesh_materials(
             mi_folder = str(preset.get("mi_folder") or "").rstrip("/")
             if mat_base and mi_folder:
                 target_path = f"{mi_folder}/MI_{mat_base}"
+        target_exists = bool(
+            target_path
+            and unreal.EditorAssetLibrary.does_asset_exist(target_path)
+        )
+        target_asset = unreal.load_asset(target_path) if target_exists else None
+        needs_empty_layer_repair = _material_instance_has_empty_background_layer(
+            target_asset,
+            entry,
+            preset,
+        )
         if (
             target_path
             and _entry_reuses_material_instance_unchanged(entry, preset)
+            and not needs_empty_layer_repair
             and (
-                unreal.EditorAssetLibrary.does_asset_exist(target_path)
+                target_exists
                 or not _entry_create_if_missing(entry, preset)
             )
         ):
@@ -4496,26 +4569,14 @@ def preflight_mesh_materials(
 
     normalized = False
     for entry, preset in mutable_layer_entries:
-        master_path = str(preset.get("master") or "")
         parent_layer = _layer_parent_path(preset, entry)
-        if master_path:
-            _normalize_material_layer_asset(
-                helper,
-                "normalize_material_layer_placeholders",
-                master_path,
-                "material master",
-                mutation_scope_path=mesh_path,
-            )
-            normalized = True
-        if parent_layer:
-            _normalize_material_layer_asset(
-                helper,
-                "normalize_material_function_attribute_nodes",
-                parent_layer,
-                "material layer function",
-                mutation_scope_path=mesh_path,
-            )
-            normalized = True
+        _normalize_material_layer_dependencies(
+            helper,
+            preset,
+            parent_layer,
+            mutation_scope_path=mesh_path,
+        )
+        normalized = True
     return normalized
 
 

@@ -2092,6 +2092,148 @@ class TestRuntimeTolerantMaterialProcess(unittest.TestCase):
 
         self.module._assign_slot = assign_slot
 
+    def test_non_tree_layer_skips_tree_function_normalization(self):
+        calls = []
+        self.module._normalize_material_layer_asset = (
+            lambda _helper, method, path, label, **kwargs: calls.append(
+                (method, path, label)
+            )
+        )
+
+        self.module._normalize_material_layer_dependencies(
+            object(),
+            {"key": "layer", "master": "/Game/Material/M_LayerBlend"},
+            "/Game/Material/Layer/MY_Mesh_UV0",
+            mutation_scope_path="/Game/Material/MYI/MYI_Test",
+        )
+
+        self.assertEqual(
+            calls,
+            [
+                (
+                    "normalize_material_layer_placeholders",
+                    "/Game/Material/M_LayerBlend",
+                    "material master",
+                )
+            ],
+        )
+
+    def test_tree_layer_keeps_tree_function_normalization(self):
+        calls = []
+        self.module._normalize_material_layer_asset = (
+            lambda _helper, method, path, label, **kwargs: calls.append(
+                (method, path, label)
+            )
+        )
+
+        self.module._normalize_material_layer_dependencies(
+            object(),
+            {"key": "tree", "master": "/Game/Material/M_Tree"},
+            "/Game/Material/Tree/MY_Tree",
+            mutation_scope_path="/Game/Material/Tree/MYI/MYI_Test",
+        )
+
+        self.assertEqual(
+            [method for method, _path, _label in calls],
+            [
+                "normalize_material_layer_placeholders",
+                "normalize_material_function_attribute_nodes",
+            ],
+        )
+
+    def test_unverified_material_layer_assignment_blocks_handoff(self):
+        self.module._assign_master_textures_impl = (
+            lambda *args, **kwargs: False
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "material layer instance handoff was not created or verified",
+        ):
+            self.module._assign_master_textures(
+                FakeMaterialInstanceConstant("/Game/Material/MI_Test"),
+                [],
+                "material_layer_instance",
+            )
+
+    def test_nonstructural_texture_failure_remains_tolerant(self):
+        self.module._assign_master_textures_impl = (
+            lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("optional"))
+        )
+
+        self.assertTrue(
+            self.module._assign_master_textures(
+                FakeMaterialInstanceConstant("/Game/Material/MI_Test"),
+                [],
+                "asset_surface_flat",
+            )
+        )
+
+    def test_background_report_none_is_verified_from_dump(self):
+        mi = FakeMaterialInstanceConstant("/Game/Material/MI_Test")
+        layer = FakeMaterialInstanceConstant("/Game/Material/MYI_Test")
+
+        class Helper:
+            assigned = False
+
+            @classmethod
+            def set_material_instance_background_layer_report(cls, *_args):
+                cls.assigned = True
+                return None
+
+            @classmethod
+            def dump_material_layers(cls, _path):
+                layer_path = layer.get_path_name() if cls.assigned else ""
+                return json.dumps(
+                    {
+                        "ok": True,
+                        "has_layers": True,
+                        "layers": [{"index": 0, "path": layer_path}],
+                    }
+                )
+
+        verified, errors = self.module._call_set_material_instance_background_layer(
+            Helper, mi, layer
+        )
+
+        self.assertTrue(verified)
+        self.assertEqual(errors, [])
+
+    def test_unreal_helper_result_scans_out_parameters_by_type(self):
+        report = json.dumps({"ok": True})
+
+        returned_ok, report_text, errors = self.module._unreal_helper_result_parts(
+            (report, ["warning"], True)
+        )
+
+        self.assertTrue(returned_ok)
+        self.assertEqual(report_text, report)
+        self.assertEqual(errors, ["warning"])
+
+    def test_create_layer_accepts_python_out_params_without_return_bool(self):
+        report = json.dumps(
+            {
+                "layer_instance": "/Game/Material/MYI_Test.MYI_Test",
+                "created": True,
+            }
+        )
+
+        class Helper:
+            @staticmethod
+            def create_or_update_material_layer_instance(*_args):
+                return report, []
+
+        ok, errors, parsed = self.module._call_create_or_update_layer_instance(
+            Helper,
+            "/Game/Material/MY_Parent",
+            "/Game/Material/MYI_Test",
+            {},
+        )
+
+        self.assertTrue(ok)
+        self.assertEqual(errors, [])
+        self.assertTrue(parsed["created"])
+
     def test_existing_explicit_mi_assigns_without_master_or_mutation(self):
         target_path = "/Game/User/Materials/MI_Existing"
         user_parent = FakeMaterialInstanceConstant("/Game/User/M_UserParent")
