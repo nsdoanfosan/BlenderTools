@@ -5,7 +5,16 @@ import bpy
 import queue
 import threading
 from .constants import ToolInfo, ExtensionTasks
-from .core import export, utilities, settings, validations, extension, hair_tool_export, armature_modifier_fix
+from .core import (
+    export,
+    utilities,
+    settings,
+    validations,
+    extension,
+    hair_tool_export,
+    armature_modifier_fix,
+    preview_modifier_guard,
+)
 from .ui import file_browser, dialog, addon_preferences
 from .dependencies import unreal
 from .dependencies.rpc import blender_server
@@ -170,7 +179,14 @@ class Send2Ue(bpy.types.Operator):
         # crashing Unreal's importer.
         armature_modifier_fix.prepare()
 
+        # Viewport-only Geometry Nodes previews (for example Unreal height
+        # displacement indicators) must never be baked into the exported mesh.
+        preview_modifier_guard.prepare()
+
     def post_operation(self):
+        # Restore preview visibility before returning the user's scene state.
+        preview_modifier_guard.cleanup()
+
         # Remove the temporary armature bindings added for un-skinned child meshes.
         armature_modifier_fix.cleanup()
 

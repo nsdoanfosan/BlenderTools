@@ -529,9 +529,43 @@ class TestUeMaterialTextureImport(unittest.TestCase):
             force_reimport=force,
         )
 
+    def test_asset_class_name_reads_top_level_asset_path_struct(self):
+        asset_data = types.SimpleNamespace(
+            asset_class_path=types.SimpleNamespace(asset_name="Texture2D"),
+            asset_class="None",
+        )
+
+        self.assertEqual(
+            self.module._asset_data_class_name(asset_data),
+            "Texture2D",
+        )
+
+    def test_layered_surface_presets_route_textures_through_myi(self):
+        expected = {
+            "prop": (
+                "/Game/Material/AssetSurface/Master/MaterialLayer/MY_Mesh_UV0",
+                "/Game/Material/AssetSurface/MYI/Surface",
+            ),
+            "asset_surface": (
+                "/Game/Material/AssetSurface/Master/MaterialLayer/MY_Mesh_UV0",
+                "/Game/Material/AssetSurface/MYI/Surface",
+            ),
+            "cloth": (
+                "/Game/Material/AssetSurface/Master/MaterialLayer/MY_Cloth",
+                "/Game/Material/AssetSurface/MYI/Cloth",
+            ),
+        }
+
+        for key, (layer_parent, layer_folder) in expected.items():
+            with self.subTest(preset=key):
+                preset = self.module.MASTER_PRESETS[key]
+                self.assertEqual(preset["assignment"], "material_layer_instance")
+                self.assertEqual(preset["layer_parent"], layer_parent)
+                self.assertEqual(preset["layer_instance_folder"], layer_folder)
+
     def test_matching_md5_and_settings_skip_mutation_even_when_forced(self):
         self.add_existing_texture()
-        untouched_path = "/Game/Textures/T_Untouched"
+        untouched_path = "/Game/texture/T_Untouched"
         cache = {
             self.asset_path: os.path.getmtime(self.source_path),
             untouched_path: 123.5,
@@ -577,7 +611,7 @@ class TestUeMaterialTextureImport(unittest.TestCase):
 
     def test_stale_md5_reimports_only_requested_existing_texture(self):
         self.add_existing_texture(file_md5="1" * 32)
-        other_path = "/Game/Textures/T_Other"
+        other_path = "/Game/texture/T_Other"
         self.runtime.assets[other_path] = FakeTexture()
         self.runtime.asset_md5[other_path] = "2" * 32
         cache = {}
@@ -733,6 +767,68 @@ class TestUeMaterialTextureImport(unittest.TestCase):
             str(self.source_path),
         )
 
+    def test_local_source_reuses_unique_verified_exact_name_texture(self):
+        existing_path = "/Game/Textures/T_Surface_extra"
+        self.runtime.assets[existing_path] = FakeTexture(
+            srgb=False,
+            compression_settings="TC_MASKS",
+            max_texture_size=0,
+            virtual_texture_streaming=True,
+        )
+        self.runtime.asset_md5[existing_path] = self.source_md5
+        self.module._texture_asset_paths_named = lambda _name: [existing_path]
+        cache = {}
+
+        self.assertEqual(self.import_texture(cache), existing_path)
+
+        self.assertEqual(self.runtime.import_tasks, [])
+        self.assertIn(existing_path, cache)
+        self.assertNotIn(self.asset_path, cache)
+        self.assertTrue(
+            any(
+                "reused before import" in message
+                for message in self.runtime.logs
+            )
+        )
+
+    def test_local_source_does_not_reuse_same_name_with_wrong_md5(self):
+        existing_path = "/Game/Textures/T_Surface_extra"
+        self.runtime.assets[existing_path] = FakeTexture(
+            srgb=False,
+            compression_settings="TC_MASKS",
+            max_texture_size=0,
+            virtual_texture_streaming=True,
+        )
+        self.runtime.asset_md5[existing_path] = "0" * 32
+        self.module._texture_asset_paths_named = lambda _name: [existing_path]
+
+        self.assertEqual(self.import_texture({}), self.asset_path)
+
+        self.assertEqual(len(self.runtime.import_tasks), 1)
+        self.assertFalse(self.runtime.import_tasks[0]["replace_existing"])
+
+    def test_local_source_updates_role_settings_on_source_matching_texture(self):
+        existing_path = "/Game/Textures/T_Surface_extra"
+        existing_texture = FakeTexture(
+            srgb=False,
+            compression_settings="TC_MASKS",
+            max_texture_size=0,
+            virtual_texture_streaming=False,
+        )
+        self.runtime.assets[existing_path] = existing_texture
+        self.runtime.asset_md5[existing_path] = self.source_md5
+        self.module._texture_asset_paths_named = lambda _name: [existing_path]
+
+        self.assertEqual(self.import_texture({}), existing_path)
+
+        self.assertEqual(self.runtime.import_tasks, [])
+        self.assertEqual(self.runtime.checkout_calls, [existing_path])
+        self.assertEqual(self.runtime.save_calls, [existing_path])
+        self.assertEqual(self.runtime.revert_unchanged_calls, [existing_path])
+        self.assertTrue(
+            existing_texture.properties["virtual_texture_streaming"]
+        )
+
     def test_owned_checkout_reverts_unchanged_after_failed_reimport(self):
         self.add_existing_texture(file_md5="1" * 32)
         cache = {self.asset_path: os.path.getmtime(self.source_path)}
@@ -854,7 +950,7 @@ class TestUeMaterialTextureImport(unittest.TestCase):
         self.assertEqual(self.runtime.import_tasks, [])
         self.assertEqual(self.runtime.warnings, [])
 
-    def test_failed_local_import_reuses_only_verified_exact_registry_texture(self):
+    def test_local_import_reuses_only_verified_exact_registry_texture(self):
         fallback_path = "/Game/Shared/Textures/T_Surface_extra"
         self.runtime.assets[fallback_path] = FakeTexture(
             srgb=False,
@@ -881,7 +977,7 @@ class TestUeMaterialTextureImport(unittest.TestCase):
         )
 
         self.assertEqual(self.import_texture({}), fallback_path)
-        self.assertEqual(len(self.runtime.import_tasks), 1)
+        self.assertEqual(self.runtime.import_tasks, [])
         self.assertTrue(
             any("verified existing texture reused" in message for message in self.runtime.logs)
         )
@@ -1005,8 +1101,8 @@ class TestUeMaterialTextureImport(unittest.TestCase):
         )
 
     def test_flat_texture_setter_failure_omits_only_failed_role(self):
-        albedo_path = "/Game/Textures/T_Albedo"
-        normal_path = "/Game/Textures/T_Normal"
+        albedo_path = "/Game/texture/T_Albedo"
+        normal_path = "/Game/texture/T_Normal"
         self.runtime.assets[albedo_path] = FakeTexture()
         self.runtime.assets[normal_path] = FakeTexture()
         self.runtime.fail_texture_parameter_names.add("BaseColor")
@@ -1046,8 +1142,8 @@ class TestUeMaterialTextureImport(unittest.TestCase):
         self.assertTrue(self.runtime.warnings)
 
     def test_layer_zero_failure_does_not_keep_stale_failed_override(self):
-        albedo_path = "/Game/Textures/T_Albedo"
-        normal_path = "/Game/Textures/T_Normal"
+        albedo_path = "/Game/texture/T_Albedo"
+        normal_path = "/Game/texture/T_Normal"
         self.runtime.assets[albedo_path] = FakeTexture()
         self.runtime.assets[normal_path] = FakeTexture()
         self.runtime.fail_texture_parameter_names.add("Albedo")
@@ -1120,8 +1216,8 @@ class TestUeMaterialTextureImport(unittest.TestCase):
 
         self.assertIn("/Game/Meshes/SM_Test", paths)
         self.assertIn("/Game/Material/M_Master", paths)
-        self.assertNotIn("/Game/Textures/T_Direct", paths)
-        self.assertNotIn("/Game/Textures/T_Layer", paths)
+        self.assertNotIn("/Game/texture/T_Direct", paths)
+        self.assertNotIn("/Game/texture/T_Layer", paths)
 
     def test_codex_test_mutation_paths_keep_production_references_read_only(self):
         self.module._master_preset = lambda data, entry, mesh_path: {
@@ -2395,6 +2491,55 @@ class TestRuntimeTolerantMaterialProcess(unittest.TestCase):
         self.assertEqual(assigned, [existing])
         self.assertIs(existing.parent, master)
         self.assertEqual(self.assignments[0][1], existing)
+
+    def test_empty_generated_mi_without_explicit_layer_contract_is_repairable(self):
+        existing = FakeMaterialInstanceConstant("/Game/Material/MI/MI_Test")
+
+        class Helper:
+            @staticmethod
+            def dump_material_layers(_material_path):
+                return True, json.dumps(
+                    {
+                        "ok": True,
+                        "has_layers": True,
+                        "layers": [{"index": 0, "path": ""}],
+                    }
+                )
+
+        self.runtime.unreal_module.CodexMaterialToolsLibrary = Helper()
+        entry = {"name": "M_Test"}
+        preset = {
+            "assignment": "material_layer_instance",
+            "mi_folder": "/Game/Material/MI",
+            "layer_parent": "/Game/Material/MY_Parent",
+            "layer_instance_folder": "/Game/Material/MYI",
+        }
+
+        self.assertTrue(
+            self.module._material_instance_has_empty_background_layer(
+                existing,
+                entry,
+                preset,
+            )
+        )
+
+    def test_empty_external_mi_without_layer_contract_remains_assignment_only(self):
+        existing = FakeMaterialInstanceConstant("/Game/User/MI_Artist")
+        entry = {"name": "M_Test"}
+        preset = {
+            "assignment": "material_layer_instance",
+            "mi_folder": "/Game/Material/MI",
+            "layer_parent": "/Game/Material/MY_Parent",
+            "layer_instance_folder": "/Game/Material/MYI",
+        }
+
+        self.assertFalse(
+            self.module._material_instance_has_empty_background_layer(
+                existing,
+                entry,
+                preset,
+            )
+        )
 
     def test_empty_background_generated_mi_is_initialized_without_textures(self):
         target_path = "/Game/Material/MI/MI_Test"

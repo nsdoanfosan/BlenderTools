@@ -5,7 +5,7 @@ send2ue post_import extension(send2ue_material_pipeline.py)이 import 직후
 process_mesh(asset_path) 를 RPC 로 호출한다. 수동 실행도 가능.
 
 블렌더 애드온이 남긴 JSON 사이드카(exports/<mesh_name>.json)를 읽어:
-  1. 각 머티리얼의 텍스처를 디스크 파일에서 /Game/Textures 로 직접 import
+  1. 각 머티리얼의 텍스처를 디스크 파일에서 /Game/texture 로 직접 import
      → FBX 가 못 나르는 MetallicRoughness 포함 모든 맵이 확실히 들어온다.
   2. 텍스처 종류별로 sRGB / 노멀맵 압축을 설정.
   3. Create or load a preset material instance, then assign shared texture data.
@@ -120,7 +120,17 @@ MASTER_PRESETS = {
     "prop": {
         "master": "/Game/Material/AssetSurface/Master/M_AssetSurface_Master",
         "mi_folder": "/Game/Material/AssetSurface/MI/Surface",
-        "assignment": "asset_surface_flat",
+        "assignment": "material_layer_instance",
+        "layer_parent": "/Game/Material/AssetSurface/Master/MaterialLayer/MY_Mesh_UV0",
+        "layer_instance_folder": "/Game/Material/AssetSurface/MYI/Surface",
+        "layer_texture_remap": {
+            "Albedo": "Albedo",
+            "Extra": "Extra",
+            "Normal": "Normal",
+            "Height": "Height",
+            "Opacity Map": "Opacity Map",
+            "Subsurface": "Subsurface",
+        },
         "virtual_textures": True,
     },
     "layer": {
@@ -159,7 +169,17 @@ MASTER_PRESETS = {
     "asset_surface": {
         "master": "/Game/Material/AssetSurface/Master/M_AssetSurface_Master",
         "mi_folder": "/Game/Material/AssetSurface/MI/Surface",
-        "assignment": "asset_surface_flat",
+        "assignment": "material_layer_instance",
+        "layer_parent": "/Game/Material/AssetSurface/Master/MaterialLayer/MY_Mesh_UV0",
+        "layer_instance_folder": "/Game/Material/AssetSurface/MYI/Surface",
+        "layer_texture_remap": {
+            "Albedo": "Albedo",
+            "Extra": "Extra",
+            "Normal": "Normal",
+            "Height": "Height",
+            "Opacity Map": "Opacity Map",
+            "Subsurface": "Subsurface",
+        },
         "virtual_textures": True,
     },
     "coat": {
@@ -215,7 +235,7 @@ MASTER_PRESETS = {
 # 반투명(유리) 머티리얼은 전용 MI 를 만들지 않고 이 공유 글래스 MI 를 슬롯에 직접 할당한다.
 # (Megascan 글래스를 프로젝트로 localize 한 인스턴스. 부모 M_MS_Glass_Material, TRANSLUCENT)
 GLASS_MI_PATH        = "/Game/Material/AssetSurface/MI/MI_Prop_Glass_01"
-TEXTURES_FOLDER      = "/Game/Textures"
+TEXTURES_FOLDER      = "/Game/texture"
 EXPORT_DIR           = r"C:/Users/PARK/Documents/UE_Blender_Pipeline/exports"
 _PATH_MAPPING        = _contract_path_mapping()
 _LOCAL_ANCHOR        = str(_PATH_MAPPING.get("local_anchor") or "Forestportfolio").strip("/\\")
@@ -1100,6 +1120,44 @@ def _existing_texture_asset_path(asset_name: str, preferred_path: str = ""):
     return resolved
 
 
+def _unique_source_matching_texture(
+    asset_name: str,
+    preferred_path: str,
+    source_md5: str,
+):
+    """Return one exact-name Texture2D whose import source matches the local file."""
+    try:
+        candidates = _texture_asset_paths_named(asset_name)
+    except Exception as exc:
+        _log(f"  texture registry lookup unavailable: {asset_name} ({exc})")
+        return None, None
+    candidates = list(
+        dict.fromkeys(str(path).split(".")[0] for path in candidates if path)
+    )
+    candidates = [path for path in candidates if path != preferred_path]
+    matching = []
+    for candidate in candidates:
+        texture = _load_texture2d(candidate)
+        if texture is None:
+            continue
+        try:
+            if _asset_import_file_md5(candidate) == source_md5:
+                matching.append((candidate, texture))
+        except Exception as exc:
+            _warn(
+                "  existing texture source verification failed; candidate omitted: "
+                f"{candidate} ({exc})"
+            )
+    if len(matching) == 1:
+        return matching[0]
+    if len(matching) > 1:
+        _log(
+            "  source-matching texture lookup ambiguous; existing assets omitted: "
+            f"{asset_name} ({', '.join(path for path, _texture in matching)})"
+        )
+    return None, None
+
+
 def _import_texture_impl(
     file_path: str,
     asset_name: str,
@@ -1148,6 +1206,46 @@ def _import_texture_impl(
     )
     asset_exists = unreal.EditorAssetLibrary.does_asset_exist(full_path)
     if not asset_exists:
+        existing_path, existing_texture = _unique_source_matching_texture(
+            asset_name,
+            full_path,
+            source_md5,
+        )
+        if existing_path and existing_texture is not None:
+            settings_match = _texture_settings_match(
+                existing_texture,
+                desired_settings,
+            )
+            checkout_owned = False
+            try:
+                if not settings_match:
+                    checkout_owned = _checkout_texture_for_update(existing_path)
+                    _configure_imported_texture(
+                        existing_texture,
+                        param,
+                        virtual_texture_streaming,
+                        file_path,
+                        asset_name,
+                    )
+                    if not _save_texture_asset(existing_path):
+                        return None
+                if not _cache_verified_texture(
+                    tex_cache,
+                    existing_path,
+                    source_md5,
+                    fingerprint,
+                    existing_texture,
+                    desired_settings,
+                ):
+                    return None
+                _log(
+                    "  verified existing texture reused before import: "
+                    f"{asset_name} -> {existing_path}"
+                )
+                return existing_path
+            finally:
+                if checkout_owned:
+                    _revert_owned_texture_checkout(existing_path)
         task = _run_texture_import(file_path, asset_name, replace_existing=False)
         if not _texture_import_task_succeeded(task, full_path):
             _warn(f"  텍스처 import task 실패: {asset_name}")
@@ -1471,7 +1569,7 @@ def _set_nanite(
 
 def _sync_browser_to_mesh(mesh_path: str):
     """Content Browser 를 import 된 메쉬로 이동/선택시킨다.
-    (텍스처 import 가 마지막이라 브라우저가 /Game/Textures 로 튀는 것을 되돌림)"""
+    (텍스처 import 가 마지막이라 브라우저가 /Game/texture 로 튀는 것을 되돌림)"""
     try:
         command_line = unreal.SystemLibrary.get_command_line().casefold()
         if "-unattended" in command_line or "-run=" in command_line:
@@ -1898,13 +1996,22 @@ def _material_instance_has_empty_background_layer(mi, entry: dict, preset: dict)
     """
     if mi is None or preset.get("assignment") != "material_layer_instance":
         return False
+    mat_base = _material_instance_base_name(str(entry.get("name") or ""))
     material_layer = entry.get("material_layer")
-    if not isinstance(material_layer, dict):
+    has_explicit_layer_contract = isinstance(material_layer, dict)
+    material_layer = material_layer if has_explicit_layer_contract else {}
+    generated_mi_path = (
+        f"{str(preset.get('mi_folder') or '').rstrip('/')}/MI_{mat_base}"
+        if mat_base and preset.get("mi_folder")
+        else ""
+    )
+    actual_mi_path = str(mi.get_path_name() or "").split(".", 1)[0]
+    if not has_explicit_layer_contract and actual_mi_path != generated_mi_path:
         return False
     desired_layer = str(
         material_layer.get("instance_path")
         or _layer_instance_path(
-            _material_instance_base_name(str(entry.get("name") or "")),
+            mat_base,
             preset,
             entry,
         )
@@ -3967,6 +4074,16 @@ def _asset_data_class_name(asset_data):
         except Exception:
             continue
         if value:
+            if property_name == "asset_class_path":
+                try:
+                    class_asset_name = getattr(value, "asset_name")
+                except Exception:
+                    try:
+                        class_asset_name = value.get_editor_property("asset_name")
+                    except Exception:
+                        class_asset_name = None
+                if class_asset_name:
+                    return str(class_asset_name)
             text = str(value)
             return text.rsplit("/", 1)[-1].rsplit(".", 1)[-1].strip("'\"")
     return ""
