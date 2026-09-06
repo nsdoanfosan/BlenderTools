@@ -319,6 +319,14 @@ class FakeEditorAssetLibrary:
         self.runtime.delete_calls.append(asset_path)
         return self.runtime.assets.pop(asset_path, None) is not None
 
+    def get_metadata_tag(self, asset, key):
+        return self.runtime.metadata_tags.get((id(asset), key), "")
+
+    def set_metadata_tag(self, asset, key, value):
+        self.runtime.metadata_tags[(id(asset), key)] = value
+        self.runtime.metadata_set_calls.append((asset, key, value))
+        return True
+
 
 class FakeAssetTools:
     def __init__(self, runtime):
@@ -371,6 +379,8 @@ class FakeRuntime:
         self.assets = {}
         self.asset_md5 = {}
         self.asset_import_tags = {}
+        self.metadata_tags = {}
+        self.metadata_set_calls = []
         self.source_control_states = {}
         self.fail_import = False
         self.fail_save = False
@@ -1784,8 +1794,22 @@ class TestUeMaterialTextureImport(unittest.TestCase):
         self.assertEqual(remap["Opacity Map"], "Opacity Map")
         self.assertNotIn("Transmission", remap)
 
+    def _contract_export_path(self, mesh_name="SK_CommonGrass"):
+        path = Path(self.temp_dir.name) / f"{mesh_name}.fbx"
+        if not path.exists():
+            path.write_bytes(f"fbx-payload:{mesh_name}".encode("ascii"))
+        return path
+
     def _contract_sidecar(self, mesh_name="SK_CommonGrass"):
         contract_api = self.module._speedtree_handoff_api()
+        export_path = self._contract_export_path(mesh_name)
+        identity_fixture = json.loads(
+            (
+                Path(__file__).parent
+                / "fixtures"
+                / "prototype_identity_v1.json"
+            ).read_text(encoding="utf-8")
+        )
         entry = {
             "name": "M_stem_common_01",
             "slot_name": "M_stem_common_01",
@@ -1810,6 +1834,31 @@ class TestUeMaterialTextureImport(unittest.TestCase):
             "speedtree_handoff_contract": (
                 contract_api.build_sidecar_descriptor(mesh_name)
             ),
+            "speedtree_prototype_handoff": {
+                "schema_version": 2,
+                "prototype_identity": identity_fixture[
+                    "single_member_lineage"
+                ],
+                "prototype_identity_members": [
+                    identity_fixture["identity"]
+                ],
+                "blender_geometry_content": {
+                    "kind": (
+                        "speedtree_blender_export_geometry_content"
+                    ),
+                    "schema_version": 1,
+                    "algorithm": "sha256",
+                    "digest": "0" * 64,
+                },
+                "output_content": {
+                    "kind": "speedtree_blender_fbx_payload_content",
+                    "schema_version": 1,
+                    "algorithm": "sha256",
+                    "digest": hashlib.sha256(
+                        export_path.read_bytes()
+                    ).hexdigest(),
+                },
+            },
             "materials": [entry],
         }
 
@@ -1818,6 +1867,7 @@ class TestUeMaterialTextureImport(unittest.TestCase):
         descriptor = self.module._validate_speedtree_handoff_contract(
             data,
             "SK_CommonGrass",
+            export_file_path=str(self._contract_export_path()),
         )
 
         self.assertEqual(descriptor["asset_kind"], "speedtree")
@@ -1838,6 +1888,7 @@ class TestUeMaterialTextureImport(unittest.TestCase):
             self.module._validate_speedtree_handoff_contract(
                 bad_descriptor,
                 "SK_CommonGrass",
+                export_file_path=str(self._contract_export_path()),
             )
 
         bad_intent = self._contract_sidecar()
@@ -1848,6 +1899,7 @@ class TestUeMaterialTextureImport(unittest.TestCase):
             self.module._validate_speedtree_handoff_contract(
                 bad_intent,
                 "SK_CommonGrass",
+                export_file_path=str(self._contract_export_path()),
             )
 
         wrong_mesh = self._contract_sidecar("SK_Other")
@@ -1855,6 +1907,9 @@ class TestUeMaterialTextureImport(unittest.TestCase):
             self.module._validate_speedtree_handoff_contract(
                 wrong_mesh,
                 "SK_CommonGrass",
+                export_file_path=str(
+                    self._contract_export_path("SK_Other")
+                ),
             )
 
         legacy = {
@@ -1863,7 +1918,10 @@ class TestUeMaterialTextureImport(unittest.TestCase):
                 {"name": "M_stem_common_01", "master_preset": "tree"}
             ],
         }
-        with self.assertRaisesRegex(RuntimeError, "no speedtree_handoff_contract"):
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "tree sidecar has no speedtree_handoff_contract",
+        ):
             self.module._validate_speedtree_handoff_contract(
                 legacy,
                 "SK_CommonGrass",
@@ -1882,6 +1940,149 @@ class TestUeMaterialTextureImport(unittest.TestCase):
                 "/Game/Meshes/Props/SM_Prop",
             )
         )
+
+    def test_existing_speedtree_contract_without_prototype_keeps_legacy_path(self):
+        data = self._contract_sidecar()
+        data.pop("speedtree_prototype_handoff")
+        descriptor = self.module._validate_speedtree_handoff_contract(
+            data, "SK_CommonGrass")
+        self.assertEqual(descriptor["asset_kind"], "speedtree")
+        self.assertFalse(self.module._persist_prototype_metadata(
+            FakeSkeletalMesh([]), data, ""))
+        self.assertEqual(self.runtime.checkout_calls, [])
+        self.assertEqual(self.runtime.created_assets, [])
+        self.assertEqual(self.runtime.save_calls, [])
+
+    def test_prototype_prop_sidecar_validates_before_mutation(self):
+        handoff = self._contract_sidecar()["speedtree_prototype_handoff"]
+        prop = {
+            "mesh_name": "SM_Prop",
+            "materials": [{"name": "M_Prop", "master_preset": "prop"}],
+            "speedtree_prototype_handoff": handoff,
+        }
+        export_path = self._contract_export_path()
+        self.assertIsNone(self.module._validate_speedtree_handoff_contract(
+            prop, "SM_Prop", "/Game/Meshes/Props/SM_Prop", str(export_path)))
+        prop["speedtree_prototype_handoff"] = {"schema_version": -1}
+        with self.assertRaisesRegex(RuntimeError, "before mutation"):
+            self.module._validate_speedtree_handoff_contract(
+                prop, "SM_Prop", "/Game/Meshes/Props/SM_Prop", str(export_path))
+        prop["speedtree_prototype_handoff"] = handoff
+        export_path.write_bytes(b"unrelated replacement FBX bytes")
+        with self.assertRaisesRegex(RuntimeError, "before mutation"):
+            self.module._validate_speedtree_handoff_contract(
+                prop, "SM_Prop", "/Game/Meshes/Props/SM_Prop", str(export_path))
+        self.assertEqual(self.runtime.checkout_calls, [])
+        self.assertEqual(self.runtime.created_assets, [])
+        self.assertEqual(self.runtime.save_calls, [])
+
+    def test_prototype_metadata_persists_exact_handoff_and_sidecar_hash(self):
+        mesh = FakeSkeletalMesh([])
+        data = self._contract_sidecar()
+        sidecar_sha256 = "a" * 64
+
+        self.assertTrue(
+            self.module._persist_prototype_metadata(
+                mesh,
+                data,
+                sidecar_sha256,
+                export_file_path=str(self._contract_export_path()),
+            )
+        )
+        expected = {
+            self.module.PROTOTYPE_METADATA_IDENTITY: json.dumps(
+                data["speedtree_prototype_handoff"][
+                    "prototype_identity"
+                ],
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            self.module.PROTOTYPE_METADATA_MEMBERS: json.dumps(
+                data["speedtree_prototype_handoff"][
+                    "prototype_identity_members"
+                ],
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            self.module.PROTOTYPE_METADATA_OUTPUT: json.dumps(
+                data["speedtree_prototype_handoff"]["output_content"],
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            self.module.PROTOTYPE_METADATA_SIDECAR: sidecar_sha256,
+        }
+        self.assertEqual(
+            {
+                key: self.runtime.metadata_tags[(id(mesh), key)]
+                for key in expected
+            },
+            expected,
+        )
+        call_count = len(self.runtime.metadata_set_calls)
+        self.assertFalse(
+            self.module._persist_prototype_metadata(
+                mesh,
+                data,
+                sidecar_sha256,
+                export_file_path=str(self._contract_export_path()),
+            )
+        )
+        self.assertEqual(
+            len(self.runtime.metadata_set_calls),
+            call_count,
+        )
+
+    def test_prototype_metadata_rejects_malformed_sidecar_before_mutation(self):
+        mesh = FakeSkeletalMesh([])
+        data = self._contract_sidecar()
+        data["speedtree_prototype_handoff"]["output_content"][
+            "digest"
+        ] = "stale"
+        with self.assertRaisesRegex(ValueError, "output content"):
+            self.module._persist_prototype_metadata(
+                mesh,
+                data,
+                "b" * 64,
+                export_file_path=str(self._contract_export_path()),
+            )
+        self.assertEqual(self.runtime.metadata_set_calls, [])
+
+    def test_prototype_metadata_rehashes_current_fbx_before_mutation(self):
+        mesh = FakeSkeletalMesh([])
+        data = self._contract_sidecar()
+        export_path = self._contract_export_path()
+        original_stat = export_path.stat()
+        changed = bytearray(export_path.read_bytes())
+        changed[0] ^= 1
+        export_path.write_bytes(changed)
+        os.utime(
+            export_path,
+            ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "current FBX export payload does not match",
+        ):
+            self.module._persist_prototype_metadata(
+                mesh,
+                data,
+                "c" * 64,
+                export_file_path=str(export_path),
+            )
+        self.assertEqual(self.runtime.metadata_set_calls, [])
+        data = self._contract_sidecar()
+        with self.assertRaisesRegex(RuntimeError, "sidecar sha256"):
+            self.module._persist_prototype_metadata(
+                mesh,
+                data,
+                "not-a-sha",
+                export_file_path=str(self._contract_export_path()),
+            )
+        self.assertEqual(self.runtime.metadata_set_calls, [])
 
     def test_json_fallback_rejects_ambiguous_candidates(self):
         first = Path(self.temp_dir.name) / "first" / "SK_CommonGrass.json"

@@ -25,6 +25,110 @@ import unreal
 
 
 UNREAL_INSTANCE_PROFILE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
+PROTOTYPE_HANDOFF_KEY = "speedtree_prototype_handoff"
+PROTOTYPE_METADATA_IDENTITY = "SpeedTree.PrototypeIdentity"
+PROTOTYPE_METADATA_MEMBERS = "SpeedTree.PrototypeIdentityMembers"
+PROTOTYPE_METADATA_OUTPUT = "SpeedTree.BlenderOutputContent"
+PROTOTYPE_METADATA_SIDECAR = "SpeedTree.SidecarSHA256"
+
+
+def _prototype_identity_api():
+    module_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "prototype_identity.py",
+    )
+    spec = importlib.util.spec_from_file_location(
+        "_send2ue_ue_prototype_identity", module_path
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(
+            "Could not load bundled prototype identity rules: " + module_path
+        )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _validate_prototype_handoff(data, required=False):
+    value = data.get(PROTOTYPE_HANDOFF_KEY) if isinstance(data, dict) else None
+    if value is None:
+        if required:
+            raise ValueError(
+                "SpeedTree sidecar has no content-addressed prototype handoff"
+            )
+        return None
+    if not isinstance(value, dict) or set(value) != {
+        "schema_version",
+        "prototype_identity",
+        "prototype_identity_members",
+        "blender_geometry_content",
+        "output_content",
+    }:
+        raise ValueError("SpeedTree prototype handoff schema is incomplete or unknown")
+    if value.get("schema_version") != 2:
+        raise ValueError("SpeedTree prototype handoff schema_version is unsupported")
+    identity_api = _prototype_identity_api()
+    identity = identity_api.validate_lineage(
+        value.get("prototype_identity"),
+        value.get("prototype_identity_members"),
+    )
+    try:
+        blender_geometry = identity_api.validate_identity(
+            value.get("blender_geometry_content"),
+            expected_kind="speedtree_blender_export_geometry_content",
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "SpeedTree Blender geometry content identity is invalid"
+        ) from exc
+    try:
+        output = identity_api.validate_file_content_identity(
+            value.get("output_content"),
+            identity_api.BLENDER_FBX_CONTENT_KIND,
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "SpeedTree Blender output content identity is invalid"
+        ) from exc
+    return {
+        "schema_version": 2,
+        "prototype_identity": identity,
+        "prototype_identity_members": value[
+            "prototype_identity_members"
+        ],
+        "blender_geometry_content": blender_geometry,
+        "output_content": output,
+    }
+
+
+def _validate_current_prototype_export_payload(
+    data,
+    export_file_path,
+    required=False,
+):
+    handoff = _validate_prototype_handoff(data, required=required)
+    if handoff is None:
+        return None
+    path = str(export_file_path or "").strip()
+    if not path:
+        raise ValueError(
+            "SpeedTree prototype handoff has no exact current FBX export path"
+        )
+    identity_api = _prototype_identity_api()
+    try:
+        current = identity_api.file_content_identity(
+            path,
+            identity_api.BLENDER_FBX_CONTENT_KIND,
+        )
+    except OSError as exc:
+        raise ValueError(
+            f"SpeedTree current FBX export payload is unreadable: {path}: {exc}"
+        ) from exc
+    if current != handoff["output_content"]:
+        raise ValueError(
+            "SpeedTree current FBX export payload does not match sidecar output content"
+        )
+    return handoff
 
 
 def _candidate_contract_paths():
@@ -510,6 +614,7 @@ def _validate_speedtree_handoff_contract(
     data: dict,
     expected_mesh_name: str,
     mesh_path: str = "",
+    export_file_path: str = "",
 ):
     """Validate new contract-authored sidecars before any Unreal mutation.
 
@@ -544,6 +649,20 @@ def _validate_speedtree_handoff_contract(
         or has_tree_root
         or _is_tree_asset_path(mesh_path)
     )
+    try:
+        _validate_current_prototype_export_payload(
+            data,
+            export_file_path,
+            # Prototype identity is opt-in, independent of material preset.
+            # Unmarked existing SpeedTree and prop sidecars keep their contract.
+            required=False,
+        )
+    except ValueError as exc:
+        raise RuntimeError(
+            "SpeedTree handoff contract preflight blocked before mutation: "
+            + str(exc)
+        ) from exc
+
     if not requires_speedtree_contract:
         return None
 
@@ -668,6 +787,61 @@ def _set_texture_property_if_changed(tex, property_name: str, value) -> bool:
         return False
     tex.set_editor_property(property_name, value)
     return True
+
+
+def _persist_prototype_metadata(
+    mesh,
+    data,
+    sidecar_sha256: str,
+    export_file_path: str = "",
+) -> bool:
+    handoff = _validate_current_prototype_export_payload(
+        data,
+        export_file_path,
+        required=False,
+    )
+    if handoff is None:
+        return False
+    sidecar_digest = str(sidecar_sha256 or "").strip().casefold()
+    if re.fullmatch(r"[0-9a-f]{64}", sidecar_digest) is None:
+        raise RuntimeError(
+            "Prototype metadata requires the exact Blender-selected sidecar sha256"
+        )
+    values = {
+        PROTOTYPE_METADATA_IDENTITY: json.dumps(
+            handoff["prototype_identity"],
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        PROTOTYPE_METADATA_MEMBERS: json.dumps(
+            handoff["prototype_identity_members"],
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        PROTOTYPE_METADATA_OUTPUT: json.dumps(
+            handoff["output_content"],
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        PROTOTYPE_METADATA_SIDECAR: sidecar_digest,
+    }
+    library = unreal.EditorAssetLibrary
+    if not all(
+        hasattr(library, name)
+        for name in ("get_metadata_tag", "set_metadata_tag")
+    ):
+        raise RuntimeError("Unreal metadata tag API is unavailable")
+    changed = False
+    for key, value in values.items():
+        if str(library.get_metadata_tag(mesh, key) or "") == value:
+            continue
+        if library.set_metadata_tag(mesh, key, value) is False:
+            raise RuntimeError(f"Could not set Unreal prototype metadata tag {key}")
+        changed = True
+    return changed
 
 
 def _texture_param_from_name(file_path=None, asset_name=None):
@@ -4642,6 +4816,7 @@ def preflight_mesh_materials(
     json_path: str = None,
     expected_mesh_name: str = "",
     sidecar_sha256: str = "",
+    export_file_path: str = "",
 ) -> bool:
     """Normalize shared material-layer assets before Unreal touches an existing mesh.
 
@@ -4659,7 +4834,12 @@ def preflight_mesh_materials(
     )
     if not data:
         return False
-    _validate_speedtree_handoff_contract(data, mesh_name, mesh_path)
+    _validate_speedtree_handoff_contract(
+        data,
+        mesh_name,
+        mesh_path,
+        export_file_path=export_file_path,
+    )
     _validate_codex_test_material_scope(data, mesh_path)
 
     instance_profile_targets = _validate_instance_profile_targets(
@@ -4790,6 +4970,7 @@ def process_mesh(
     json_path: str = None,
     expected_mesh_name: str = "",
     sidecar_sha256: str = "",
+    export_file_path: str = "",
 ) -> bool:
     """단일 StaticMesh/SkeletalMesh 를 JSON 기반으로 처리. 변경이 있었으면 True.
 
@@ -4809,7 +4990,12 @@ def process_mesh(
     )
     asset_tools = None
     if data:
-        _validate_speedtree_handoff_contract(data, mesh_name, mesh_path)
+        _validate_speedtree_handoff_contract(
+            data,
+            mesh_name,
+            mesh_path,
+            export_file_path=export_file_path,
+        )
         _validate_codex_test_material_scope(data, mesh_path)
         instance_profile_targets = _validate_instance_profile_targets(
             data, mesh_path
@@ -4869,6 +5055,13 @@ def process_mesh(
         return False
 
     changed = False
+    if _persist_prototype_metadata(
+        mesh,
+        data,
+        sidecar_sha256,
+        export_file_path=export_file_path,
+    ):
+        changed = True
     json_mesh_name = str(data.get("mesh_name", ""))
     if json_mesh_name and json_mesh_name != mesh_name:
         _warn(f"JSON mesh_name mismatch: asset={mesh_name}, json={json_mesh_name}; using JSON data")

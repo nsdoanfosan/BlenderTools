@@ -142,6 +142,7 @@ class TestMaterialPipelineExactSidecar(unittest.TestCase):
             self.module.MATERIAL_PIPELINE_EXPECTED_MESH_NAME_KEY
         ] = "SK_Branch_01"
         self.asset_data[self.module.MATERIAL_PIPELINE_JSON_SHA256_KEY] = "a" * 64
+        self.asset_data["file_path"] = "D:/temp/SK_Branch_01.fbx"
         self.extension._resolve_json_path = lambda asset_path: (_ for _ in ()).throw(
             AssertionError("pre_import must keep the pre-export asset-unit sidecar")
         )
@@ -154,6 +155,17 @@ class TestMaterialPipelineExactSidecar(unittest.TestCase):
         self.assertIn(repr(exact_path), commands)
         self.assertIn("expected_mesh_name='SK_Branch_01'", commands)
         self.assertIn(f"sidecar_sha256={'a' * 64!r}", commands)
+        self.assertIn(
+            "export_file_path='D:/temp/SK_Branch_01.fbx'",
+            commands,
+        )
+
+        self.extension.post_import(self.asset_data, None)
+        post_commands = "\n".join(self.command_calls[-1])
+        self.assertIn(
+            "export_file_path='D:/temp/SK_Branch_01.fbx'",
+            post_commands,
+        )
 
     def test_pre_export_selects_only_exact_asset_unit_from_current_refresh(self):
         package_name = "ue_unique_export_names_addon"
@@ -539,6 +551,197 @@ class TestMaterialPipelineExactSidecar(unittest.TestCase):
             else:
                 sys.modules[api_name] = previous_api
 
+    def test_blender_output_content_ignores_names_and_descendant_order(self):
+        identity_fixture = json.loads(
+            (
+                Path(__file__).parent
+                / "fixtures"
+                / "prototype_identity_v1.json"
+            ).read_text(encoding="utf-8")
+        )
+
+        class IdentityMatrix:
+            def inverted_safe(self):
+                return self
+
+            def __matmul__(self, other):
+                if isinstance(other, IdentityMatrix):
+                    return self
+                return other
+
+        def mesh_object(name, x_offset):
+            vertices = [
+                types.SimpleNamespace(co=(x_offset + x, y, 0.0))
+                for x, y in (
+                    (0.0, 0.0),
+                    (1.0, 0.0),
+                    (1.0, 1.0),
+                )
+            ]
+            loops = [
+                types.SimpleNamespace(vertex_index=index)
+                for index in range(3)
+            ]
+            uv_data = [
+                types.SimpleNamespace(uv=uv)
+                for uv in ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0))
+            ]
+            mesh = types.SimpleNamespace(
+                vertices=vertices,
+                loops=loops,
+                loop_triangles=[types.SimpleNamespace(loops=(0, 1, 2))],
+                uv_layers=types.SimpleNamespace(
+                    active=types.SimpleNamespace(data=uv_data)
+                ),
+                calc_loop_triangles=lambda: None,
+            )
+            return types.SimpleNamespace(
+                name=name,
+                type="MESH",
+                data=mesh,
+                matrix_world=IdentityMatrix(),
+                children=[],
+            )
+
+        first = mesh_object("rename_is_not_identity", 0.0)
+        second = mesh_object("also_renamable", 3.0)
+        properties = {
+            self.module.PROTOTYPE_IDENTITY_OBJECT_KEY: json.dumps(
+                identity_fixture["single_member_lineage"]
+            ),
+            self.module.PROTOTYPE_IDENTITY_MEMBERS_OBJECT_KEY: json.dumps(
+                [identity_fixture["identity"]]
+            ),
+        }
+        target = types.SimpleNamespace(
+            name="renamable_root",
+            type="EMPTY",
+            matrix_world=IdentityMatrix(),
+            children=[first, second],
+            get=properties.get,
+        )
+
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        export_path = Path(temp_dir.name) / "tree.fbx"
+        export_path.write_bytes(b"current-fbx-payload")
+
+        original = self.module._prototype_handoff_for_target(
+            target,
+            export_path,
+        )
+        target.name = "different_name"
+        first.name = "different_child_name"
+        target.children.reverse()
+        reordered = self.module._prototype_handoff_for_target(
+            target,
+            export_path,
+        )
+        self.assertEqual(original, reordered)
+
+        first.data.vertices[1].co = (1.25, 0.0, 0.0)
+        changed = self.module._prototype_handoff_for_target(
+            target,
+            export_path,
+        )
+        self.assertNotEqual(
+            original["blender_geometry_content"],
+            changed["blender_geometry_content"],
+        )
+        self.assertEqual(
+            original["output_content"],
+            changed["output_content"],
+        )
+        export_path.write_bytes(b"different-fbx-byte")
+        changed_export = self.module._prototype_handoff_for_target(
+            target,
+            export_path,
+        )
+        self.assertNotEqual(
+            changed["output_content"],
+            changed_export["output_content"],
+        )
+
+        scoped = self.module._prototype_handoff_for_target(
+            target, export_path, export_objects=[first])
+        second.data.vertices[1].co = (999.0, 0.0, 0.0)
+        self.assertEqual(scoped, self.module._prototype_handoff_for_target(
+            target, export_path, export_objects=[first]))
+        self.assertNotEqual(scoped["blender_geometry_content"],
+            self.module._prototype_handoff_for_target(
+                target, export_path, export_objects=[first, second])[
+                    "blender_geometry_content"])
+
+        sidecar_path = Path(temp_dir.name) / "tree.json"
+        initial_sidecar = b'{"mesh_name":"tree"}'
+        sidecar_path.write_bytes(initial_sidecar)
+        asset_data = {
+            "file_path": str(export_path),
+            self.module.MATERIAL_PIPELINE_JSON_PATH_KEY: str(sidecar_path),
+            self.module.MATERIAL_PIPELINE_JSON_SHA256_KEY: (
+                hashlib.sha256(initial_sidecar).hexdigest()
+            ),
+        }
+        self.extension._finalize_prototype_sidecar_for_export(
+            asset_data,
+            target,
+        )
+        finalized = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            finalized[self.module.PROTOTYPE_HANDOFF_KEY]["output_content"],
+            changed_export["output_content"],
+        )
+        self.assertEqual(
+            asset_data[self.module.MATERIAL_PIPELINE_JSON_SHA256_KEY],
+            hashlib.sha256(sidecar_path.read_bytes()).hexdigest(),
+        )
+
+        # Every later mesh refresh rewrites the whole Export collection JSON.
+        # Keep only the current operation's already validated FBX binding.
+        self.module.bpy.data.objects[target.name] = target
+        sidecar_path.write_bytes(initial_sidecar)
+        self.extension._restore_finalized_prototype_sidecars_after_refresh()
+        restored_bytes = sidecar_path.read_bytes()
+        self.assertEqual(json.loads(restored_bytes), finalized)
+        self.assertEqual(
+            asset_data[self.module.MATERIAL_PIPELINE_JSON_SHA256_KEY],
+            hashlib.sha256(restored_bytes).hexdigest(),
+        )
+
+        changed_intent = b'{"mesh_name":"tree","materials":["changed"]}'
+        sidecar_path.write_bytes(changed_intent)
+        with self.assertRaisesRegex(RuntimeError, "material intent changed"):
+            self.extension._restore_finalized_prototype_sidecars_after_refresh()
+        self.assertEqual(sidecar_path.read_bytes(), changed_intent)
+
+        sidecar_path.write_bytes(initial_sidecar)
+        self.module.bpy.data.objects.pop(target.name)
+        with self.assertRaisesRegex(RuntimeError, "source lineage changed"):
+            self.extension._restore_finalized_prototype_sidecars_after_refresh()
+        self.assertEqual(sidecar_path.read_bytes(), initial_sidecar)
+        self.module.bpy.data.objects[target.name] = target
+
+        export_path.write_bytes(b"unrelated replacement FBX bytes")
+        with self.assertRaisesRegex(RuntimeError, "FBX payload changed"):
+            self.extension._restore_finalized_prototype_sidecars_after_refresh()
+        self.assertEqual(sidecar_path.read_bytes(), initial_sidecar)
+
+        self.extension.pre_operation(None)
+        self.assertEqual(self.module._PROTOTYPE_FINALIZED_SIDECARS, {})
+        self.extension._restore_finalized_prototype_sidecars_after_refresh()
+        self.assertEqual(sidecar_path.read_bytes(), initial_sidecar)
+
+    def test_disabled_post_mesh_export_has_no_sidecar_work(self):
+        self.extension.enabled = False
+        self.module.bpy.data.objects["marked"] = types.SimpleNamespace(name="marked")
+        calls = []
+        self.extension._finalize_prototype_sidecar_for_export = (
+            lambda *args: calls.append("finalize"))
+        self.extension._restore_textureless_fbx_materials = (
+            lambda name: calls.append(("restore", name)))
+        self.extension.post_mesh_export({"_mesh_object_name": "marked"}, None)
+        self.assertEqual(calls, [("restore", "marked")])
+
     def test_export_sidecar_rejects_json_mesh_name_as_authority(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             sidecar = Path(temp_dir) / "SK_Branch_01.json"
@@ -571,6 +774,91 @@ class TestMaterialPipelineExactSidecar(unittest.TestCase):
             self.module.MATERIAL_PIPELINE_JSON_SHA256_KEY,
             asset_data,
         )
+
+    def test_prototype_transfer_list_has_no_first_row_fallback(self):
+        target, _lineage, _members = self._prototype_transfer_target()
+        sidecar = {
+            "transfer_sources": [
+                {"enabled": True, "target": "Other_A"},
+                {"enabled": True, "target": "Other_B"},
+            ]
+        }
+        with self.assertRaises(RuntimeError):
+            self.extension._transfer_entry_for_target(
+                sidecar,
+                target,
+            )
+
+    def test_unmarked_target_keeps_existing_transfer_contract(self):
+        first = {"enabled": True, "target": "Other_A"}
+        matching = {"enabled": True, "target": "Expected"}
+        target = types.SimpleNamespace(name="Expected")
+        self.assertIs(self.extension._transfer_entry_for_target(
+            {"transfer_sources": [first, matching]}, target), matching)
+        self.assertIs(self.extension._transfer_entry_for_target(
+            {"transfer_sources": [first]}, target), first)
+        self.assertIs(self.extension._transfer_entry_for_target(
+            {"transfer_source": first}, target), first)
+
+    def _prototype_transfer_target(self):
+        identity_api = self.module._prototype_identity_api()
+        member = {
+            "kind": identity_api.IDENTITY_KIND,
+            "schema_version": 1,
+            "algorithm": "sha256",
+            "digest": "1" * 64,
+        }
+        lineage = identity_api.lineage_identity([member])
+        values = {
+            self.module.PROTOTYPE_IDENTITY_OBJECT_KEY: json.dumps(
+                lineage
+            ),
+            self.module.PROTOTYPE_IDENTITY_MEMBERS_OBJECT_KEY: json.dumps(
+                [member]
+            ),
+        }
+        target = types.SimpleNamespace(name="Renamed_Target")
+        target.get = lambda key: values.get(key)
+        return target, lineage, [member]
+
+    def test_prototype_transfer_uses_lineage_not_target_name(self):
+        target, lineage, members = self._prototype_transfer_target()
+        expected = {
+            "enabled": True,
+            "target": "Stale_Name",
+            "source": "Source",
+            "prototype_identity": lineage,
+            "prototype_identity_members": members,
+        }
+        selected = self.extension._transfer_entry_for_target(
+            {"transfer_sources": [expected]},
+            target,
+        )
+        self.assertIs(selected, expected)
+
+    def test_prototype_transfer_rejects_name_only_and_duplicate_lineage(self):
+        target, lineage, members = self._prototype_transfer_target()
+        with self.assertRaises(RuntimeError):
+            self.extension._transfer_entry_for_target(
+                {
+                    "transfer_sources": [{
+                        "enabled": True,
+                        "target": target.name,
+                    }]
+                },
+                target,
+            )
+
+        duplicate = {
+            "enabled": True,
+            "prototype_identity": lineage,
+            "prototype_identity_members": members,
+        }
+        with self.assertRaises(RuntimeError):
+            self.extension._transfer_entry_for_target(
+                {"transfer_sources": [duplicate, dict(duplicate)]},
+                target,
+            )
 
     def test_preflight_asset_path_uses_expected_asset_unit_not_json(self):
         path = self.extension._preflight_asset_path(
