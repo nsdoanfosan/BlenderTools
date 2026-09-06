@@ -142,6 +142,30 @@ class SourceResolutionTests(unittest.TestCase):
         self.assertEqual(result['kind'], 'MESH')
         self.assertEqual(result['asset_path'], path)
 
+    def test_missing_static_mesh_reports_missing_source(self):
+        data = placement()
+        data.update(source_pivot='Door_wood_double_01', source_requires_blueprint=False)
+        with self.assertRaisesRegex(RuntimeError, 'StaticMesh is missing'):
+            runtime.resolve_source(self.unreal, data)
+
+    def test_backup_collision_lists_candidates_and_explicit_mapping_wins(self):
+        data = placement()
+        data.update(source_pivot='Door_wood_double_01', source_requires_blueprint=False)
+        path = '/Game/Doors/Door_wood_double_01'
+        backup = '/Game/Backups/Door_wood_double_01'
+        self.assets.update({path: StaticMesh(), backup: StaticMesh()})
+        with self.assertRaisesRegex(RuntimeError, 'Multiple source StaticMeshes') as error:
+            runtime.resolve_source(self.unreal, data)
+        self.assertIn(path, str(error.exception))
+        self.assertIn(backup, str(error.exception))
+        data['asset_path'] = path
+        self.assertEqual(runtime.resolve_source(self.unreal, data)['asset_path'], path)
+
+    def test_optional_blueprint_still_takes_precedence_over_mesh(self):
+        data = placement()
+        data['source_requires_blueprint'] = False
+        self.assertEqual(runtime.resolve_source(self.unreal, data)['kind'], 'BLUEPRINT')
+
 
 class ExtensionTests(unittest.TestCase):
     def setUp(self):

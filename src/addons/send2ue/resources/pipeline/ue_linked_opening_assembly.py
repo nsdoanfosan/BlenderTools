@@ -127,8 +127,11 @@ def resolve_source(unreal, specification):
             if specification['source_requires_blueprint']:
                 raise RuntimeError('Send the source file first; its native bc_' + pivot + ' Blueprint is missing.')
             candidates = _exact_paths(unreal, pivot, 'StaticMesh')
-            if len(candidates) != 1:
-                raise RuntimeError('Expected one source StaticMesh for ' + pivot + '; send it first or set its exact Unreal asset path.')
+            if not candidates:
+                raise RuntimeError('Source StaticMesh is missing for ' + pivot + '; send its source blend first or set its exact Unreal asset path.')
+            if len(candidates) > 1:
+                raise RuntimeError('Multiple source StaticMeshes match ' + pivot + ': ' + ', '.join(candidates)
+                                   + '; set the placement to the intended Unreal asset path.')
             path = candidates[0]
     asset = unreal.load_asset(path)
     if isinstance(asset, unreal.Blueprint):

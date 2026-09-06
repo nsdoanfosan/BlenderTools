@@ -14,6 +14,7 @@ from .core import (
     hair_tool_export,
     armature_modifier_fix,
     preview_modifier_guard,
+    grouppro_export,
 )
 from .ui import file_browser, dialog, addon_preferences
 from .dependencies import unreal
@@ -198,7 +199,13 @@ class Send2Ue(bpy.types.Operator):
         # displacement indicators) must never be baked into the exported mesh.
         preview_modifier_guard.prepare()
 
+        # GroupPro Empty geometry needs Mesh objects for validation, material
+        # discovery and FBX selection. These native groups are temporary.
+        grouppro_export.prepare(bpy.context.scene.send2ue)
+
     def post_operation(self):
+        grouppro_export.cleanup()
+
         # Restore preview visibility before returning the user's scene state.
         preview_modifier_guard.cleanup()
 
