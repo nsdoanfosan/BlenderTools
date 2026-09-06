@@ -20,6 +20,7 @@ def load_module(name, path):
 
 
 PIVOTS = load_module('tested_nested_pivots', ADDON / 'core' / 'nested_pivots.py')
+BEVEL = load_module('tested_bevel_modifier_export', ADDON / 'core' / 'bevel_modifier_export.py')
 
 
 class Object:
@@ -268,6 +269,7 @@ class TestNestedPivotBoundary(unittest.TestCase):
                 if assembly:
                     asset_data['_nested_pivot_origin'] = True
                 context = Context()
+                context.evaluated_depsgraph_get = lambda: types.SimpleNamespace(update=lambda: None)
                 context.window_manager = types.SimpleNamespace(send2ue=types.SimpleNamespace(asset_data={'unit': asset_data}))
                 bpy = types.SimpleNamespace(context=context, data=types.SimpleNamespace(
                     objects={obj.name: obj for obj in all_objects}, collections={'Export': self.export},
@@ -298,6 +300,7 @@ class TestNestedPivotBoundary(unittest.TestCase):
                 )
                 namespace = {
                     'bpy': bpy, 'utilities': utilities, 'nested_pivots': PIVOTS,
+                    'bevel_modifier_export': BEVEL,
                     'extension': types.SimpleNamespace(run_extension_tasks=run_extension_tasks),
                     'ExtensionTasks': types.SimpleNamespace(
                         PRE_MESH_EXPORT=types.SimpleNamespace(value='pre'),
