@@ -5,7 +5,7 @@ import math
 import os
 import bpy
 from contextlib import contextmanager
-from . import utilities, validations, settings, ingest, extension, io, hair_tool_export, ue_groom_adapter, nested_pivots
+from . import utilities, validations, settings, ingest, extension, io, hair_tool_export, ue_groom_adapter, nested_pivots, bevel_modifier_export
 from ..constants import BlenderTypes, UnrealTypes, FileTypes, PreFixToken, ToolInfo, ExtensionTasks
 
 
@@ -536,10 +536,15 @@ def export_mesh(asset_id, mesh_object, properties, lod=0):
         )
         # instances are realized first so that the negative-scale compensation
         # runs on the geometry the exporter will actually write
-        with realize_selected_geometry_node_instances():
-            with compensate_negative_scale_winding(enabled=is_static_mesh):
-                # export selection to a file
-                export_file(properties, lod)
+        with bevel_modifier_export.enabled_for_export(
+            bpy.context.selected_objects,
+            update=bpy.context.evaluated_depsgraph_get().update,
+            enabled=bevel_modifier_export.requested_for_export(properties, is_static_mesh=is_static_mesh),
+        ):
+            with realize_selected_geometry_node_instances():
+                with compensate_negative_scale_winding(enabled=is_static_mesh):
+                    # export selection to a file
+                    export_file(properties, lod)
     finally:
         # restore the particle system display options
         utilities.restore_particles(mesh_object, existing_display_options)
