@@ -22,7 +22,8 @@ if os.environ.get('TEST_ENVIRONMENT'):
 
 unreal_response = ''
 _COMMAND_RECORDING_STACK = []
-REMOTE_EXECUTION_CONNECTION_TIMEOUT = 60.0
+REMOTE_EXECUTION_CONNECTION_TIMEOUT = 5.0
+REMOTE_EXECUTION_ATTEMPT_TIMEOUT = 1.0
 REMOTE_EXECUTION_POLL_INTERVAL = 0.1
 
 
@@ -107,14 +108,8 @@ def print_python(commands):
 
 
 def _get_remote_execution_connection_timeout():
-    """Use the existing Blender response timeout for discovery as well."""
-    try:
-        import bpy
-        from .. import __package__ as base_package
-        preferences = bpy.context.preferences.addons[base_package].preferences
-        return max(float(preferences.rpc_response_timeout), 0.1)
-    except (ImportError, KeyError, AttributeError, TypeError, ValueError):
-        return REMOTE_EXECUTION_CONNECTION_TIMEOUT
+    """Discovery must not inherit the long-running asset import timeout."""
+    return REMOTE_EXECUTION_CONNECTION_TIMEOUT
 
 
 def _remote_execution_endpoint_summary(remote_exec):
@@ -153,12 +148,18 @@ def run_unreal_python_commands(
 
     while True:
         for node in list(remote_exec.remote_nodes):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
             node_id = node.get('node_id')
             if not node_id:
                 continue
             discovered_node_ids.add(node_id)
             try:
-                remote_exec.open_command_connection(node_id)
+                remote_exec.open_command_connection(
+                    node_id,
+                    timeout=min(REMOTE_EXECUTION_ATTEMPT_TIMEOUT, remaining),
+                )
             except Exception as error:
                 last_connection_error = error
                 try:
@@ -189,13 +190,22 @@ def run_unreal_python_commands(
             break
         time.sleep(min(poll_interval, remaining))
 
+    if discovered_node_ids:
+        reason = (
+            'Unreal Editor was discovered, but its command connection did not open. '
+            'Wait for the editor to finish loading or importing, close modal dialogs, '
+            'and retry. If this persists, check the Command Endpoint and firewall. '
+        )
+    else:
+        reason = (
+            'No Unreal Editor responded. Open the target project, wait for it to load, '
+            'enable Python Remote Execution, and retry. Check the Multicast Group '
+            'Endpoint and Multicast Bind Address if the editor is already open. '
+        )
     message = (
-        'Could not find an open Unreal Editor instance with Python Remote '
-        f'Execution enabled after {connection_timeout:.1f}s '
+        reason + f'Connection timed out after {connection_timeout:.1f}s '
         f'({_remote_execution_endpoint_summary(remote_exec)}; '
-        f'discovered_nodes={len(discovered_node_ids)}). Check that Blender '
-        'and Unreal use the same Multicast Group Endpoint and Multicast Bind '
-        'Address.'
+        f'discovered_nodes={len(discovered_node_ids)}).'
     )
     if last_connection_error:
         raise ConnectionError(message) from last_connection_error
@@ -220,12 +230,12 @@ def run_commands(commands):
 
     # start a connection to the engine that lets you send python-commands.md strings
     remote_exec = remote_execution.RemoteExecution()
-    remote_exec.start()
 
     # Send over the Python code and clean up the session exactly once. The
     # command itself is never retried after dispatch because imports are not
     # generally idempotent.
     try:
+        remote_exec.start()
         return run_unreal_python_commands(remote_exec, commands)
     finally:
         remote_exec.stop()
@@ -237,9 +247,10 @@ def is_connected():
     """
     try:
         from .rpc import client
-        rpc_client = client.RPCClient(port=UNREAL_PORT)
-        return rpc_client.proxy.is_running()
-    except (RemoteDisconnected, ConnectionRefusedError, ProtocolError):
+        rpc_client = client.RPCClient(port=UNREAL_PORT, timeout=1.0)
+        with rpc_client.proxy as proxy:
+            return proxy.is_running()
+    except (OSError, RemoteDisconnected, ProtocolError):
         return False
 
 
@@ -1346,6 +1357,25 @@ class UnrealImportAsset(Unreal):
         imported_object_paths = list(
             self._import_task.get_editor_property('imported_object_paths')
         )
+        if (
+            self._asset_data.get('_nested_pivot_component')
+            and self._asset_data.get('_asset_type') == 'StaticMesh'
+        ):
+            # A task can fail without raising and leave an older asset in place.
+            # Assembly creation requires this import's exact mesh result,
+            # before any material/post-import code can operate on that old asset.
+            expected_path = str(self._asset_data.get('asset_path') or '').split('.', 1)[0]
+            imported_packages = {str(path).split('.', 1)[0] for path in imported_object_paths}
+            if not expected_path or expected_path not in imported_packages:
+                raise RuntimeError(
+                    'Assembly import did not produce the expected StaticMesh: '
+                    + expected_path + '; imported=' + repr(imported_object_paths)
+                )
+            if not isinstance(unreal.load_asset(expected_path), unreal.StaticMesh):
+                raise RuntimeError(
+                    'Assembly import result is missing or is not a StaticMesh: '
+                    + expected_path
+                )
         self.ensure_hair_tool_uv_precision(imported_object_paths)
         self.ensure_hair_tool_nanite(imported_object_paths)
         self.audit_hair_tool_payload(imported_object_paths)

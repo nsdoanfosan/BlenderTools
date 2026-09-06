@@ -1,8 +1,8 @@
 import os
+import importlib
 import bpy
 from ..utilities import report_error
 from mathutils import Vector
-from importlib.machinery import SourceFileLoader
 
 SCALE_FACTOR = 100
 
@@ -16,14 +16,12 @@ def export(**keywords):
     The functions below have been tweaked from their originals here:
     https://github.com/blender/blender-addons/blob/master/io_scene_fbx/export_fbx_bin.py
     """
-    import addon_utils
-    addons = {os.path.basename(os.path.dirname(module.__file__)): module.__file__ for module in addon_utils.modules()}
-    addon_folder_path = os.path.dirname(addons.get('io_scene_fbx'))
-
-    # this load the io_scene_fbx module from the blender FBX addon
+    # Preserve the canonical module object. Loading the package again under the
+    # same name replaces sys.modules and leaves Blender trying to unregister a
+    # different set of class objects at shutdown.
     try:
-        SourceFileLoader('io_scene_fbx', os.path.join(addon_folder_path, '__init__.py')).load_module()
-    except RuntimeError as error:
+        importlib.import_module('io_scene_fbx')
+    except (ImportError, RuntimeError) as error:
         print(error)
 
     import io_scene_fbx.export_fbx_bin as export_fbx_bin
@@ -384,9 +382,12 @@ def export(**keywords):
             loc = Vector((loc[0] * SCALE_FACTOR, loc[1] * SCALE_FACTOR, loc[2] * SCALE_FACTOR))
         elif ob_obj.type == 'MESH':
             # centers mesh object by their object origin
-            if bpy.context.scene.send2ue.use_object_origin:
-                asset_id = bpy.context.window_manager.send2ue.asset_id
-                asset_data = bpy.context.window_manager.send2ue.asset_data.get(asset_id)
+            asset_id = bpy.context.window_manager.send2ue.asset_id
+            asset_data = bpy.context.window_manager.send2ue.asset_data.get(asset_id) or {}
+            if (
+                bpy.context.scene.send2ue.use_object_origin
+                or asset_data.get('_nested_pivot_origin', False)
+            ):
 
                 # if this is a static mesh then check that all other mesh objects in this export are
                 # centered relative the asset object

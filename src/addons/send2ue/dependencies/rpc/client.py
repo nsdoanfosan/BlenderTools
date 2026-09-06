@@ -72,6 +72,16 @@ class RPCUnmarshaller(Unmarshaller):
 
 
 class RPCTransport(Transport):
+    def __init__(self, timeout=None):
+        super().__init__()
+        self.timeout = timeout
+
+    def make_connection(self, host):
+        connection = super().make_connection(host)
+        if self.timeout is not None:
+            connection.timeout = self.timeout
+        return connection
+
     def getparser(self):
         """
         Override so we can redefine our transport to use its own custom unmarshaller.
@@ -90,12 +100,12 @@ class RPCServerProxy(ServerProxy):
         """
         Override so we can redefine the ServerProxy to use our custom transport.
         """
-        kwargs['transport'] = RPCTransport()
+        kwargs['transport'] = RPCTransport(timeout=kwargs.pop('timeout', None))
         ServerProxy.__init__(self, *args, **kwargs)
 
 
 class RPCClient:
-    def __init__(self, port, marshall_exceptions=True):
+    def __init__(self, port, marshall_exceptions=True, timeout=None):
         """
         Initializes the rpc client.
 
@@ -107,6 +117,7 @@ class RPCClient:
         self.proxy = RPCServerProxy(
             f"http://{server_ip}:{port}",
             allow_none=True,
+            timeout=timeout,
         )
         self.marshall_exceptions = marshall_exceptions
         self.port = port

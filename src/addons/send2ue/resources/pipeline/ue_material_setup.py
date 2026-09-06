@@ -864,12 +864,14 @@ def _configure_imported_texture(
         file_path,
         asset_name,
     )
-    changed |= _set_texture_property_if_changed(tex, "srgb", settings["srgb"])
     changed |= _set_texture_property_if_changed(
         tex,
         "compression_settings",
         settings["compression_settings"],
     )
+    # Import auto-detection can classify blue albedo as a normal map. Unreal
+    # refuses sRGB while TC_NORMALMAP is active, so correct compression first.
+    changed |= _set_texture_property_if_changed(tex, "srgb", settings["srgb"])
     changed |= _set_texture_property_if_changed(
         tex,
         "max_texture_size",
@@ -1872,6 +1874,7 @@ def _create_or_load_mi(
     mat_base: str,
     mi_folder: str,
     manage_existing: bool = False,
+    create_if_missing: bool = True,
 ):
     mi_name = f"MI_{mat_base}"
     mi_path = f"{mi_folder}/{mi_name}"
@@ -1891,6 +1894,10 @@ def _create_or_load_mi(
             _log(f"  MI parent 변경: {mi_name} -> {master_mat.get_path_name()}")
             parent_changed = True
         return mi, mi_path, False, parent_changed, "existing"
+
+    if not create_if_missing:
+        _log(f"  target material unavailable; slot left unchanged: {mi_path}")
+        return None, mi_path, False, False, "missing"
 
     copy_from_path = _derive_number_suffix_copy_source(mi_path)
     if copy_from_path:
@@ -1979,8 +1986,8 @@ def _entry_reuses_material_instance_unchanged(entry: dict, preset: dict) -> bool
     """Return whether an existing MI is assignment-only."""
     if _entry_manages_existing_material_instance(entry):
         return False
-    # These fields still document ownership intent, but default reuse is broad:
-    # finding an exact MI ends texture discovery and mutation for this slot.
+    # These fields still document ownership intent, but default MI/MYI reuse is
+    # broad. Texture2D content is synchronized separately from material mutation.
     return True
 
 
@@ -2442,13 +2449,16 @@ def _load_or_copy_target_material(
     if existing is not None:
         return existing, target_path, False, "existing"
 
+    # Duplication also creates an asset. Respect assignment-only intent before
+    # deriving a suffix copy source or using an explicit copy source.
+    if not create_if_missing:
+        _log(f"  target material unavailable; slot left unchanged: {target_path}")
+        return None, target_path, False, "missing"
+
     if not copy_from_path:
         copy_from_path = _derive_number_suffix_copy_source(target_path)
 
     if not copy_from_path:
-        if not create_if_missing:
-            _log(f"  target material unavailable; slot left unchanged: {target_path}")
-            return None, target_path, False, "missing"
         if master_mat is None:
             _log(
                 "  target material and master unavailable; slot left unchanged: "
@@ -3147,6 +3157,20 @@ def _import_layer_textures(
     return layer_maps
 
 
+def _sync_entry_texture_assets(entry: dict, preset: dict, tex_cache: dict):
+    """Import or refresh sidecar textures without taking ownership of an MI/MYI.
+
+    Existing material instances can remain assignment-only while the Texture2D
+    assets they already reference still follow the latest Blender handoff.  The
+    content-hash gate in :func:`_import_texture` keeps unchanged textures a no-op.
+    """
+    return _import_layer_textures(
+        _entry_layers(entry, preset),
+        tex_cache,
+        virtual_texture_streaming=preset.get("virtual_textures"),
+    )
+
+
 def reimport_textures_from_json(json_path: str) -> int:
     json_path = os.path.abspath(str(json_path or ""))
     if not os.path.isfile(json_path):
@@ -3327,7 +3351,9 @@ def _texture_parameter_name(parameter_value):
 
 def _parameter_association_key(value) -> str:
     text = str(value or "GLOBAL_PARAMETER")
-    return text.rsplit(".", 1)[-1].strip().upper()
+    # Unreal 5.8 renders enums as '<MaterialParameterAssociation.GLOBAL_PARAMETER: 2>'.
+    # A bare string and the live enum must identify the same owned binding.
+    return text.rsplit(".", 1)[-1].split(":", 1)[0].strip(" <>\t\r\n").upper()
 
 
 def _texture_parameter_binding(parameter_value):
@@ -3932,6 +3958,22 @@ def _assign_material_layer_instance(
         _warn(f"  background MYI assignment not verified: {layer_path}")
         return False
     changed = layer_overrides_pruned or overrides_pruned or changed
+    # SetMaterialLayers can be a no-op when the MYI path stays the same. Its
+    # changed parameter values still require rebuilding the owning MI's cached
+    # render parameters/permutation; otherwise the viewport keeps parent defaults.
+    # Save directly to avoid the newly-created MYI thumbnail path on UE 5.8.
+    safe_save = getattr(helper, "save_asset_package_without_thumbnail", None)
+    if callable(safe_save):
+        # Refresh the function instance first. Updating only the owning MI leaves
+        # stale compiled MYI texture/sampler state (including VT aspect ratios).
+        unreal.MaterialEditingLibrary.update_material_function(layer_asset)
+        if not safe_save(layer_asset):
+            raise RuntimeError(f"material layer refresh save failed: {layer_path}")
+        unreal.MaterialEditingLibrary.update_material_instance(mi)
+        if not safe_save(mi):
+            raise RuntimeError(f"layer-backed material refresh save failed: {mi.get_path_name()}")
+        changed = True
+        _log(f"  layer-backed MI render parameters refreshed: {mi.get_path_name()}")
     _log(f"  background MYI <- {layer_path}")
     return changed
 
@@ -4792,7 +4834,8 @@ def process_mesh(
             if not helper.save_asset_package_without_thumbnail(mesh):
                 raise RuntimeError(f"safe skeletal-mesh save failed: {mesh_path}")
             return
-        unreal.EditorAssetLibrary.save_asset(mesh_path)
+        if not unreal.EditorAssetLibrary.save_asset(mesh_path):
+            raise RuntimeError(f"static-mesh save failed: {mesh_path}")
 
     # Nanite: import 되는 StaticMesh 에 켜되, 반투명 머티리얼 메쉬는 끈다.
     # (JSON 이 없으면 불투명으로 가정 → 켬. 반투명으로 판정되면 이미 켜져 있어도 끈다.)
@@ -4854,16 +4897,19 @@ def process_mesh(
                 continue
             slot_index = int(entry.get("slot_index", 0))
 
+        preset = _master_preset(data, entry, mesh_path)
         profile_target = instance_profile_targets.get(entry_index)
         if (
             profile_target
             and profile_target.get("target_existed")
             and profile_target.get("asset") is not None
         ):
+            _sync_entry_texture_assets(entry, preset, tex_cache)
             assigned_mi = profile_target["asset"]
             _log(
                 f"  existing profile '{profile_target['profile']}' -> "
-                f"{profile_target['target_path']} (reused without base or texture work)"
+                f"{profile_target['target_path']} "
+                "(texture assets synchronized; MI reused unchanged)"
             )
             if _is_skeletal_mesh(mesh):
                 skeletal_slot_assignments[slot_index] = (slot_name, assigned_mi)
@@ -4871,7 +4917,6 @@ def process_mesh(
                 changed = True
             continue
 
-        preset = _master_preset(data, entry, mesh_path)
         if preset.get("key") == "hair":
             reuse_unchanged = _entry_reuses_material_instance_unchanged(
                 entry,
@@ -4889,12 +4934,8 @@ def process_mesh(
             reuse_unchanged = bool(reuse_unchanged and not mi_created)
             if _is_skeletal_mesh(mesh) and not reuse_unchanged:
                 _ensure_hair_master_skeletal_mesh_usage(mi)
+            layer_maps = _sync_entry_texture_assets(entry, preset, tex_cache)
             if not reuse_unchanged:
-                layer_maps = _import_layer_textures(
-                    _entry_layers(entry, preset),
-                    tex_cache,
-                    virtual_texture_streaming=preset.get("virtual_textures"),
-                )
                 if _assign_hair_tool_parameters(
                     mi,
                     entry,
@@ -4923,7 +4964,6 @@ def process_mesh(
                 changed = True
             continue
 
-        preset = _master_preset(data, entry, mesh_path)
         if target_material_path:
             copy_from_path = _entry_copy_source_material_path(entry)
             existing_mi = _load_exact_material_instance(target_material_path)
@@ -4961,6 +5001,7 @@ def process_mesh(
                 )
             if mi is None:
                 continue
+            layer_maps = _sync_entry_texture_assets(entry, preset, tex_cache)
             parent_changed = False
             if selected_master is not None and not reuse_unchanged:
                 try:
@@ -4977,12 +5018,6 @@ def process_mesh(
             )
             params_changed = False
             if not reuse_unchanged:
-                layers = _entry_layers(entry, preset)
-                layer_maps = _import_layer_textures(
-                    layers,
-                    tex_cache,
-                    virtual_texture_streaming=preset.get("virtual_textures"),
-                )
                 mat_base = _material_instance_base_name(mat_name)
                 params_changed = _assign_master_textures(
                     mi,
@@ -5033,11 +5068,7 @@ def process_mesh(
             f"(base: {mat_base}, master: {preset['key']})"
         )
 
-        # 1. 텍스처 직접 import (소스가 안 바뀌었으면 캐시 히트로 skip)
-        layers = None
-        layer_maps = None
-
-        # 2. MI 생성/로드
+        # 1. MI 생성/로드
         if existing_unchanged is not None and not initialize_empty_layer:
             mi = existing_unchanged
             mi_path = generated_mi_path
@@ -5051,6 +5082,7 @@ def process_mesh(
                 mat_base,
                 preset["mi_folder"],
                 manage_existing=(manage_existing or initialize_empty_layer),
+                create_if_missing=_entry_create_if_missing(entry, preset),
             )
         if mi is None:
             profile_target = instance_profile_targets.get(entry_index)
@@ -5066,9 +5098,10 @@ def process_mesh(
                     changed = True
             continue
 
-        # 3. An exact existing MI wins by default. Texture discovery and managed
-        # override mutation only apply to a newly created/copied MI, or to an
-        # existing MI whose contract explicitly declares pipeline ownership.
+        # 2. Texture2D content always follows the sidecar, even when an exact MI
+        # remains assignment-only. Parameter/parent mutation still requires a
+        # newly created/copied MI or explicit pipeline ownership.
+        layer_maps = _sync_entry_texture_assets(entry, preset, tex_cache)
         reuse_unchanged = bool(
             mi_source == "existing"
             and not manage_existing
@@ -5076,14 +5109,10 @@ def process_mesh(
         )
         params_changed = False
         if reuse_unchanged:
-            _log(f"  existing MI reused unchanged: {mi_path}")
-        else:
-            layers = _entry_layers(entry, preset)
-            layer_maps = _import_layer_textures(
-                layers,
-                tex_cache,
-                virtual_texture_streaming=preset.get("virtual_textures"),
+            _log(
+                f"  existing MI reused unchanged after texture asset sync: {mi_path}"
             )
+        else:
             params_changed = _assign_master_textures(
                 mi,
                 layer_maps,
@@ -5102,7 +5131,7 @@ def process_mesh(
         elif parent_changed or params_changed:
             changed = True
 
-        # 4. Keep the base MI/MYI pipeline-managed. A profile target is
+        # 3. Keep the base MI/MYI pipeline-managed. A profile target is
         # user-owned and assignment-only: do not save, reparent, or edit it.
         assigned_mi = mi
         profile_target = instance_profile_targets.get(entry_index)
