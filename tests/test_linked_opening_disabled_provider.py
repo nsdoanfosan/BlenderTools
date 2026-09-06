@@ -16,13 +16,11 @@ class ProviderLifecycleTests(unittest.TestCase):
         self.provider = ModuleType('linked_opening_assembly.send2ue_manifest')
         self.provider.for_export = Mock(return_value=None)
         self.provider.filter_objects = Mock(side_effect=lambda *args: args)
-        self.scene_type = type('Scene', (), {})
-        self.object_type = type('Object', (), {})
+        self.provider.is_registered = Mock(return_value=False)
         modules = {name: ModuleType(name) for name in (
-            'bpy', 'send2ue', 'send2ue.constants', 'send2ue.core',
+            'send2ue', 'send2ue.constants', 'send2ue.core',
             'send2ue.core.extension', 'send2ue.dependencies', 'send2ue.dependencies.unreal',
             'linked_opening_assembly')}
-        modules['bpy'].types = SimpleNamespace(Scene=self.scene_type, Object=self.object_type)
         modules['send2ue.constants'].UnrealTypes = SimpleNamespace(STATIC_MESH='StaticMesh')
         modules['send2ue.core.extension'].ExtensionBase = object
         modules['send2ue.dependencies.unreal'].run_commands = Mock()
@@ -44,31 +42,40 @@ class ProviderLifecycleTests(unittest.TestCase):
         self.provider.filter_objects.assert_not_called()
         self.provider.for_export.assert_not_called()
 
-    def test_absent_provider_is_inactive_even_if_rna_exists(self):
-        self.scene_type.loa_settings = object()
-        self.object_type.loa_settings = object()
-        sys.modules.pop('linked_opening_assembly')
+    def test_absent_provider_is_inactive(self):
+        sys.modules.pop('linked_opening_assembly.send2ue_manifest')
         self.assert_inactive()
 
     def test_cached_unregistered_provider_is_inactive(self):
         self.assert_inactive()
 
-    def test_partial_provider_registration_is_inactive(self):
-        self.scene_type.loa_settings = object()
-        self.assert_inactive()
-        del self.scene_type.loa_settings
-        self.object_type.loa_settings = object()
+    def test_provider_without_registration_contract_is_inactive(self):
+        del self.provider.is_registered
         self.assert_inactive()
 
-    def test_disable_after_registered_export_stops_dispatch(self):
-        self.scene_type.loa_settings = object()
-        self.object_type.loa_settings = object()
+    def test_enabled_legacy_provider_requires_matching_update(self):
+        del self.provider.is_registered
+        sys.modules['linked_opening_assembly'].__addon_enabled__ = True
+        with self.assertRaisesRegex(RuntimeError, 'Update both addons and restart Blender'):
+            self.extension.filter_objects([], ['house'], [])
+        self.provider.filter_objects.assert_not_called()
+
+    def test_disable_and_reenable_follow_provider_lifecycle(self):
+        self.provider.is_registered.return_value = True
         self.extension.filter_objects([], ['house'], [])
         self.provider.filter_objects.assert_called_once()
         self.provider.filter_objects.reset_mock()
-        del self.scene_type.loa_settings
-        del self.object_type.loa_settings
+        self.provider.is_registered.return_value = False
         self.assert_inactive()
+        self.provider.is_registered.return_value = True
+        self.extension.filter_objects([], ['house'], [])
+        self.provider.filter_objects.assert_called_once()
+
+    def test_active_provider_export_errors_propagate(self):
+        self.provider.is_registered.return_value = True
+        self.provider.for_export.side_effect = ValueError('Invalid authored placement')
+        with self.assertRaisesRegex(ValueError, 'Invalid authored placement'):
+            self.extension.pre_mesh_export({'_asset_type': 'StaticMesh'}, None)
 
 
 if __name__ == '__main__':

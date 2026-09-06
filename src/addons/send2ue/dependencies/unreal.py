@@ -1358,7 +1358,8 @@ class UnrealImportAsset(Unreal):
             self._import_task.get_editor_property('imported_object_paths')
         )
         if (
-            self._asset_data.get('_nested_pivot_component')
+            (self._asset_data.get('_nested_pivot_component')
+             or self._asset_data.get('_linked_opening_assembly'))
             and self._asset_data.get('_asset_type') == 'StaticMesh'
         ):
             # A task can fail without raising and leave an older asset in place.

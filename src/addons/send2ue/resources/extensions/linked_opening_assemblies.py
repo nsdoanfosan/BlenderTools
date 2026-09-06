@@ -5,7 +5,6 @@ Blueprint assembly; this extension never exports linked window/door sources.
 """
 
 import copy
-import importlib
 import json
 from pathlib import Path
 import sys
@@ -22,18 +21,21 @@ PIPELINE_FILE = (Path(__file__).resolve().parent.parent / 'pipeline' /
 
 
 def _authoring_api():
-    # Do not activate another addon or change ordinary exports when it is absent.
-    if 'linked_opening_assembly' not in sys.modules:
+    # The provider owns its lifecycle. Cached modules alone are not registration,
+    # and an export must never import or activate another addon on its behalf.
+    api = sys.modules.get('linked_opening_assembly.send2ue_manifest')
+    is_registered = getattr(api, 'is_registered', None)
+    if not callable(is_registered):
+        package = sys.modules.get('linked_opening_assembly')
+        if getattr(package, '__addon_enabled__', False):
+            raise RuntimeError(
+                'Linked Opening Assembly and Send2UE require matching provider lifecycle versions. '
+                'Update both addons and restart Blender before exporting.'
+            )
         return None
-    import bpy
-    # Disabling a Blender addon leaves its modules cached but removes its RNA.
-    # Guard actual registration so unrelated exports still work after disable.
-    if (
-        not hasattr(bpy.types.Scene, 'loa_settings')
-        or not hasattr(bpy.types.Object, 'loa_settings')
-    ):
+    if not is_registered():
         return None
-    return importlib.import_module('linked_opening_assembly.send2ue_manifest')
+    return api
 
 
 class LinkedOpeningAssembliesExtension(ExtensionBase):
