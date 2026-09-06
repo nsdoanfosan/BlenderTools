@@ -1,0 +1,32 @@
+{
+  "schema": "speedtree_prototype_identity_vectors",
+  "schema_version": 1,
+  "geometry": {
+    "positions": [[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]],
+    "normals": [[0, 0, 1], [0, 0, 1], [0, 0, 1], [0, 0, 1]],
+    "uvs": [[0, 0], [1, 0], [1, 1], [0, 1]],
+    "indices": [0, 1, 2, 0, 2, 3]
+  },
+  "content": {
+    "kind": "speedtree_embedded_cutout_content",
+    "schema_version": 1,
+    "vertex_count": 4,
+    "triangle_count": 2,
+    "position_sha256": "c8c33fae18e21b1079108b2c8daf8eed70d5f6339103ef2464942bc9eb26b929",
+    "normal_sha256": "34036b7d9249f77852d592012875b4b70797a97dba9fe4fee46db86671856a56",
+    "uv_sha256": "95fae7573eb3062832e82fb257a94ed80ce831a6a249aa226b43fc4242e14a35",
+    "topology_sha256": "a0f73b4c5f3d3c99133a5f5fbbfe292168746aedc6c4a4b8d6fd91b73fb334e2"
+  },
+  "identity": {
+    "kind": "speedtree_prototype_content",
+    "schema_version": 1,
+    "algorithm": "sha256",
+    "digest": "c3160a327f0ed1e963a29b09dc32e4a3d25b50a3bdb7c4f5ebd872893d94c8cf"
+  },
+  "single_member_lineage": {
+    "kind": "speedtree_prototype_lineage_content",
+    "schema_version": 1,
+    "algorithm": "sha256",
+    "digest": "8897cf5ec4ac9cce61cb9eefcd95fffd778dcb0de146ba928c696a0d0d624ec0"
+  }
+}

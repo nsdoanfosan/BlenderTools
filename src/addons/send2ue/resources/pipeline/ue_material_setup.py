@@ -5,7 +5,7 @@ send2ue post_import extension(send2ue_material_pipeline.py)이 import 직후
 process_mesh(asset_path) 를 RPC 로 호출한다. 수동 실행도 가능.
 
 블렌더 애드온이 남긴 JSON 사이드카(exports/<mesh_name>.json)를 읽어:
-  1. 각 머티리얼의 텍스처를 디스크 파일에서 /Game/Textures 로 직접 import
+  1. 각 머티리얼의 텍스처를 디스크 파일에서 /Game/texture 로 직접 import
      → FBX 가 못 나르는 MetallicRoughness 포함 모든 맵이 확실히 들어온다.
   2. 텍스처 종류별로 sRGB / 노멀맵 압축을 설정.
   3. Create or load a preset material instance, then assign shared texture data.
@@ -25,6 +25,110 @@ import unreal
 
 
 UNREAL_INSTANCE_PROFILE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
+PROTOTYPE_HANDOFF_KEY = "speedtree_prototype_handoff"
+PROTOTYPE_METADATA_IDENTITY = "SpeedTree.PrototypeIdentity"
+PROTOTYPE_METADATA_MEMBERS = "SpeedTree.PrototypeIdentityMembers"
+PROTOTYPE_METADATA_OUTPUT = "SpeedTree.BlenderOutputContent"
+PROTOTYPE_METADATA_SIDECAR = "SpeedTree.SidecarSHA256"
+
+
+def _prototype_identity_api():
+    module_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "prototype_identity.py",
+    )
+    spec = importlib.util.spec_from_file_location(
+        "_send2ue_ue_prototype_identity", module_path
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(
+            "Could not load bundled prototype identity rules: " + module_path
+        )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _validate_prototype_handoff(data, required=False):
+    value = data.get(PROTOTYPE_HANDOFF_KEY) if isinstance(data, dict) else None
+    if value is None:
+        if required:
+            raise ValueError(
+                "SpeedTree sidecar has no content-addressed prototype handoff"
+            )
+        return None
+    if not isinstance(value, dict) or set(value) != {
+        "schema_version",
+        "prototype_identity",
+        "prototype_identity_members",
+        "blender_geometry_content",
+        "output_content",
+    }:
+        raise ValueError("SpeedTree prototype handoff schema is incomplete or unknown")
+    if value.get("schema_version") != 2:
+        raise ValueError("SpeedTree prototype handoff schema_version is unsupported")
+    identity_api = _prototype_identity_api()
+    identity = identity_api.validate_lineage(
+        value.get("prototype_identity"),
+        value.get("prototype_identity_members"),
+    )
+    try:
+        blender_geometry = identity_api.validate_identity(
+            value.get("blender_geometry_content"),
+            expected_kind="speedtree_blender_export_geometry_content",
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "SpeedTree Blender geometry content identity is invalid"
+        ) from exc
+    try:
+        output = identity_api.validate_file_content_identity(
+            value.get("output_content"),
+            identity_api.BLENDER_FBX_CONTENT_KIND,
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "SpeedTree Blender output content identity is invalid"
+        ) from exc
+    return {
+        "schema_version": 2,
+        "prototype_identity": identity,
+        "prototype_identity_members": value[
+            "prototype_identity_members"
+        ],
+        "blender_geometry_content": blender_geometry,
+        "output_content": output,
+    }
+
+
+def _validate_current_prototype_export_payload(
+    data,
+    export_file_path,
+    required=False,
+):
+    handoff = _validate_prototype_handoff(data, required=required)
+    if handoff is None:
+        return None
+    path = str(export_file_path or "").strip()
+    if not path:
+        raise ValueError(
+            "SpeedTree prototype handoff has no exact current FBX export path"
+        )
+    identity_api = _prototype_identity_api()
+    try:
+        current = identity_api.file_content_identity(
+            path,
+            identity_api.BLENDER_FBX_CONTENT_KIND,
+        )
+    except OSError as exc:
+        raise ValueError(
+            f"SpeedTree current FBX export payload is unreadable: {path}: {exc}"
+        ) from exc
+    if current != handoff["output_content"]:
+        raise ValueError(
+            "SpeedTree current FBX export payload does not match sidecar output content"
+        )
+    return handoff
 
 
 def _candidate_contract_paths():
@@ -120,7 +224,17 @@ MASTER_PRESETS = {
     "prop": {
         "master": "/Game/Material/AssetSurface/Master/M_AssetSurface_Master",
         "mi_folder": "/Game/Material/AssetSurface/MI/Surface",
-        "assignment": "asset_surface_flat",
+        "assignment": "material_layer_instance",
+        "layer_parent": "/Game/Material/AssetSurface/Master/MaterialLayer/MY_Mesh_UV0",
+        "layer_instance_folder": "/Game/Material/AssetSurface/MYI/Surface",
+        "layer_texture_remap": {
+            "Albedo": "Albedo",
+            "Extra": "Extra",
+            "Normal": "Normal",
+            "Height": "Height",
+            "Opacity Map": "Opacity Map",
+            "Subsurface": "Subsurface",
+        },
         "virtual_textures": True,
     },
     "layer": {
@@ -159,7 +273,17 @@ MASTER_PRESETS = {
     "asset_surface": {
         "master": "/Game/Material/AssetSurface/Master/M_AssetSurface_Master",
         "mi_folder": "/Game/Material/AssetSurface/MI/Surface",
-        "assignment": "asset_surface_flat",
+        "assignment": "material_layer_instance",
+        "layer_parent": "/Game/Material/AssetSurface/Master/MaterialLayer/MY_Mesh_UV0",
+        "layer_instance_folder": "/Game/Material/AssetSurface/MYI/Surface",
+        "layer_texture_remap": {
+            "Albedo": "Albedo",
+            "Extra": "Extra",
+            "Normal": "Normal",
+            "Height": "Height",
+            "Opacity Map": "Opacity Map",
+            "Subsurface": "Subsurface",
+        },
         "virtual_textures": True,
     },
     "coat": {
@@ -215,7 +339,7 @@ MASTER_PRESETS = {
 # 반투명(유리) 머티리얼은 전용 MI 를 만들지 않고 이 공유 글래스 MI 를 슬롯에 직접 할당한다.
 # (Megascan 글래스를 프로젝트로 localize 한 인스턴스. 부모 M_MS_Glass_Material, TRANSLUCENT)
 GLASS_MI_PATH        = "/Game/Material/AssetSurface/MI/MI_Prop_Glass_01"
-TEXTURES_FOLDER      = "/Game/Textures"
+TEXTURES_FOLDER      = "/Game/texture"
 EXPORT_DIR           = r"C:/Users/PARK/Documents/UE_Blender_Pipeline/exports"
 _PATH_MAPPING        = _contract_path_mapping()
 _LOCAL_ANCHOR        = str(_PATH_MAPPING.get("local_anchor") or "Forestportfolio").strip("/\\")
@@ -490,6 +614,7 @@ def _validate_speedtree_handoff_contract(
     data: dict,
     expected_mesh_name: str,
     mesh_path: str = "",
+    export_file_path: str = "",
 ):
     """Validate new contract-authored sidecars before any Unreal mutation.
 
@@ -524,6 +649,20 @@ def _validate_speedtree_handoff_contract(
         or has_tree_root
         or _is_tree_asset_path(mesh_path)
     )
+    try:
+        _validate_current_prototype_export_payload(
+            data,
+            export_file_path,
+            # Prototype identity is opt-in, independent of material preset.
+            # Unmarked existing SpeedTree and prop sidecars keep their contract.
+            required=False,
+        )
+    except ValueError as exc:
+        raise RuntimeError(
+            "SpeedTree handoff contract preflight blocked before mutation: "
+            + str(exc)
+        ) from exc
+
     if not requires_speedtree_contract:
         return None
 
@@ -648,6 +787,61 @@ def _set_texture_property_if_changed(tex, property_name: str, value) -> bool:
         return False
     tex.set_editor_property(property_name, value)
     return True
+
+
+def _persist_prototype_metadata(
+    mesh,
+    data,
+    sidecar_sha256: str,
+    export_file_path: str = "",
+) -> bool:
+    handoff = _validate_current_prototype_export_payload(
+        data,
+        export_file_path,
+        required=False,
+    )
+    if handoff is None:
+        return False
+    sidecar_digest = str(sidecar_sha256 or "").strip().casefold()
+    if re.fullmatch(r"[0-9a-f]{64}", sidecar_digest) is None:
+        raise RuntimeError(
+            "Prototype metadata requires the exact Blender-selected sidecar sha256"
+        )
+    values = {
+        PROTOTYPE_METADATA_IDENTITY: json.dumps(
+            handoff["prototype_identity"],
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        PROTOTYPE_METADATA_MEMBERS: json.dumps(
+            handoff["prototype_identity_members"],
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        PROTOTYPE_METADATA_OUTPUT: json.dumps(
+            handoff["output_content"],
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        PROTOTYPE_METADATA_SIDECAR: sidecar_digest,
+    }
+    library = unreal.EditorAssetLibrary
+    if not all(
+        hasattr(library, name)
+        for name in ("get_metadata_tag", "set_metadata_tag")
+    ):
+        raise RuntimeError("Unreal metadata tag API is unavailable")
+    changed = False
+    for key, value in values.items():
+        if str(library.get_metadata_tag(mesh, key) or "") == value:
+            continue
+        if library.set_metadata_tag(mesh, key, value) is False:
+            raise RuntimeError(f"Could not set Unreal prototype metadata tag {key}")
+        changed = True
+    return changed
 
 
 def _texture_param_from_name(file_path=None, asset_name=None):
@@ -844,12 +1038,14 @@ def _configure_imported_texture(
         file_path,
         asset_name,
     )
-    changed |= _set_texture_property_if_changed(tex, "srgb", settings["srgb"])
     changed |= _set_texture_property_if_changed(
         tex,
         "compression_settings",
         settings["compression_settings"],
     )
+    # Import auto-detection can classify blue albedo as a normal map. Unreal
+    # refuses sRGB while TC_NORMALMAP is active, so correct compression first.
+    changed |= _set_texture_property_if_changed(tex, "srgb", settings["srgb"])
     changed |= _set_texture_property_if_changed(
         tex,
         "max_texture_size",
@@ -1100,6 +1296,44 @@ def _existing_texture_asset_path(asset_name: str, preferred_path: str = ""):
     return resolved
 
 
+def _unique_source_matching_texture(
+    asset_name: str,
+    preferred_path: str,
+    source_md5: str,
+):
+    """Return one exact-name Texture2D whose import source matches the local file."""
+    try:
+        candidates = _texture_asset_paths_named(asset_name)
+    except Exception as exc:
+        _log(f"  texture registry lookup unavailable: {asset_name} ({exc})")
+        return None, None
+    candidates = list(
+        dict.fromkeys(str(path).split(".")[0] for path in candidates if path)
+    )
+    candidates = [path for path in candidates if path != preferred_path]
+    matching = []
+    for candidate in candidates:
+        texture = _load_texture2d(candidate)
+        if texture is None:
+            continue
+        try:
+            if _asset_import_file_md5(candidate) == source_md5:
+                matching.append((candidate, texture))
+        except Exception as exc:
+            _warn(
+                "  existing texture source verification failed; candidate omitted: "
+                f"{candidate} ({exc})"
+            )
+    if len(matching) == 1:
+        return matching[0]
+    if len(matching) > 1:
+        _log(
+            "  source-matching texture lookup ambiguous; existing assets omitted: "
+            f"{asset_name} ({', '.join(path for path, _texture in matching)})"
+        )
+    return None, None
+
+
 def _import_texture_impl(
     file_path: str,
     asset_name: str,
@@ -1148,6 +1382,46 @@ def _import_texture_impl(
     )
     asset_exists = unreal.EditorAssetLibrary.does_asset_exist(full_path)
     if not asset_exists:
+        existing_path, existing_texture = _unique_source_matching_texture(
+            asset_name,
+            full_path,
+            source_md5,
+        )
+        if existing_path and existing_texture is not None:
+            settings_match = _texture_settings_match(
+                existing_texture,
+                desired_settings,
+            )
+            checkout_owned = False
+            try:
+                if not settings_match:
+                    checkout_owned = _checkout_texture_for_update(existing_path)
+                    _configure_imported_texture(
+                        existing_texture,
+                        param,
+                        virtual_texture_streaming,
+                        file_path,
+                        asset_name,
+                    )
+                    if not _save_texture_asset(existing_path):
+                        return None
+                if not _cache_verified_texture(
+                    tex_cache,
+                    existing_path,
+                    source_md5,
+                    fingerprint,
+                    existing_texture,
+                    desired_settings,
+                ):
+                    return None
+                _log(
+                    "  verified existing texture reused before import: "
+                    f"{asset_name} -> {existing_path}"
+                )
+                return existing_path
+            finally:
+                if checkout_owned:
+                    _revert_owned_texture_checkout(existing_path)
         task = _run_texture_import(file_path, asset_name, replace_existing=False)
         if not _texture_import_task_succeeded(task, full_path):
             _warn(f"  텍스처 import task 실패: {asset_name}")
@@ -1471,7 +1745,7 @@ def _set_nanite(
 
 def _sync_browser_to_mesh(mesh_path: str):
     """Content Browser 를 import 된 메쉬로 이동/선택시킨다.
-    (텍스처 import 가 마지막이라 브라우저가 /Game/Textures 로 튀는 것을 되돌림)"""
+    (텍스처 import 가 마지막이라 브라우저가 /Game/texture 로 튀는 것을 되돌림)"""
     try:
         command_line = unreal.SystemLibrary.get_command_line().casefold()
         if "-unattended" in command_line or "-run=" in command_line:
@@ -1774,6 +2048,7 @@ def _create_or_load_mi(
     mat_base: str,
     mi_folder: str,
     manage_existing: bool = False,
+    create_if_missing: bool = True,
 ):
     mi_name = f"MI_{mat_base}"
     mi_path = f"{mi_folder}/{mi_name}"
@@ -1793,6 +2068,10 @@ def _create_or_load_mi(
             _log(f"  MI parent 변경: {mi_name} -> {master_mat.get_path_name()}")
             parent_changed = True
         return mi, mi_path, False, parent_changed, "existing"
+
+    if not create_if_missing:
+        _log(f"  target material unavailable; slot left unchanged: {mi_path}")
+        return None, mi_path, False, False, "missing"
 
     copy_from_path = _derive_number_suffix_copy_source(mi_path)
     if copy_from_path:
@@ -1881,8 +2160,8 @@ def _entry_reuses_material_instance_unchanged(entry: dict, preset: dict) -> bool
     """Return whether an existing MI is assignment-only."""
     if _entry_manages_existing_material_instance(entry):
         return False
-    # These fields still document ownership intent, but default reuse is broad:
-    # finding an exact MI ends texture discovery and mutation for this slot.
+    # These fields still document ownership intent, but default MI/MYI reuse is
+    # broad. Texture2D content is synchronized separately from material mutation.
     return True
 
 
@@ -1898,13 +2177,22 @@ def _material_instance_has_empty_background_layer(mi, entry: dict, preset: dict)
     """
     if mi is None or preset.get("assignment") != "material_layer_instance":
         return False
+    mat_base = _material_instance_base_name(str(entry.get("name") or ""))
     material_layer = entry.get("material_layer")
-    if not isinstance(material_layer, dict):
+    has_explicit_layer_contract = isinstance(material_layer, dict)
+    material_layer = material_layer if has_explicit_layer_contract else {}
+    generated_mi_path = (
+        f"{str(preset.get('mi_folder') or '').rstrip('/')}/MI_{mat_base}"
+        if mat_base and preset.get("mi_folder")
+        else ""
+    )
+    actual_mi_path = str(mi.get_path_name() or "").split(".", 1)[0]
+    if not has_explicit_layer_contract and actual_mi_path != generated_mi_path:
         return False
     desired_layer = str(
         material_layer.get("instance_path")
         or _layer_instance_path(
-            _material_instance_base_name(str(entry.get("name") or "")),
+            mat_base,
             preset,
             entry,
         )
@@ -2335,13 +2623,16 @@ def _load_or_copy_target_material(
     if existing is not None:
         return existing, target_path, False, "existing"
 
+    # Duplication also creates an asset. Respect assignment-only intent before
+    # deriving a suffix copy source or using an explicit copy source.
+    if not create_if_missing:
+        _log(f"  target material unavailable; slot left unchanged: {target_path}")
+        return None, target_path, False, "missing"
+
     if not copy_from_path:
         copy_from_path = _derive_number_suffix_copy_source(target_path)
 
     if not copy_from_path:
-        if not create_if_missing:
-            _log(f"  target material unavailable; slot left unchanged: {target_path}")
-            return None, target_path, False, "missing"
         if master_mat is None:
             _log(
                 "  target material and master unavailable; slot left unchanged: "
@@ -3040,6 +3331,20 @@ def _import_layer_textures(
     return layer_maps
 
 
+def _sync_entry_texture_assets(entry: dict, preset: dict, tex_cache: dict):
+    """Import or refresh sidecar textures without taking ownership of an MI/MYI.
+
+    Existing material instances can remain assignment-only while the Texture2D
+    assets they already reference still follow the latest Blender handoff.  The
+    content-hash gate in :func:`_import_texture` keeps unchanged textures a no-op.
+    """
+    return _import_layer_textures(
+        _entry_layers(entry, preset),
+        tex_cache,
+        virtual_texture_streaming=preset.get("virtual_textures"),
+    )
+
+
 def reimport_textures_from_json(json_path: str) -> int:
     json_path = os.path.abspath(str(json_path or ""))
     if not os.path.isfile(json_path):
@@ -3220,7 +3525,9 @@ def _texture_parameter_name(parameter_value):
 
 def _parameter_association_key(value) -> str:
     text = str(value or "GLOBAL_PARAMETER")
-    return text.rsplit(".", 1)[-1].strip().upper()
+    # Unreal 5.8 renders enums as '<MaterialParameterAssociation.GLOBAL_PARAMETER: 2>'.
+    # A bare string and the live enum must identify the same owned binding.
+    return text.rsplit(".", 1)[-1].split(":", 1)[0].strip(" <>\t\r\n").upper()
 
 
 def _texture_parameter_binding(parameter_value):
@@ -3825,6 +4132,22 @@ def _assign_material_layer_instance(
         _warn(f"  background MYI assignment not verified: {layer_path}")
         return False
     changed = layer_overrides_pruned or overrides_pruned or changed
+    # SetMaterialLayers can be a no-op when the MYI path stays the same. Its
+    # changed parameter values still require rebuilding the owning MI's cached
+    # render parameters/permutation; otherwise the viewport keeps parent defaults.
+    # Save directly to avoid the newly-created MYI thumbnail path on UE 5.8.
+    safe_save = getattr(helper, "save_asset_package_without_thumbnail", None)
+    if callable(safe_save):
+        # Refresh the function instance first. Updating only the owning MI leaves
+        # stale compiled MYI texture/sampler state (including VT aspect ratios).
+        unreal.MaterialEditingLibrary.update_material_function(layer_asset)
+        if not safe_save(layer_asset):
+            raise RuntimeError(f"material layer refresh save failed: {layer_path}")
+        unreal.MaterialEditingLibrary.update_material_instance(mi)
+        if not safe_save(mi):
+            raise RuntimeError(f"layer-backed material refresh save failed: {mi.get_path_name()}")
+        changed = True
+        _log(f"  layer-backed MI render parameters refreshed: {mi.get_path_name()}")
     _log(f"  background MYI <- {layer_path}")
     return changed
 
@@ -3967,6 +4290,16 @@ def _asset_data_class_name(asset_data):
         except Exception:
             continue
         if value:
+            if property_name == "asset_class_path":
+                try:
+                    class_asset_name = getattr(value, "asset_name")
+                except Exception:
+                    try:
+                        class_asset_name = value.get_editor_property("asset_name")
+                    except Exception:
+                        class_asset_name = None
+                if class_asset_name:
+                    return str(class_asset_name)
             text = str(value)
             return text.rsplit("/", 1)[-1].rsplit(".", 1)[-1].strip("'\"")
     return ""
@@ -4483,6 +4816,7 @@ def preflight_mesh_materials(
     json_path: str = None,
     expected_mesh_name: str = "",
     sidecar_sha256: str = "",
+    export_file_path: str = "",
 ) -> bool:
     """Normalize shared material-layer assets before Unreal touches an existing mesh.
 
@@ -4500,7 +4834,12 @@ def preflight_mesh_materials(
     )
     if not data:
         return False
-    _validate_speedtree_handoff_contract(data, mesh_name, mesh_path)
+    _validate_speedtree_handoff_contract(
+        data,
+        mesh_name,
+        mesh_path,
+        export_file_path=export_file_path,
+    )
     _validate_codex_test_material_scope(data, mesh_path)
 
     instance_profile_targets = _validate_instance_profile_targets(
@@ -4631,6 +4970,7 @@ def process_mesh(
     json_path: str = None,
     expected_mesh_name: str = "",
     sidecar_sha256: str = "",
+    export_file_path: str = "",
 ) -> bool:
     """단일 StaticMesh/SkeletalMesh 를 JSON 기반으로 처리. 변경이 있었으면 True.
 
@@ -4650,7 +4990,12 @@ def process_mesh(
     )
     asset_tools = None
     if data:
-        _validate_speedtree_handoff_contract(data, mesh_name, mesh_path)
+        _validate_speedtree_handoff_contract(
+            data,
+            mesh_name,
+            mesh_path,
+            export_file_path=export_file_path,
+        )
         _validate_codex_test_material_scope(data, mesh_path)
         instance_profile_targets = _validate_instance_profile_targets(
             data, mesh_path
@@ -4675,7 +5020,8 @@ def process_mesh(
             if not helper.save_asset_package_without_thumbnail(mesh):
                 raise RuntimeError(f"safe skeletal-mesh save failed: {mesh_path}")
             return
-        unreal.EditorAssetLibrary.save_asset(mesh_path)
+        if not unreal.EditorAssetLibrary.save_asset(mesh_path):
+            raise RuntimeError(f"static-mesh save failed: {mesh_path}")
 
     # Nanite: import 되는 StaticMesh 에 켜되, 반투명 머티리얼 메쉬는 끈다.
     # (JSON 이 없으면 불투명으로 가정 → 켬. 반투명으로 판정되면 이미 켜져 있어도 끈다.)
@@ -4709,6 +5055,13 @@ def process_mesh(
         return False
 
     changed = False
+    if _persist_prototype_metadata(
+        mesh,
+        data,
+        sidecar_sha256,
+        export_file_path=export_file_path,
+    ):
+        changed = True
     json_mesh_name = str(data.get("mesh_name", ""))
     if json_mesh_name and json_mesh_name != mesh_name:
         _warn(f"JSON mesh_name mismatch: asset={mesh_name}, json={json_mesh_name}; using JSON data")
@@ -4737,16 +5090,19 @@ def process_mesh(
                 continue
             slot_index = int(entry.get("slot_index", 0))
 
+        preset = _master_preset(data, entry, mesh_path)
         profile_target = instance_profile_targets.get(entry_index)
         if (
             profile_target
             and profile_target.get("target_existed")
             and profile_target.get("asset") is not None
         ):
+            _sync_entry_texture_assets(entry, preset, tex_cache)
             assigned_mi = profile_target["asset"]
             _log(
                 f"  existing profile '{profile_target['profile']}' -> "
-                f"{profile_target['target_path']} (reused without base or texture work)"
+                f"{profile_target['target_path']} "
+                "(texture assets synchronized; MI reused unchanged)"
             )
             if _is_skeletal_mesh(mesh):
                 skeletal_slot_assignments[slot_index] = (slot_name, assigned_mi)
@@ -4754,7 +5110,6 @@ def process_mesh(
                 changed = True
             continue
 
-        preset = _master_preset(data, entry, mesh_path)
         if preset.get("key") == "hair":
             reuse_unchanged = _entry_reuses_material_instance_unchanged(
                 entry,
@@ -4772,12 +5127,8 @@ def process_mesh(
             reuse_unchanged = bool(reuse_unchanged and not mi_created)
             if _is_skeletal_mesh(mesh) and not reuse_unchanged:
                 _ensure_hair_master_skeletal_mesh_usage(mi)
+            layer_maps = _sync_entry_texture_assets(entry, preset, tex_cache)
             if not reuse_unchanged:
-                layer_maps = _import_layer_textures(
-                    _entry_layers(entry, preset),
-                    tex_cache,
-                    virtual_texture_streaming=preset.get("virtual_textures"),
-                )
                 if _assign_hair_tool_parameters(
                     mi,
                     entry,
@@ -4806,7 +5157,6 @@ def process_mesh(
                 changed = True
             continue
 
-        preset = _master_preset(data, entry, mesh_path)
         if target_material_path:
             copy_from_path = _entry_copy_source_material_path(entry)
             existing_mi = _load_exact_material_instance(target_material_path)
@@ -4844,6 +5194,7 @@ def process_mesh(
                 )
             if mi is None:
                 continue
+            layer_maps = _sync_entry_texture_assets(entry, preset, tex_cache)
             parent_changed = False
             if selected_master is not None and not reuse_unchanged:
                 try:
@@ -4860,12 +5211,6 @@ def process_mesh(
             )
             params_changed = False
             if not reuse_unchanged:
-                layers = _entry_layers(entry, preset)
-                layer_maps = _import_layer_textures(
-                    layers,
-                    tex_cache,
-                    virtual_texture_streaming=preset.get("virtual_textures"),
-                )
                 mat_base = _material_instance_base_name(mat_name)
                 params_changed = _assign_master_textures(
                     mi,
@@ -4916,11 +5261,7 @@ def process_mesh(
             f"(base: {mat_base}, master: {preset['key']})"
         )
 
-        # 1. 텍스처 직접 import (소스가 안 바뀌었으면 캐시 히트로 skip)
-        layers = None
-        layer_maps = None
-
-        # 2. MI 생성/로드
+        # 1. MI 생성/로드
         if existing_unchanged is not None and not initialize_empty_layer:
             mi = existing_unchanged
             mi_path = generated_mi_path
@@ -4934,6 +5275,7 @@ def process_mesh(
                 mat_base,
                 preset["mi_folder"],
                 manage_existing=(manage_existing or initialize_empty_layer),
+                create_if_missing=_entry_create_if_missing(entry, preset),
             )
         if mi is None:
             profile_target = instance_profile_targets.get(entry_index)
@@ -4949,9 +5291,10 @@ def process_mesh(
                     changed = True
             continue
 
-        # 3. An exact existing MI wins by default. Texture discovery and managed
-        # override mutation only apply to a newly created/copied MI, or to an
-        # existing MI whose contract explicitly declares pipeline ownership.
+        # 2. Texture2D content always follows the sidecar, even when an exact MI
+        # remains assignment-only. Parameter/parent mutation still requires a
+        # newly created/copied MI or explicit pipeline ownership.
+        layer_maps = _sync_entry_texture_assets(entry, preset, tex_cache)
         reuse_unchanged = bool(
             mi_source == "existing"
             and not manage_existing
@@ -4959,14 +5302,10 @@ def process_mesh(
         )
         params_changed = False
         if reuse_unchanged:
-            _log(f"  existing MI reused unchanged: {mi_path}")
-        else:
-            layers = _entry_layers(entry, preset)
-            layer_maps = _import_layer_textures(
-                layers,
-                tex_cache,
-                virtual_texture_streaming=preset.get("virtual_textures"),
+            _log(
+                f"  existing MI reused unchanged after texture asset sync: {mi_path}"
             )
+        else:
             params_changed = _assign_master_textures(
                 mi,
                 layer_maps,
@@ -4985,7 +5324,7 @@ def process_mesh(
         elif parent_changed or params_changed:
             changed = True
 
-        # 4. Keep the base MI/MYI pipeline-managed. A profile target is
+        # 3. Keep the base MI/MYI pipeline-managed. A profile target is
         # user-owned and assignment-only: do not save, reparent, or edit it.
         assigned_mi = mi
         profile_target = instance_profile_targets.get(entry_index)

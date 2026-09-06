@@ -5,7 +5,16 @@ import bpy
 import queue
 import threading
 from .constants import ToolInfo, ExtensionTasks
-from .core import export, utilities, settings, validations, extension, hair_tool_export, armature_modifier_fix
+from .core import (
+    export,
+    utilities,
+    settings,
+    validations,
+    extension,
+    hair_tool_export,
+    armature_modifier_fix,
+    preview_modifier_guard,
+)
 from .ui import file_browser, dialog, addon_preferences
 from .dependencies import unreal
 from .dependencies.rpc import blender_server
@@ -37,7 +46,7 @@ class Send2Ue(bpy.types.Operator):
         self.layout.prop(context.window_manager.send2ue, 'progress')
 
     def modal(self, context, event):
-        if not self.done:
+        if not self.done and context.area is not None:
             context.area.tag_redraw()
 
         if self.execution_queue.empty():
@@ -70,8 +79,11 @@ class Send2Ue(bpy.types.Operator):
                     # run the function
                     function(*args, **kwargs)
                 except Exception as error:
-                    self.escape_operation(context)
-                    raise error
+                    self.escape_operation(context, error=error)
+                    if os.environ.get('SEND2UE_DEV'):
+                        raise
+                    self.report({'ERROR'}, str(error))
+                    return {'CANCELLED'}
 
             if self.escape:
                 bpy.types.STATUSBAR_HT_header.remove(self.draw_progress)
@@ -102,7 +114,7 @@ class Send2Ue(bpy.types.Operator):
                 export.send2ue(properties)
             # if validations fail
             except Exception as error:
-                self.escape_operation(context)
+                self.escape_operation(context, error=error)
                 # if in dev mode raise the error instead of reporting it
                 if os.environ.get('SEND2UE_DEV'):
                     raise error
@@ -140,12 +152,24 @@ class Send2Ue(bpy.types.Operator):
             self.post_operation()
         return {'FINISHED'}
 
-    def escape_operation(self, context):
+    def escape_operation(self, context, error=None):
+        self.escape = True
+        self.done = True
+        with self.execution_queue.mutex:
+            self.execution_queue.queue.clear()
         if self.timer:
             bpy.types.STATUSBAR_HT_header.remove(self.draw_progress)
             context.window_manager.event_timer_remove(self.timer)
+            self.timer = None
         bpy.context.workspace.status_text_set_internal(None)
-        self.post_operation()
+        context.window_manager.progress_end()
+        if isinstance(error, (ConnectionError, TimeoutError)):
+            # Run local extension cleanup, but do not reconnect to a lost editor
+            # for post-operation saves. Recorded commands are deliberately discarded.
+            with unreal.record_commands():
+                self.post_operation()
+        else:
+            self.post_operation()
         return {'FINISHED'}
 
     def pre_operation(self):
@@ -170,7 +194,14 @@ class Send2Ue(bpy.types.Operator):
         # crashing Unreal's importer.
         armature_modifier_fix.prepare()
 
+        # Viewport-only Geometry Nodes previews (for example Unreal height
+        # displacement indicators) must never be baked into the exported mesh.
+        preview_modifier_guard.prepare()
+
     def post_operation(self):
+        # Restore preview visibility before returning the user's scene state.
+        preview_modifier_guard.cleanup()
+
         # Remove the temporary armature bindings added for un-skinned child meshes.
         armature_modifier_fix.cleanup()
 

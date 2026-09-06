@@ -5,7 +5,7 @@ import math
 import os
 import bpy
 from contextlib import contextmanager
-from . import utilities, validations, settings, ingest, extension, io, hair_tool_export, ue_groom_adapter
+from . import utilities, validations, settings, ingest, extension, io, hair_tool_export, ue_groom_adapter, nested_pivots, bevel_modifier_export
 from ..constants import BlenderTypes, UnrealTypes, FileTypes, PreFixToken, ToolInfo, ExtensionTasks
 
 
@@ -514,6 +514,17 @@ def export_mesh(asset_id, mesh_object, properties, lod=0):
         asset_name = utilities.get_asset_name(mesh_object.name, properties)
         utilities.select_asset_collisions(asset_name, properties)
 
+    # Collision selection runs after the extension hooks and can pick up a
+    # misnamed collider inside another pivot's subtree. Enforce the assembly
+    # boundary again on the final selection consumed by the FBX exporter.
+    asset_data = bpy.context.window_manager.send2ue.asset_data.get(asset_id, {})
+    if asset_data.get('_nested_pivot_origin'):
+        nested_pivots.prune_nested_pivot_selection(
+            bpy.data.objects.get(asset_data.get('empty_object_name', '')),
+            bpy.data.collections.get(ToolInfo.EXPORT_COLLECTION.value),
+            list(bpy.context.selected_objects),
+        )
+
     # Note: this is a weird work around for morph targets not exporting when
     # particle systems are on the mesh. Making them not visible fixes this bug
     existing_display_options = utilities.disable_particles(mesh_object)
@@ -525,10 +536,15 @@ def export_mesh(asset_id, mesh_object, properties, lod=0):
         )
         # instances are realized first so that the negative-scale compensation
         # runs on the geometry the exporter will actually write
-        with realize_selected_geometry_node_instances():
-            with compensate_negative_scale_winding(enabled=is_static_mesh):
-                # export selection to a file
-                export_file(properties, lod)
+        with bevel_modifier_export.enabled_for_export(
+            bpy.context.selected_objects,
+            update=bpy.context.evaluated_depsgraph_get().update,
+            enabled=bevel_modifier_export.requested_for_export(properties, is_static_mesh=is_static_mesh),
+        ):
+            with realize_selected_geometry_node_instances():
+                with compensate_negative_scale_winding(enabled=is_static_mesh):
+                    # export selection to a file
+                    export_file(properties, lod)
     finally:
         # restore the particle system display options
         utilities.restore_particles(mesh_object, existing_display_options)

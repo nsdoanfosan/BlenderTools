@@ -65,6 +65,7 @@
   "export_all_actions": true,
   "export_custom_property_fcurves": true,
   "export_object_name_as_root": true,
+  "export_render_bevels": false,
   "extensions": {
     "affixes": {
       "animation_sequence_name_affix": "Anim_",

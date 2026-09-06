@@ -319,6 +319,14 @@ class FakeEditorAssetLibrary:
         self.runtime.delete_calls.append(asset_path)
         return self.runtime.assets.pop(asset_path, None) is not None
 
+    def get_metadata_tag(self, asset, key):
+        return self.runtime.metadata_tags.get((id(asset), key), "")
+
+    def set_metadata_tag(self, asset, key, value):
+        self.runtime.metadata_tags[(id(asset), key)] = value
+        self.runtime.metadata_set_calls.append((asset, key, value))
+        return True
+
 
 class FakeAssetTools:
     def __init__(self, runtime):
@@ -371,6 +379,8 @@ class FakeRuntime:
         self.assets = {}
         self.asset_md5 = {}
         self.asset_import_tags = {}
+        self.metadata_tags = {}
+        self.metadata_set_calls = []
         self.source_control_states = {}
         self.fail_import = False
         self.fail_save = False
@@ -529,9 +539,43 @@ class TestUeMaterialTextureImport(unittest.TestCase):
             force_reimport=force,
         )
 
+    def test_asset_class_name_reads_top_level_asset_path_struct(self):
+        asset_data = types.SimpleNamespace(
+            asset_class_path=types.SimpleNamespace(asset_name="Texture2D"),
+            asset_class="None",
+        )
+
+        self.assertEqual(
+            self.module._asset_data_class_name(asset_data),
+            "Texture2D",
+        )
+
+    def test_layered_surface_presets_route_textures_through_myi(self):
+        expected = {
+            "prop": (
+                "/Game/Material/AssetSurface/Master/MaterialLayer/MY_Mesh_UV0",
+                "/Game/Material/AssetSurface/MYI/Surface",
+            ),
+            "asset_surface": (
+                "/Game/Material/AssetSurface/Master/MaterialLayer/MY_Mesh_UV0",
+                "/Game/Material/AssetSurface/MYI/Surface",
+            ),
+            "cloth": (
+                "/Game/Material/AssetSurface/Master/MaterialLayer/MY_Cloth",
+                "/Game/Material/AssetSurface/MYI/Cloth",
+            ),
+        }
+
+        for key, (layer_parent, layer_folder) in expected.items():
+            with self.subTest(preset=key):
+                preset = self.module.MASTER_PRESETS[key]
+                self.assertEqual(preset["assignment"], "material_layer_instance")
+                self.assertEqual(preset["layer_parent"], layer_parent)
+                self.assertEqual(preset["layer_instance_folder"], layer_folder)
+
     def test_matching_md5_and_settings_skip_mutation_even_when_forced(self):
         self.add_existing_texture()
-        untouched_path = "/Game/Textures/T_Untouched"
+        untouched_path = "/Game/texture/T_Untouched"
         cache = {
             self.asset_path: os.path.getmtime(self.source_path),
             untouched_path: 123.5,
@@ -577,7 +621,7 @@ class TestUeMaterialTextureImport(unittest.TestCase):
 
     def test_stale_md5_reimports_only_requested_existing_texture(self):
         self.add_existing_texture(file_md5="1" * 32)
-        other_path = "/Game/Textures/T_Other"
+        other_path = "/Game/texture/T_Other"
         self.runtime.assets[other_path] = FakeTexture()
         self.runtime.asset_md5[other_path] = "2" * 32
         cache = {}
@@ -696,6 +740,19 @@ class TestUeMaterialTextureImport(unittest.TestCase):
         self.assertEqual(self.runtime.revert_unchanged_calls, [])
         self.assertEqual(self.runtime.save_calls, [self.asset_path])
 
+    def test_auto_detected_normal_compression_is_corrected_before_albedo_srgb(self):
+        class EngineNormalTexture(FakeTexture):
+            def set_editor_property(self, name, value):
+                if name == "srgb" and self.properties['compression_settings'] == "TC_NORMALMAP":
+                    value = False
+                super().set_editor_property(name, value)
+
+        texture = EngineNormalTexture(srgb=False, compression_settings='TC_NORMALMAP')
+        self.module._configure_imported_texture(texture, 'Albedo')
+        expected = self.module._desired_texture_settings('Albedo')
+        self.assertTrue(self.module._texture_settings_match(texture, expected))
+        self.assertTrue(texture.properties['srgb'])
+
     def test_new_texture_import_marks_for_add_after_configured_save(self):
         normal_source = Path(self.temp_dir.name) / "T_Surface_normal.png"
         normal_source.write_bytes(self.source_path.read_bytes())
@@ -731,6 +788,68 @@ class TestUeMaterialTextureImport(unittest.TestCase):
         self.assertEqual(
             self.runtime.import_tasks[0]["filename"],
             str(self.source_path),
+        )
+
+    def test_local_source_reuses_unique_verified_exact_name_texture(self):
+        existing_path = "/Game/Textures/T_Surface_extra"
+        self.runtime.assets[existing_path] = FakeTexture(
+            srgb=False,
+            compression_settings="TC_MASKS",
+            max_texture_size=0,
+            virtual_texture_streaming=True,
+        )
+        self.runtime.asset_md5[existing_path] = self.source_md5
+        self.module._texture_asset_paths_named = lambda _name: [existing_path]
+        cache = {}
+
+        self.assertEqual(self.import_texture(cache), existing_path)
+
+        self.assertEqual(self.runtime.import_tasks, [])
+        self.assertIn(existing_path, cache)
+        self.assertNotIn(self.asset_path, cache)
+        self.assertTrue(
+            any(
+                "reused before import" in message
+                for message in self.runtime.logs
+            )
+        )
+
+    def test_local_source_does_not_reuse_same_name_with_wrong_md5(self):
+        existing_path = "/Game/Textures/T_Surface_extra"
+        self.runtime.assets[existing_path] = FakeTexture(
+            srgb=False,
+            compression_settings="TC_MASKS",
+            max_texture_size=0,
+            virtual_texture_streaming=True,
+        )
+        self.runtime.asset_md5[existing_path] = "0" * 32
+        self.module._texture_asset_paths_named = lambda _name: [existing_path]
+
+        self.assertEqual(self.import_texture({}), self.asset_path)
+
+        self.assertEqual(len(self.runtime.import_tasks), 1)
+        self.assertFalse(self.runtime.import_tasks[0]["replace_existing"])
+
+    def test_local_source_updates_role_settings_on_source_matching_texture(self):
+        existing_path = "/Game/Textures/T_Surface_extra"
+        existing_texture = FakeTexture(
+            srgb=False,
+            compression_settings="TC_MASKS",
+            max_texture_size=0,
+            virtual_texture_streaming=False,
+        )
+        self.runtime.assets[existing_path] = existing_texture
+        self.runtime.asset_md5[existing_path] = self.source_md5
+        self.module._texture_asset_paths_named = lambda _name: [existing_path]
+
+        self.assertEqual(self.import_texture({}), existing_path)
+
+        self.assertEqual(self.runtime.import_tasks, [])
+        self.assertEqual(self.runtime.checkout_calls, [existing_path])
+        self.assertEqual(self.runtime.save_calls, [existing_path])
+        self.assertEqual(self.runtime.revert_unchanged_calls, [existing_path])
+        self.assertTrue(
+            existing_texture.properties["virtual_texture_streaming"]
         )
 
     def test_owned_checkout_reverts_unchanged_after_failed_reimport(self):
@@ -854,7 +973,7 @@ class TestUeMaterialTextureImport(unittest.TestCase):
         self.assertEqual(self.runtime.import_tasks, [])
         self.assertEqual(self.runtime.warnings, [])
 
-    def test_failed_local_import_reuses_only_verified_exact_registry_texture(self):
+    def test_local_import_reuses_only_verified_exact_registry_texture(self):
         fallback_path = "/Game/Shared/Textures/T_Surface_extra"
         self.runtime.assets[fallback_path] = FakeTexture(
             srgb=False,
@@ -881,7 +1000,7 @@ class TestUeMaterialTextureImport(unittest.TestCase):
         )
 
         self.assertEqual(self.import_texture({}), fallback_path)
-        self.assertEqual(len(self.runtime.import_tasks), 1)
+        self.assertEqual(self.runtime.import_tasks, [])
         self.assertTrue(
             any("verified existing texture reused" in message for message in self.runtime.logs)
         )
@@ -1004,9 +1123,31 @@ class TestUeMaterialTextureImport(unittest.TestCase):
             [layer_one, global_value],
         )
 
+    def test_live_unreal_enum_repr_prunes_stale_global_role_only(self):
+        class LiveAssociation:
+            def __str__(self):
+                return "<MaterialParameterAssociation.GLOBAL_PARAMETER: 2>"
+
+        stale = FakeTextureParameterValue("Normal", association=LiveAssociation())
+        kept = FakeTextureParameterValue("Albedo", association=LiveAssociation())
+        artist_layer = FakeTextureParameterValue(
+            "Normal", association="<MaterialParameterAssociation.LAYER_PARAMETER: 0>", index=1
+        )
+        material = FakeMaterialInstanceConstant(
+            "/Game/Material/MYI_Test",
+            texture_parameter_values=[stale, kept, artist_layer],
+        )
+        changed = self.module._prune_managed_texture_parameter_overrides(
+            material, {"Normal", "Albedo"}, {"Albedo"},
+            managed_bindings={("Normal", "GLOBAL_PARAMETER", -1), ("Albedo", "GLOBAL_PARAMETER", -1)},
+            keep_bindings={("Albedo", "GLOBAL_PARAMETER", -1)},
+        )
+        self.assertTrue(changed)
+        self.assertEqual(material.texture_parameter_values, [kept, artist_layer])
+
     def test_flat_texture_setter_failure_omits_only_failed_role(self):
-        albedo_path = "/Game/Textures/T_Albedo"
-        normal_path = "/Game/Textures/T_Normal"
+        albedo_path = "/Game/texture/T_Albedo"
+        normal_path = "/Game/texture/T_Normal"
         self.runtime.assets[albedo_path] = FakeTexture()
         self.runtime.assets[normal_path] = FakeTexture()
         self.runtime.fail_texture_parameter_names.add("BaseColor")
@@ -1046,8 +1187,8 @@ class TestUeMaterialTextureImport(unittest.TestCase):
         self.assertTrue(self.runtime.warnings)
 
     def test_layer_zero_failure_does_not_keep_stale_failed_override(self):
-        albedo_path = "/Game/Textures/T_Albedo"
-        normal_path = "/Game/Textures/T_Normal"
+        albedo_path = "/Game/texture/T_Albedo"
+        normal_path = "/Game/texture/T_Normal"
         self.runtime.assets[albedo_path] = FakeTexture()
         self.runtime.assets[normal_path] = FakeTexture()
         self.runtime.fail_texture_parameter_names.add("Albedo")
@@ -1120,8 +1261,8 @@ class TestUeMaterialTextureImport(unittest.TestCase):
 
         self.assertIn("/Game/Meshes/SM_Test", paths)
         self.assertIn("/Game/Material/M_Master", paths)
-        self.assertNotIn("/Game/Textures/T_Direct", paths)
-        self.assertNotIn("/Game/Textures/T_Layer", paths)
+        self.assertNotIn("/Game/texture/T_Direct", paths)
+        self.assertNotIn("/Game/texture/T_Layer", paths)
 
     def test_codex_test_mutation_paths_keep_production_references_read_only(self):
         self.module._master_preset = lambda data, entry, mesh_path: {
@@ -1653,8 +1794,22 @@ class TestUeMaterialTextureImport(unittest.TestCase):
         self.assertEqual(remap["Opacity Map"], "Opacity Map")
         self.assertNotIn("Transmission", remap)
 
+    def _contract_export_path(self, mesh_name="SK_CommonGrass"):
+        path = Path(self.temp_dir.name) / f"{mesh_name}.fbx"
+        if not path.exists():
+            path.write_bytes(f"fbx-payload:{mesh_name}".encode("ascii"))
+        return path
+
     def _contract_sidecar(self, mesh_name="SK_CommonGrass"):
         contract_api = self.module._speedtree_handoff_api()
+        export_path = self._contract_export_path(mesh_name)
+        identity_fixture = json.loads(
+            (
+                Path(__file__).parent
+                / "fixtures"
+                / "prototype_identity_v1.json"
+            ).read_text(encoding="utf-8")
+        )
         entry = {
             "name": "M_stem_common_01",
             "slot_name": "M_stem_common_01",
@@ -1679,6 +1834,31 @@ class TestUeMaterialTextureImport(unittest.TestCase):
             "speedtree_handoff_contract": (
                 contract_api.build_sidecar_descriptor(mesh_name)
             ),
+            "speedtree_prototype_handoff": {
+                "schema_version": 2,
+                "prototype_identity": identity_fixture[
+                    "single_member_lineage"
+                ],
+                "prototype_identity_members": [
+                    identity_fixture["identity"]
+                ],
+                "blender_geometry_content": {
+                    "kind": (
+                        "speedtree_blender_export_geometry_content"
+                    ),
+                    "schema_version": 1,
+                    "algorithm": "sha256",
+                    "digest": "0" * 64,
+                },
+                "output_content": {
+                    "kind": "speedtree_blender_fbx_payload_content",
+                    "schema_version": 1,
+                    "algorithm": "sha256",
+                    "digest": hashlib.sha256(
+                        export_path.read_bytes()
+                    ).hexdigest(),
+                },
+            },
             "materials": [entry],
         }
 
@@ -1687,6 +1867,7 @@ class TestUeMaterialTextureImport(unittest.TestCase):
         descriptor = self.module._validate_speedtree_handoff_contract(
             data,
             "SK_CommonGrass",
+            export_file_path=str(self._contract_export_path()),
         )
 
         self.assertEqual(descriptor["asset_kind"], "speedtree")
@@ -1707,6 +1888,7 @@ class TestUeMaterialTextureImport(unittest.TestCase):
             self.module._validate_speedtree_handoff_contract(
                 bad_descriptor,
                 "SK_CommonGrass",
+                export_file_path=str(self._contract_export_path()),
             )
 
         bad_intent = self._contract_sidecar()
@@ -1717,6 +1899,7 @@ class TestUeMaterialTextureImport(unittest.TestCase):
             self.module._validate_speedtree_handoff_contract(
                 bad_intent,
                 "SK_CommonGrass",
+                export_file_path=str(self._contract_export_path()),
             )
 
         wrong_mesh = self._contract_sidecar("SK_Other")
@@ -1724,6 +1907,9 @@ class TestUeMaterialTextureImport(unittest.TestCase):
             self.module._validate_speedtree_handoff_contract(
                 wrong_mesh,
                 "SK_CommonGrass",
+                export_file_path=str(
+                    self._contract_export_path("SK_Other")
+                ),
             )
 
         legacy = {
@@ -1732,7 +1918,10 @@ class TestUeMaterialTextureImport(unittest.TestCase):
                 {"name": "M_stem_common_01", "master_preset": "tree"}
             ],
         }
-        with self.assertRaisesRegex(RuntimeError, "no speedtree_handoff_contract"):
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "tree sidecar has no speedtree_handoff_contract",
+        ):
             self.module._validate_speedtree_handoff_contract(
                 legacy,
                 "SK_CommonGrass",
@@ -1751,6 +1940,149 @@ class TestUeMaterialTextureImport(unittest.TestCase):
                 "/Game/Meshes/Props/SM_Prop",
             )
         )
+
+    def test_existing_speedtree_contract_without_prototype_keeps_legacy_path(self):
+        data = self._contract_sidecar()
+        data.pop("speedtree_prototype_handoff")
+        descriptor = self.module._validate_speedtree_handoff_contract(
+            data, "SK_CommonGrass")
+        self.assertEqual(descriptor["asset_kind"], "speedtree")
+        self.assertFalse(self.module._persist_prototype_metadata(
+            FakeSkeletalMesh([]), data, ""))
+        self.assertEqual(self.runtime.checkout_calls, [])
+        self.assertEqual(self.runtime.created_assets, [])
+        self.assertEqual(self.runtime.save_calls, [])
+
+    def test_prototype_prop_sidecar_validates_before_mutation(self):
+        handoff = self._contract_sidecar()["speedtree_prototype_handoff"]
+        prop = {
+            "mesh_name": "SM_Prop",
+            "materials": [{"name": "M_Prop", "master_preset": "prop"}],
+            "speedtree_prototype_handoff": handoff,
+        }
+        export_path = self._contract_export_path()
+        self.assertIsNone(self.module._validate_speedtree_handoff_contract(
+            prop, "SM_Prop", "/Game/Meshes/Props/SM_Prop", str(export_path)))
+        prop["speedtree_prototype_handoff"] = {"schema_version": -1}
+        with self.assertRaisesRegex(RuntimeError, "before mutation"):
+            self.module._validate_speedtree_handoff_contract(
+                prop, "SM_Prop", "/Game/Meshes/Props/SM_Prop", str(export_path))
+        prop["speedtree_prototype_handoff"] = handoff
+        export_path.write_bytes(b"unrelated replacement FBX bytes")
+        with self.assertRaisesRegex(RuntimeError, "before mutation"):
+            self.module._validate_speedtree_handoff_contract(
+                prop, "SM_Prop", "/Game/Meshes/Props/SM_Prop", str(export_path))
+        self.assertEqual(self.runtime.checkout_calls, [])
+        self.assertEqual(self.runtime.created_assets, [])
+        self.assertEqual(self.runtime.save_calls, [])
+
+    def test_prototype_metadata_persists_exact_handoff_and_sidecar_hash(self):
+        mesh = FakeSkeletalMesh([])
+        data = self._contract_sidecar()
+        sidecar_sha256 = "a" * 64
+
+        self.assertTrue(
+            self.module._persist_prototype_metadata(
+                mesh,
+                data,
+                sidecar_sha256,
+                export_file_path=str(self._contract_export_path()),
+            )
+        )
+        expected = {
+            self.module.PROTOTYPE_METADATA_IDENTITY: json.dumps(
+                data["speedtree_prototype_handoff"][
+                    "prototype_identity"
+                ],
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            self.module.PROTOTYPE_METADATA_MEMBERS: json.dumps(
+                data["speedtree_prototype_handoff"][
+                    "prototype_identity_members"
+                ],
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            self.module.PROTOTYPE_METADATA_OUTPUT: json.dumps(
+                data["speedtree_prototype_handoff"]["output_content"],
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            self.module.PROTOTYPE_METADATA_SIDECAR: sidecar_sha256,
+        }
+        self.assertEqual(
+            {
+                key: self.runtime.metadata_tags[(id(mesh), key)]
+                for key in expected
+            },
+            expected,
+        )
+        call_count = len(self.runtime.metadata_set_calls)
+        self.assertFalse(
+            self.module._persist_prototype_metadata(
+                mesh,
+                data,
+                sidecar_sha256,
+                export_file_path=str(self._contract_export_path()),
+            )
+        )
+        self.assertEqual(
+            len(self.runtime.metadata_set_calls),
+            call_count,
+        )
+
+    def test_prototype_metadata_rejects_malformed_sidecar_before_mutation(self):
+        mesh = FakeSkeletalMesh([])
+        data = self._contract_sidecar()
+        data["speedtree_prototype_handoff"]["output_content"][
+            "digest"
+        ] = "stale"
+        with self.assertRaisesRegex(ValueError, "output content"):
+            self.module._persist_prototype_metadata(
+                mesh,
+                data,
+                "b" * 64,
+                export_file_path=str(self._contract_export_path()),
+            )
+        self.assertEqual(self.runtime.metadata_set_calls, [])
+
+    def test_prototype_metadata_rehashes_current_fbx_before_mutation(self):
+        mesh = FakeSkeletalMesh([])
+        data = self._contract_sidecar()
+        export_path = self._contract_export_path()
+        original_stat = export_path.stat()
+        changed = bytearray(export_path.read_bytes())
+        changed[0] ^= 1
+        export_path.write_bytes(changed)
+        os.utime(
+            export_path,
+            ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "current FBX export payload does not match",
+        ):
+            self.module._persist_prototype_metadata(
+                mesh,
+                data,
+                "c" * 64,
+                export_file_path=str(export_path),
+            )
+        self.assertEqual(self.runtime.metadata_set_calls, [])
+        data = self._contract_sidecar()
+        with self.assertRaisesRegex(RuntimeError, "sidecar sha256"):
+            self.module._persist_prototype_metadata(
+                mesh,
+                data,
+                "not-a-sha",
+                export_file_path=str(self._contract_export_path()),
+            )
+        self.assertEqual(self.runtime.metadata_set_calls, [])
 
     def test_json_fallback_rejects_ambiguous_candidates(self):
         first = Path(self.temp_dir.name) / "first" / "SK_CommonGrass.json"
@@ -1905,6 +2237,30 @@ class TestUeMaterialTextureImport(unittest.TestCase):
 
         self.assertTrue(changed)
         self.assertEqual(self.runtime.mark_add_calls, [layer_path])
+
+    def test_existing_myi_rebuilds_owner_render_state_and_saves_without_thumbnail(self):
+        layer_path = '/Game/Material/MYI_Test'
+        material = FakeMaterialInstanceConstant('/Game/Material/MI_Test')
+        self.runtime.assets[layer_path] = FakeMaterialInstanceConstant(layer_path)
+        events = []
+        class Helper:
+            def create_or_update_material_layer_instance(inner_self, *args):
+                return True, json.dumps({'created': False, 'changed': True}), []
+            def set_material_instance_background_layer(inner_self, *args):
+                return False
+            def save_asset_package_without_thumbnail(inner_self, asset):
+                events.append(('save', asset))
+                return True
+        self.runtime.unreal_module.CodexMaterialToolsLibrary = Helper()
+        self.runtime.unreal_module.MaterialEditingLibrary.update_material_instance = lambda asset: events.append(('refresh', asset))
+        self.runtime.unreal_module.MaterialEditingLibrary.update_material_function = lambda asset: events.append(('refresh_layer', asset))
+        self.module._normalize_material_layer_asset = lambda *args, **kwargs: None
+        self.module._layer_parent_path = lambda *args: '/Game/Layer/Parent'
+        self.module._layer_instance_path = lambda *args: layer_path
+        self.module._call_set_material_instance_background_layer = lambda *args: (True, [])
+        self.assertTrue(self.module._assign_material_layer_instance(material, 'Test', [], {'key':'prop','master':'/Game/Master'}, {}))
+        layer = self.runtime.assets[layer_path]
+        self.assertEqual(events, [('refresh_layer', layer), ('save', layer), ('refresh', material), ('save', material)])
 
     def test_pipeline_owned_myi_clears_missing_managed_role_only(self):
         layer_path = "/Game/Material/Tree/MYI/MYI_Test"
@@ -2281,7 +2637,7 @@ class TestRuntimeTolerantMaterialProcess(unittest.TestCase):
         self.assertEqual(self.runtime.import_tasks, [])
         self.assertNotIn(target_path, self.runtime.save_calls)
 
-    def test_existing_generated_mi_wins_before_master_or_texture_discovery(self):
+    def test_existing_generated_mi_reuses_material_without_missing_texture_import(self):
         target_path = "/Game/Material/MI/MI_Test"
         user_parent = FakeMaterialInstanceConstant("/Game/User/M_UserParent")
         user_override = FakeTextureParameterValue("ArtistDetailMask")
@@ -2329,6 +2685,87 @@ class TestRuntimeTolerantMaterialProcess(unittest.TestCase):
         self.assertEqual(self.runtime.texture_parameter_sets, [])
         self.assertEqual(self.runtime.import_tasks, [])
         self.assertNotIn(target_path, self.runtime.save_calls)
+
+    def test_existing_generated_mi_reimports_changed_texture_without_material_mutation(
+        self,
+    ):
+        target_path = "/Game/Material/MI/MI_Test"
+        layer_path = "/Game/Material/MYI/MYI_Test"
+        user_parent = FakeMaterialInstanceConstant("/Game/User/M_UserParent")
+        mi_override = FakeTextureParameterValue("ArtistDetailMask")
+        myi_override = FakeTextureParameterValue("ArtistLayerMask")
+        existing_mi = FakeMaterialInstanceConstant(
+            target_path,
+            parent=user_parent,
+            texture_parameter_values=[mi_override],
+        )
+        existing_myi = FakeMaterialInstanceConstant(
+            layer_path,
+            texture_parameter_values=[myi_override],
+        )
+        self.runtime.assets[target_path] = existing_mi
+        self.runtime.assets[layer_path] = existing_myi
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_path = Path(temp_dir) / "T_Test_color.png"
+            source_path.write_bytes(b"changed texture bytes")
+            expected_md5 = _md5(source_path)
+            texture_path = "/Game/texture/T_Test_color"
+            self.runtime.assets[texture_path] = FakeTexture(
+                srgb=True,
+                compression_settings="TC_DEFAULT",
+                max_texture_size=0,
+                virtual_texture_streaming=True,
+            )
+            self.runtime.asset_md5[texture_path] = "0" * 32
+            data = {
+                "mesh_name": "SM_Test",
+                "materials": [
+                    {
+                        "name": "M_Test",
+                        "slot_index": 0,
+                        "layers": [
+                            {
+                                "name": "Base",
+                                "index": 0,
+                                "textures": [
+                                    {
+                                        "param": "Albedo",
+                                        "asset_name": "T_Test_color",
+                                        "file": str(source_path),
+                                    }
+                                ],
+                            }
+                        ],
+                        "material_layer": {"instance_path": layer_path},
+                    }
+                ],
+            }
+            preset = {
+                "key": "prop",
+                "master": "/Game/Missing/M_Master",
+                "mi_folder": "/Game/Material/MI",
+                "assignment": "material_layer_instance",
+                "layer_parent": "/Game/Material/MY_Parent",
+                "layer_instance_folder": "/Game/Material/MYI",
+                "virtual_textures": True,
+            }
+            self.configure_process(data, preset)
+
+            changed = self.module.process_mesh(self.mesh_path)
+
+        self.assertTrue(changed)
+        self.assertEqual(len(self.runtime.import_tasks), 1)
+        self.assertTrue(self.runtime.import_tasks[0]["replace_existing"])
+        self.assertEqual(self.runtime.checkout_calls, [texture_path])
+        self.assertEqual(self.runtime.asset_md5[texture_path], expected_md5)
+        self.assertIs(existing_mi.parent, user_parent)
+        self.assertEqual(existing_mi.texture_parameter_values, [mi_override])
+        self.assertEqual(existing_myi.texture_parameter_values, [myi_override])
+        self.assertEqual(self.runtime.parent_changes, [])
+        self.assertEqual(self.runtime.texture_parameter_sets, [])
+        self.assertNotIn(target_path, self.runtime.save_calls)
+        self.assertNotIn(layer_path, self.runtime.save_calls)
 
     def test_empty_background_generated_mi_is_initialized_from_sidecar(self):
         target_path = "/Game/Material/MI/MI_Test"
@@ -2395,6 +2832,55 @@ class TestRuntimeTolerantMaterialProcess(unittest.TestCase):
         self.assertEqual(assigned, [existing])
         self.assertIs(existing.parent, master)
         self.assertEqual(self.assignments[0][1], existing)
+
+    def test_empty_generated_mi_without_explicit_layer_contract_is_repairable(self):
+        existing = FakeMaterialInstanceConstant("/Game/Material/MI/MI_Test")
+
+        class Helper:
+            @staticmethod
+            def dump_material_layers(_material_path):
+                return True, json.dumps(
+                    {
+                        "ok": True,
+                        "has_layers": True,
+                        "layers": [{"index": 0, "path": ""}],
+                    }
+                )
+
+        self.runtime.unreal_module.CodexMaterialToolsLibrary = Helper()
+        entry = {"name": "M_Test"}
+        preset = {
+            "assignment": "material_layer_instance",
+            "mi_folder": "/Game/Material/MI",
+            "layer_parent": "/Game/Material/MY_Parent",
+            "layer_instance_folder": "/Game/Material/MYI",
+        }
+
+        self.assertTrue(
+            self.module._material_instance_has_empty_background_layer(
+                existing,
+                entry,
+                preset,
+            )
+        )
+
+    def test_empty_external_mi_without_layer_contract_remains_assignment_only(self):
+        existing = FakeMaterialInstanceConstant("/Game/User/MI_Artist")
+        entry = {"name": "M_Test"}
+        preset = {
+            "assignment": "material_layer_instance",
+            "mi_folder": "/Game/Material/MI",
+            "layer_parent": "/Game/Material/MY_Parent",
+            "layer_instance_folder": "/Game/Material/MYI",
+        }
+
+        self.assertFalse(
+            self.module._material_instance_has_empty_background_layer(
+                existing,
+                entry,
+                preset,
+            )
+        )
 
     def test_empty_background_generated_mi_is_initialized_without_textures(self):
         target_path = "/Game/Material/MI/MI_Test"
@@ -2535,7 +3021,7 @@ class TestRuntimeTolerantMaterialProcess(unittest.TestCase):
             )
         )
 
-    def test_existing_profile_mi_skips_base_master_and_texture_work(self):
+    def test_existing_profile_mi_skips_base_master_and_missing_texture_import(self):
         target_path = "/Game/Material/MI/MI_Test_canopy"
         existing = FakeMaterialInstanceConstant(target_path)
         self.runtime.assets[target_path] = existing

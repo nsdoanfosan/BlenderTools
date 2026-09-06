@@ -929,8 +929,8 @@ def is_unreal_connected():
         # bootstrap the unreal rpc server if it is not already running
         unreal.bootstrap_unreal_with_rpc_server()
         return True
-    except ConnectionError:
-        report_error('Could not find an open Unreal Editor instance!', raise_exception=False)
+    except ConnectionError as error:
+        report_error(str(error), raise_exception=False)
         return False
 
 
