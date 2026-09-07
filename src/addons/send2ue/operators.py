@@ -174,6 +174,7 @@ class Send2Ue(bpy.types.Operator):
         return {'FINISHED'}
 
     def pre_operation(self):
+        hair_tool_export.restore_debug_view()
         # get the current state of the scene and its objects
         self.state['context'] = utilities.get_current_context()
 
