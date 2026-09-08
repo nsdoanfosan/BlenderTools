@@ -19,6 +19,7 @@ from collections import defaultdict
 OWNER = "Send2UE.HairGuideCloth.Owner"
 CONTENT = "Send2UE.HairGuideCloth.Content"
 VERSION = "send2ue.hair_guide_cloth.v1"
+RENDER_ONLY_SOURCE_STATUSES = {"no_guide_after_search", "guide_weights_all_zero"}
 
 
 def _sha(path):
@@ -113,9 +114,9 @@ def validate_record(record):
     if render_only:
         sources = packet.get("render_only_sources", [])
         if (record["version"] != 2 or render.get("render_only_vertex_indices") != render_only or
-                not sources or any(source.get("status") != "no_guide_after_search" or
+                not sources or any(source.get("status") not in RENDER_ONLY_SOURCE_STATUSES or
                                    source.get("simulation_enabled") is not False for source in sources)):
-            raise ValueError("Render-only vertices require an explicit completed no-guide search")
+            raise ValueError("Render-only vertices require an explicit completed no-guide search or all-zero guide decision")
     elif render.get("render_only_vertex_indices") or packet.get("render_only_sources"):
         raise ValueError("Render-only provenance does not match the exported vertices")
     guided = {owner for owner in render["guide_ids"] if owner != -1}
@@ -195,7 +196,10 @@ def _render_only_receipt(record, packet):
             "manifest_sha256": record["manifest_sha256"], "sim_vertices": 0,
             "render_vertices": len(packet["meshes"]["render"]["vertices"]),
             "render_only_vertices": len(packet["meshes"]["render"]["vertices"]),
-            "guide_count": 0, "no_guide_policy": "render_only_skinning"}
+            "guide_count": 0, "no_guide_policy": "render_only_skinning",
+            "static_guide_policy": "omit_whole_zero_weight_source",
+            "static_guide_sources": [source for source in packet.get("render_only_sources", [])
+                                     if source.get("status") == "guide_weights_all_zero"]}
 
 
 def _verify_render_only_binding(receipt, expected_count):

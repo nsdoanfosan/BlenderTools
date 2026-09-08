@@ -274,11 +274,21 @@ def capture_source(source, export_state, include_system_ao=False, ao_settings=No
         bpy.context.view_layer.update()
         gm = _copy_mesh(guide_copy)
         meshes.append(gm)
+        weights, weight_receipt = own_weights(gm)
+        # Decide once for the entire evaluated generating source, before
+        # requiring render ownership. Zero roots/islands of an active source
+        # remain part of its cloth topology; render weights never decide this.
+        if not any(weight > 0.0 for weight in weights):
+            static_source = {**search, **weight_receipt,
+                'status': 'guide_weights_all_zero',
+                'guide_search_status': search['status'],
+                'excluded_sim_vertices': len(gm.vertices)}
+            return _capture_render_only(source, export_state, static_source,
+                                        include_system_ao, ao_settings)
         rm = _copy_mesh(render_copy)
         meshes.append(rm)
         if include_system_ao and rm.attributes.get('AO') is None:
             hair._set_neutral_ao(rm)
-        weights, weight_receipt = own_weights(gm)
         guide_islands = components(gm)
         if guide:
             stamped = gm.attributes.get(STAMP_ATTRIBUTE)
@@ -484,7 +494,7 @@ def _finish_asset(render, captures, asset_name, armature, export_collection, exp
                                      'matrix_local': [list(r) for r in b.matrix_local]} for b in armature.data.bones],
                      'export_skin_rule': {'head_bone': hair._get_head_bone_name(armature), 'weight': 1.0,
                                           'basis': 'existing_send2ue_hair_tool_export_rule'}} if armature else None,
-        'weight_policy': 'Own simulation ChaosWeight; absence intentionally static; never child render G.',
+        'weight_policy': 'Own simulation ChaosWeight; whole all-zero or absent-weight sources render-only; retain all vertices of any positive-weight source; never child render G.',
         'missing_guide_policy': 'Render-only after complete guide search; no simulation geometry or proxy binding.'}
     packet['content_id'] = hashlib.sha256(json.dumps(packet, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()).hexdigest()
     package = {'packet': packet, 'exports': {}, 'imported': set(), 'asset_name': asset_name}

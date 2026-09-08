@@ -13,12 +13,19 @@ before the disposable render generator is evaluated. Hair Tool's grid generator
 uses its native `src_island_index` when it does not propagate the custom stamp.
 Every connected output strand must retain one generating source island.
 
-The guide's evaluated mesh is exported separately as `<asset>_GuideSim`, including
-all its islands. No Remesh, polygon reduction, profile edits or paint generation
-occur. The simulation FBX G channel comes from that guide's own `ChaosWeight`.
-An absent attribute means intentionally static: its temporary simulation G is
-zero and the manifest records `authored_weight_present=false`. Artist-authored
-zero remains distinct. Render colors follow the existing material export packing.
+An evaluated guide with any positive own `ChaosWeight` is exported separately as
+`<asset>_GuideSim`, including all its vertices and islands. Zero-weight roots and
+zero-weight islands within that active source are preserved. No Remesh, polygon
+reduction, profile edits or paint generation occur. The simulation FBX G channel
+comes from that guide's own `ChaosWeight`, never the render mesh's colors.
+
+If the entire evaluated source has zero weights, or the attribute is absent, its
+complete ordinary render output is retained with no simulation geometry. The
+manifest records `status=guide_weights_all_zero`, the actual resolved guide and
+search receipt, and `excluded_sim_vertices`. An absent attribute remains distinct
+from authored zero through `authored_weight_present=false`. This whole-source
+decision happens before byte-color quantization; even a tiny positive authored
+weight keeps the entire source. Render colors follow the existing material packing.
 Both outputs follow the existing Hair Tool exporter rule of full head-bone binding
 to the same complete armature; this feature does not add a skin transfer rule.
 The final cloth uses the chosen body's reference skeleton after checking bone
@@ -34,7 +41,10 @@ mesh while their simulation FBX contains only actual guides. Native binding
 keeps unguided vertices fully skinned with zero effective simulation influence;
 it never assigns them to a nearby guide. With no guides anywhere in an export,
 `simulation_enabled=false`: no simulation FBX or Cloth build is made, and the
-receipt reports `render_only` with no current cloth asset path. Previously
+receipt reports `render_only` with no current cloth asset path. The same path is
+used when every resolved guide is wholly zero-weight or unpainted. Mixed packages
+keep the complete render mesh and bind those static outputs to skinning only,
+with no proxy influence from nearby active guides. Previously
 generated assets are retained; this exporter does not assign actor components.
 An unresolved or unsupported existing guide is not classified as absent.
 Optional cloth generation is deferred with a diagnostic while ordinary Send to
