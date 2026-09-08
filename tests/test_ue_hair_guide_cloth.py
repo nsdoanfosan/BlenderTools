@@ -136,6 +136,39 @@ class NativeReceiptTests(unittest.TestCase):
 
 
 class NoGuideContractTests(unittest.TestCase):
+    def test_zero_weight_guides_are_render_only_in_pure_and_mixed_exports(self):
+        for mixed in (False, True):
+            with self.subTest(mixed=mixed), tempfile.TemporaryDirectory() as directory:
+                built, packet = render_only_packet(mixed=mixed)
+                source = packet['render_only_sources'][0]
+                source.update(status='guide_weights_all_zero', guide='AuthoredGuide',
+                              authored_weight_present=True, excluded_sim_vertices=80)
+                record, validated = M.validate_record(file_record(directory, packet))
+                self.assertEqual(record['simulation_enabled'], mixed)
+                if mixed:
+                    mapped = M.normalize_ownership(built, validated)
+                    self.assertEqual(mapped['sim_guide_ids'], [7, 7, 7])
+                    self.assertEqual(mapped['sim_weights'], [0, 0, 1])
+                    self.assertEqual(mapped['render_only_vertex_indices'], [3, 4, 5])
+                else:
+                    receipt = M._render_only_receipt(record, validated)
+                    self.assertEqual(receipt['static_guide_sources'], [source])
+                    self.assertEqual(receipt['sim_vertices'], 0)
+
+    def test_unweighted_guide_never_loads_or_builds_a_simulation_asset(self):
+        _, packet = render_only_packet()
+        packet['render_only_sources'][0].update(
+            status='guide_weights_all_zero', guide='UnpaintedGuide', authored_weight_present=False)
+        render = object()
+        unreal = SimpleNamespace(load_asset=Mock(return_value=render),
+            EditorAssetLibrary=SimpleNamespace(save_loaded_asset=Mock(return_value=True)))
+        with tempfile.TemporaryDirectory() as directory, patch.dict('sys.modules', {'unreal': unreal}):
+            result = M.apply_hair_guide_cloth(file_record(directory, packet))
+        self.assertTrue(result['verified'])
+        self.assertFalse(result['simulation_enabled'])
+        self.assertIsNone(result['cloth_asset_path'])
+        unreal.load_asset.assert_called_once_with('/Game/Hair/SK_Render')
+
     def test_guided_v1_exports_still_validate_without_rebuilding_legacy_owner_names(self):
         _, packet = fixture()
         with tempfile.TemporaryDirectory() as directory:

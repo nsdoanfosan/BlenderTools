@@ -69,6 +69,39 @@ with tempfile.TemporaryDirectory(prefix='send2ue-render-only-smoke-') as temp:
 guide = bpy.data.objects.new('FoundGuide', mesh.copy())
 bpy.context.scene.collection.objects.link(guide)
 hair._modifier_input_set(source.modifiers['Setup'], identifier, guide)
+# A resolved but wholly unweighted guide is deliberately static, even when
+# its generator cannot propagate ownership. Keep the full ordinary render.
+static_captures = []
+for authored in (False, True):
+    if authored:
+        guide.data.attributes.new('ChaosWeight', 'FLOAT', 'POINT')
+    bpy.context.view_layer.update()
+    static_capture = cloth.capture_source(source, state)
+    assert static_capture is not None and not static_capture[1]['simulation_enabled']
+    assert not static_capture[1]['vertices'] and not static_capture[1]['parts']
+    assert sum(len(obj.data.vertices) for obj in static_capture[0]) == 4
+    receipt = static_capture[1]['source']
+    assert receipt['status'] == 'guide_weights_all_zero'
+    assert receipt['guide'] == guide.name and receipt['guide_search_status'] == 'resolved'
+    assert receipt['excluded_sim_vertices'] == 4
+    assert receipt['authored_weight_present'] == authored
+    assert len(receipt['search_stages']) == 3
+    assert all(d.value == -1 for obj in static_capture[0]
+               for d in obj.data.attributes[cloth.GUID_ATTRIBUTE].data)
+    assert not cloth.state()['diagnostics']
+    static_captures.append(static_capture)
+static_render = hair._join_objects(static_captures[0][0])
+objects_before_static_finish = set(bpy.data.objects)
+cloth.finish_asset(static_render, [static_captures[0][1]], 'WhollyStaticGuide', None,
+                   bpy.context.scene.collection, state)
+wholly_static_packet = cloth.state()['packages'][static_render[cloth.PACKAGE_PROPERTY]]['packet']
+assert not wholly_static_packet['simulation_enabled']
+assert not wholly_static_packet['meshes']['sim']['vertices']
+assert set(bpy.data.objects) == objects_before_static_finish
+assert wholly_static_packet['render_only_sources'][0]['status'] == 'guide_weights_all_zero'
+# One positive tip retains the entire guide and requires real ownership.
+guide.data.attributes['ChaosWeight'].data[3].value = 1.
+bpy.context.view_layer.update()
 second = cloth.capture_source(source, state)
 assert second is None
 assert cloth.state()['diagnostics'][-1]['status'] == 'cloth_deferred'
@@ -128,8 +161,8 @@ bpy.context.view_layer.update()
 guided_capture = cloth.capture_source(guided, state)
 assert guided_capture is not None and guided_capture[1]['simulation_enabled']
 assert len(guided_capture[1]['vertices']) == 4
-assert guided_capture[1]['weights'] == [0.] * 4
-assert not guided_capture[1]['parts'][0]['authored_weight_present']
+assert guided_capture[1]['weights'] == [0., 0., 0., 1.]
+assert guided_capture[1]['parts'][0]['authored_weight_present']
 joined = hair._join_objects(guided_capture[0] + mixed_capture[0])
 bpy.ops.object.armature_add()
 rig = bpy.context.object
@@ -143,7 +176,8 @@ assert len(mixed_packet['meshes']['render']['render_only_vertex_indices']) == 6
 assert all(g > 0 for g in mixed_packet['meshes']['sim']['guide_ids'])
 assert mixed_packet['render_only_sources'][0]['status'] == 'no_guide_after_search'
 assert len(mixed_packet['parts']) == 1
-assert len(guide.data.vertices) == 4 and 'ChaosWeight' not in guide.data.attributes
+assert len(guide.data.vertices) == 4
+assert [d.value for d in guide.data.attributes['ChaosWeight'].data] == [0., 0., 0., 1.]
 
 # A fully filtered no-guide source contributes no geometry. Its absence is
 # ordinary output and cannot defer a sibling's valid guide cloth package.
@@ -166,10 +200,40 @@ assert filtered_packet['simulation_enabled'] and len(filtered_packet['meshes']['
 assert len(filtered_packet['meshes']['render']['vertices']) == 4
 assert filtered_packet['render_only_sources'] == []
 assert filtered_packet['meshes']['render']['render_only_vertex_indices'] == []
+
+# An active source keeps a disconnected all-zero island too, even when its
+# only positive value is smaller than FBX byte-color quantization precision.
+island_mesh = bpy.data.meshes.new('PartlyWeightedIslands')
+island_mesh.from_pydata([(0, 0, 0), (1, 0, 0), (0, 0, 1), (1, 0, 1),
+                       (3, 0, 0), (4, 0, 0), (3, 0, 1)], [],
+                      [(0, 1, 2), (1, 3, 2), (4, 5, 6)])
+island_mesh.attributes.new('ChaosWeight', 'FLOAT', 'POINT').data[3].value = 1e-10
+guide.data = island_mesh
+bpy.context.view_layer.update()
+island_capture = cloth.capture_source(guided, state)
+assert island_capture is not None and island_capture[1]['simulation_enabled']
+assert len(island_capture[1]['vertices']) == 7 and len(island_capture[1]['parts']) == 2
+assert sum(w > 0 for w in island_capture[1]['weights']) == 1
+assert island_capture[1]['weights'][4:] == [0.] * 3
+
+# Static resolved sources can share a package with an active source without
+# adding any simulation vertices or losing their complete render geometry.
+static_joined = hair._join_objects(island_capture[0] + static_captures[1][0])
+cloth.finish_asset(static_joined, [island_capture[1], static_captures[1][1]],
+                   'ActivePlusZeroGuide', rig, bpy.context.scene.collection, state)
+static_packet = cloth.state()['packages'][static_joined[cloth.PACKAGE_PROPERTY]]['packet']
+assert len(static_packet['meshes']['sim']['vertices']) == 7
+assert len(static_packet['meshes']['render']['vertices']) == 11
+assert len(static_packet['meshes']['render']['render_only_vertex_indices']) == 4
+assert static_packet['render_only_sources'][0]['status'] == 'guide_weights_all_zero'
 print('HAIR_GUIDE_POLICY_SMOKE ' + json.dumps({
     'no_guide_render_only_after_full_search': True, 'missing_guide_weight_static': True,
     'found_unsupported_guide_deferred': True, 'original_data_preserved': True,
     'no_guide_preserves_mesh_and_instances': True, 'pure_render_only_no_sim_object': True,
     'mixed_guided_and_render_only_keeps_full_render_and_only_real_guides': True,
     'empty_filtered_source_preserves_sibling_guide_export': True,
+    'whole_absent_or_zero_guide_render_only': True,
+    'positive_source_retains_zero_roots_and_islands': True,
+    'tiny_positive_not_discarded': True,
+    'mixed_active_and_static_guides_no_extra_sim_vertices': True,
 }), flush=True)
