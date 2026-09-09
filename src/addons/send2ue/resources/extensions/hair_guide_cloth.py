@@ -35,6 +35,15 @@ class HairGuideClothExtension(ExtensionBase):
     enabled: bpy.props.BoolProperty(
         name='Hair guides to Chaos Cloth', default=False,
         description='Export the actual generating guide mesh with hair cards and build a separate Chaos Cloth asset')
+    simulation_mesh_mode: bpy.props.EnumProperty(
+        name='Simulation guide shape',
+        items=(
+            ('RIBBON', 'Ribbon for circular guides',
+             'Export supported circular Hair Tool guides as open ribbons, preserving their splines and paint; keep other guides unchanged'),
+            ('ORIGINAL', 'Original guide',
+             'Export the evaluated guide with its original profile')),
+        default='RIBBON',
+        description='Choose the exported simulation shape; authoring guides and render generation stay unchanged')
     cloth_template_asset_path: bpy.props.StringProperty(
         name='Cloth physics template', description='Existing Chaos Cloth asset supplying physical settings')
     body_mesh_asset_path: bpy.props.StringProperty(
@@ -46,6 +55,7 @@ class HairGuideClothExtension(ExtensionBase):
         box = layout.box()
         dialog.draw_property(self, box, 'enabled')
         if self.enabled:
+            dialog.draw_property(self, box, 'simulation_mesh_mode')
             for key in ('cloth_template_asset_path', 'body_mesh_asset_path', 'physics_asset_path'):
                 dialog.draw_property(self, box, key)
             box.label(text='Unpainted guides remain static. Artist geometry is preserved.')

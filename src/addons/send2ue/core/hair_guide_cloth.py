@@ -240,6 +240,7 @@ def capture_source(source, export_state, include_system_ao=False, ao_settings=No
     """Return (temporary render parts, physical source packet), or defer safely."""
     from . import hair_tool_export as hair
     copies, group, meshes = [], None, []
+    ribbon_plan = None
     try:
         guide, sockets, search = find_guide(source)
         if search['status'] == 'unresolved':
@@ -247,6 +248,27 @@ def capture_source(source, export_state, include_system_ao=False, ao_settings=No
             return None
         if search['status'] == 'no_guide_after_search':
             return _capture_render_only(source, export_state, search, include_system_ao, ao_settings)
+        # Whole-source static policy precedes optional ribbon preparation and
+        # ownership work. Missing/zero own G never creates a simulation source.
+        guide_copy = guide.copy()
+        guide_copy.name = guide.name + '__GuideCapture'
+        bpy.context.scene.collection.objects.link(guide_copy)
+        guide_copy.hide_set(False)
+        guide_copy.hide_viewport = False
+        copies.append(guide_copy)
+        bpy.context.view_layer.update()
+        original_guide_mesh = _copy_mesh(guide_copy)
+        meshes.append(original_guide_mesh)
+        source_weights, source_weight_receipt = own_weights(original_guide_mesh)
+        if not any(weight > 0.0 for weight in source_weights):
+            static_source = {**search, **source_weight_receipt,
+                'status': 'guide_weights_all_zero', 'guide_search_status': search['status'],
+                'excluded_sim_vertices': len(original_guide_mesh.vertices),
+                'simulation_mesh': {'version': 'send2ue.guide_ribbon.v1',
+                    'requested_mode': getattr(settings(), 'simulation_mesh_mode', 'RIBBON'),
+                    'effective_mode': 'ORIGINAL', 'status': 'source_all_zero',
+                    'fallback_reason': None, 'simulation_counts': {'vertices': 0, 'triangles': 0}}}
+            return _capture_render_only(source, export_state, static_source, include_system_ao, ao_settings)
         render_copy = source.copy()
         render_copy.name = source.name + '__GuideCapture'
         bpy.context.scene.collection.objects.link(render_copy)
@@ -254,12 +276,9 @@ def capture_source(source, export_state, include_system_ao=False, ao_settings=No
         render_copy.hide_viewport = False
         copies.append(render_copy)
         if guide:
-            guide_copy = guide.copy()
-            guide_copy.name = guide.name + '__GuideCapture'
-            bpy.context.scene.collection.objects.link(guide_copy)
-            guide_copy.hide_set(False)
-            guide_copy.hide_viewport = False
-            copies.append(guide_copy)
+            from . import hair_guide_ribbon as ribbon
+            ribbon_plan = ribbon.prepare(guide_copy,
+                getattr(settings(), 'simulation_mesh_mode', 'RIBBON'))
             group = _stamp_group()
             stamp = guide_copy.modifiers.new('Send2UE Export Ownership', 'NODES')
             stamp.node_group = group
@@ -279,14 +298,35 @@ def capture_source(source, export_state, include_system_ao=False, ao_settings=No
         # requiring render ownership. Zero roots/islands of an active source
         # remain part of its cloth topology; render weights never decide this.
         if not any(weight > 0.0 for weight in weights):
+            gm.calc_loop_triangles()
+            ribbon_plan.receipt.update(status='source_all_zero',
+                source_counts={'vertices': len(gm.vertices), 'triangles': len(gm.loop_triangles)},
+                simulation_counts={'vertices': 0, 'triangles': 0})
             static_source = {**search, **weight_receipt,
                 'status': 'guide_weights_all_zero',
                 'guide_search_status': search['status'],
-                'excluded_sim_vertices': len(gm.vertices)}
+                'excluded_sim_vertices': len(gm.vertices),
+                'simulation_mesh': dict(ribbon_plan.receipt)}
             return _capture_render_only(source, export_state, static_source,
                                         include_system_ao, ao_settings)
         rm = _copy_mesh(render_copy)
         meshes.append(rm)
+        if ribbon_plan.prepared:
+            # Stamping is allowed to add identity fields only. Independently
+            # check the untouched authoring outputs before the sim-only branch
+            # can change topology; the renderer always uses the original guide.
+            original_render_mesh = _copy_mesh(source)
+            meshes.append(original_render_mesh)
+            guide_unchanged = ribbon.geometry_signature(gm) == ribbon.geometry_signature(original_guide_mesh)
+            render_unchanged = ribbon.geometry_signature(rm) == ribbon.geometry_signature(original_render_mesh)
+            ribbon_plan.receipt.update(original_guide_geometry_unchanged=guide_unchanged,
+                                       render_geometry_unchanged=render_unchanged)
+            if not guide_unchanged or not render_unchanged:
+                ribbon_plan.fallback('Identity stamping did not preserve the original guide/render geometry')
+                bpy.context.view_layer.update()
+                gm, rm = _copy_mesh(guide_copy), _copy_mesh(render_copy)
+                meshes.extend((gm, rm))
+                weights, weight_receipt = own_weights(gm)
         if include_system_ao and rm.attributes.get('AO') is None:
             hair._set_neutral_ao(rm)
         guide_islands = components(gm)
@@ -305,12 +345,35 @@ def capture_source(source, export_state, include_system_ao=False, ao_settings=No
                 raise ValueError('Guide has loose points without a surface owner.')
             attr = rm.attributes.get(STAMP_ATTRIBUTE)
             provenance = 'generator_carried_island'
-            if attr is None and _has_grid_generator(render_copy):
+            if (attr is None or attr.domain != 'POINT' or attr.data_type != 'INT') and _has_grid_generator(render_copy):
                 attr = rm.attributes.get('src_island_index')
                 provenance = 'hair_tool_grid_src_island_index'
             if attr is None or attr.domain != 'POINT' or attr.data_type != 'INT':
                 raise ValueError('This generator does not preserve an exact source guide island attribute.')
             render_islands = [v.value for v in attr.data]
+            if ribbon_plan.prepared:
+                # Verify two independently captured identities: the original
+                # mesh-island FACE stamp and the generating CURVE stamp. Native
+                # src_island_index can be renumbered after the Prism generator
+                # removes unused parents, so it is not a universal source ID.
+                source_splines = ribbon._point_attribute(gm, ribbon.SPLINE_ATTRIBUTE, 'INT')
+                render_splines = ribbon._point_attribute(rm, ribbon.SPLINE_ATTRIBUTE, 'INT')
+                native_to_spline, spline_to_native = {}, {}
+                for owner, spline in zip(guide_islands, source_splines):
+                    if native_to_spline.get(owner, spline) != spline or spline_to_native.get(spline, owner) != owner:
+                        raise ValueError('Generating mesh islands and spline identities are not one-to-one.')
+                    native_to_spline[owner] = spline
+                    spline_to_native[spline] = owner
+                if any(native_to_spline.get(owner) != spline for owner, spline in zip(render_islands, render_splines)):
+                    raise ValueError('Generated strand parent disagrees with its independently captured spline identity.')
+                native_attr = rm.attributes.get('src_island_index')
+                native_pairs = {}
+                if native_attr is not None and native_attr.domain == 'POINT' and native_attr.data_type == 'INT':
+                    for datum, owner in zip(native_attr.data, render_islands):
+                        native_pairs.setdefault(str(datum.value), set()).add(owner)
+                search['render_ownership'] = {'basis': 'independent_source_face_and_curve_stamps',
+                    'verified_vertices': len(render_islands), 'spline_mismatches': 0,
+                    'generator_native_index_to_source_islands': {key: sorted(values) for key, values in native_pairs.items()}}
         if not set(render_islands).issubset(set(guide_islands)):
             raise ValueError('Generated strands refer to an absent guide island.')
         strand_owners = {}
@@ -318,6 +381,17 @@ def capture_source(source, export_state, include_system_ao=False, ao_settings=No
             strand_owners.setdefault(strand, set()).add(owner)
         if any(len(owners) != 1 for owners in strand_owners.values()):
             raise ValueError('A connected strand has multiple generating guide IDs.')
+        original_gm = gm
+        gm, guide_islands, simulation_receipt = ribbon_plan.convert(gm, guide_islands, _copy_mesh, own_weights)
+        if gm is not original_gm:
+            meshes.append(gm)
+            weights, weight_receipt = own_weights(gm)
+        search = {**search, 'simulation_mesh': dict(simulation_receipt)}
+        if simulation_receipt.get('fallback_reason'):
+            row = {'source': source.name, 'status': 'original_simulation_retained',
+                   'reason': simulation_receipt['fallback_reason'], 'simulation_mesh': dict(simulation_receipt)}
+            state()['diagnostics'].append(row)
+            print('[send2ue][hair_guide_cloth] ' + json.dumps(row, ensure_ascii=False))
         ids = {}
         for local in sorted(set(guide_islands)):
             ids[local] = state()['next_gid']
@@ -343,7 +417,8 @@ def capture_source(source, export_state, include_system_ao=False, ao_settings=No
             packet['parts'].append({'gid': gid, 'source_guide': guide.name,
                 'source_render': source.name, 'source_vertex_indices': vertices,
                 'local_sim_vertex_indices': vertices, 'provenance': provenance,
-                'render_vertices': render_gids.count(gid), **weight_receipt})
+                'render_vertices': render_gids.count(gid),
+                'simulation_mesh': dict(simulation_receipt), **weight_receipt})
         obj = bpy.data.objects.new(source.name + '__GuideRender', rm)
         bpy.context.scene.collection.objects.link(obj)
         obj.matrix_world = Matrix.Identity(4)
@@ -354,6 +429,8 @@ def capture_source(source, export_state, include_system_ao=False, ao_settings=No
         diagnostic(source.name, str(error))
         return None
     finally:
+        if ribbon_plan is not None:
+            ribbon_plan.close()
         for obj in reversed(copies):
             bpy.data.objects.remove(obj, do_unlink=True)
         if group and group.users == 0:
