@@ -622,6 +622,20 @@ def _validate_speedtree_handoff_contract(
     marker requires the current descriptor and material intent contract.
     """
     materials = data.get("materials", []) if isinstance(data, dict) else []
+    for entry in materials:
+        if not isinstance(entry, dict) or not entry.get("speedtree_intent"):
+            continue
+        if entry.get("tree_shading") != "foliage":
+            continue
+        layers = _entry_layers(entry, {"key": "tree"})
+        if not any(
+            texture.get("param") == "Albedo" and texture.get("file")
+            for layer in layers for texture in layer.get("textures", [])
+        ):
+            raise RuntimeError(
+                "SpeedTree foliage has no Albedo payload; import blocked before mutation: "
+                + str(entry.get("name") or "<unnamed>")
+            )
     has_intent = any(
         isinstance(entry, dict) and "speedtree_intent" in entry
         for entry in materials
@@ -3995,6 +4009,21 @@ def _assign_material_layer_instance(
     entry: dict,
     clear_missing_managed: bool = False,
 ) -> bool:
+    # Missing SpeedTree textures must not erase an existing MYI's overrides.
+    if (entry or {}).get("speedtree_intent") and entry.get("tree_shading") == "foliage":
+        imported = _first_layer_textures(layer_maps)
+        declared = {
+            texture.get("param")
+            for layer in _entry_layers(entry, preset)
+            for texture in layer.get("textures", [])
+        }
+        missing = (declared | {"Albedo"}) - set(imported)
+        if missing:
+            raise RuntimeError(
+                "SpeedTree foliage texture handoff is incomplete; existing MYI preserved: "
+                + str(entry.get("name") or mat_base)
+                + "; missing=" + ",".join(sorted(missing))
+            )
     helper = getattr(unreal, "CodexMaterialToolsLibrary", None)
     if not helper or not hasattr(helper, "create_or_update_material_layer_instance"):
         _warn("  CodexMaterialTools layer instance helper missing; MYI assignment skipped")
