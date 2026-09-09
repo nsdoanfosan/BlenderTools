@@ -663,7 +663,7 @@ def _evaluate_combined_ao(scene_object, state, ao_settings=None):
         # Tool system in this export asset. Bake world space before AO so the
         # ray distances match the geometry that Unreal receives.
         world_mesh = original_mesh.copy()
-        world_mesh.transform(original_world_matrix)
+        world_mesh.transform(original_world_matrix, shape_keys=True)
         existing_ao = world_mesh.attributes.get('AO')
         if existing_ao:
             world_mesh.attributes.remove(existing_ao)
@@ -742,16 +742,33 @@ def _evaluate_combined_ao(scene_object, state, ao_settings=None):
         modifier = None
         bpy.data.node_groups.remove(temporary_node_group)
         temporary_node_group = None
-        scene_object.data = evaluated_mesh
+        if original_mesh.shape_keys:
+            # AO is attribute-only. Replacing the mesh with new_from_object()
+            # would discard the evaluated expression keys baked before joining.
+            if any(
+                tuple(a.vertices) != tuple(b.vertices)
+                for a, b in zip(original_mesh.polygons, evaluated_mesh.polygons)
+            ):
+                raise RuntimeError('HT_Mesh_AO reordered shape-key topology')
+            existing_ao = original_mesh.attributes.get('AO')
+            if existing_ao:
+                original_mesh.attributes.remove(existing_ao)
+            preserved_ao = original_mesh.attributes.new('AO', 'FLOAT', 'CORNER')
+            preserved_ao.data.foreach_set('value', ao_values)
+            scene_object.data = original_mesh
+            bpy.data.meshes.remove(evaluated_mesh)
+            evaluated_mesh = None
+        else:
+            scene_object.data = evaluated_mesh
         scene_object.matrix_world = original_world_matrix
         state.setdefault('ao_stats', {})[scene_object.name] = {
             **ao_stats,
             'source': 'combined_export_geometry',
-            'vertices': len(evaluated_mesh.vertices),
-            'polygons': len(evaluated_mesh.polygons),
+            'vertices': len(scene_object.data.vertices),
+            'polygons': len(scene_object.data.polygons),
             'fallback': False,
         }
-        state['temporary_mesh_names'].add(evaluated_mesh.name)
+        state['temporary_mesh_names'].add(scene_object.data.name)
         evaluated_mesh = None
 
         if original_mesh.users == 0:
@@ -995,7 +1012,7 @@ def _join_objects(objects):
     for scene_object in objects:
         world_matrix = scene_object.matrix_world.copy()
         negative_handedness = world_matrix.to_3x3().determinant() < 0.0
-        scene_object.data.transform(world_matrix)
+        scene_object.data.transform(world_matrix, shape_keys=True)
         if negative_handedness:
             scene_object.data.flip_normals()
         scene_object.data.update()
@@ -1035,6 +1052,41 @@ def _copy_transfer_settings(temporary_object, source_objects):
         and hasattr(temporary_object, 'vdt_object_props')
     ):
         temporary_object.vdt_object_props.transfer_source = transfer_source
+
+
+def _bake_group_shape_keys(source_parts):
+    """Preserve opted-in live deformations before combining card systems.
+
+    Once a group contains an evaluated transfer, fulfill every requested shape
+    transfer per system. A later proximity pass over the joined mesh would erase
+    the evaluated keys and can bind lower lashes to the upper eyelid again.
+    """
+    requested = [
+        (source, parts) for source, parts in source_parts
+        if parts and getattr(source, 'ue_unique_transfer_shape_keys', False)
+    ]
+    if not any(source.get('vdt_evaluated_shape_keys', False) for source, _ in requested):
+        return False
+    from vertex_data_tools.evaluated_shape_keys import bake_evaluated_shape_keys
+    from vertex_data_tools import run_pointer_shape_key_transfer
+
+    evaluated = {}
+    proximity = []
+    for source, parts in requested:
+        settings = getattr(source, 'vdt_object_props', None)
+        character = settings.transfer_source if settings else None
+        if character is None:
+            raise RuntimeError(f'{source.name}: shape-key transfer source is missing')
+        if source.get('vdt_evaluated_shape_keys', False):
+            evaluated.setdefault(character, []).append((source, parts))
+        else:
+            proximity.extend((character, part) for part in parts)
+    for character, entries in evaluated.items():
+        bake_evaluated_shape_keys(character, entries)
+    for character, part in proximity:
+        part.vdt_object_props.transfer_source = character
+        run_pointer_shape_key_transfer(bpy.context, character, part)
+    return True
 
 
 def _link_to_export_collection(scene_object, export_collection):
@@ -1212,6 +1264,7 @@ def prepare():
         for asset_parent, asset_sources in grouped_sources.items():
             ao_configuration = _asset_ao_configuration(asset_parent)
             parts = []
+            shape_source_parts = []
             guide_captures = []
             guide_capture_complete = guide_cloth_enabled
             for source_object in asset_sources:
@@ -1224,6 +1277,7 @@ def prepare():
                     if captured is not None:
                         source_parts, guide_capture = captured
                         parts.extend(source_parts)
+                        shape_source_parts.append((source_object, source_parts))
                         guide_captures.append(guide_capture)
                         continue
                     guide_capture_complete = False
@@ -1236,9 +1290,12 @@ def prepare():
                     ao_settings=ao_configuration,
                 )
                 parts.extend(source_parts)
+                shape_source_parts.append((source_object, source_parts))
 
             if not parts:
                 continue
+
+            shapes_baked = _bake_group_shape_keys(shape_source_parts)
 
             # Only actually generated card meshes are joined. AO evaluation
             # order is the explicit per-asset mode stored on the export Empty.
@@ -1249,6 +1306,9 @@ def prepare():
             temporary_object[SOURCE_NAME_PROPERTY] = asset_name
             temporary_object[TEMP_PROPERTY] = True
             _copy_transfer_settings(temporary_object, asset_sources)
+            if shapes_baked:
+                temporary_object.ue_unique_transfer_shape_keys = False
+                temporary_object['_vdt_shape_transfer_completed'] = True
             _link_to_export_collection(temporary_object, export_collection)
             state['temporary_object_names'].add(temporary_object.name)
 
