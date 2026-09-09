@@ -143,7 +143,7 @@ def normalize_ownership(built, packet, tolerance_cm=0.0002):
         cell = lambda p: tuple(math.floor(v / tolerance_cm) for v in p)
         for index, point in enumerate(positions):
             buckets[cell(point)].append(index)
-        gids, source_indices, errors = [], [], []
+        gids, source_indices, errors, unique_source_identity = [], [], [], []
         for point in built[role + "_positions"]:
             key = cell(point)
             candidates = []
@@ -161,10 +161,15 @@ def normalize_ownership(built, packet, tolerance_cm=0.0002):
                 raise ValueError("Coincident simulation vertices have conflicting source G")
             error, index = min(candidates)
             gids.append(source["guide_ids"][index]); source_indices.append(index); errors.append(error)
+            # Same-parent coincident strands can have several original vertices.
+            # Their parent remains known, but they must not share a position
+            # embedding merely because coordinate matching selected one index.
+            unique_source_identity.append(len(candidates) == 1)
         result[role + "_positions"] = built[role + "_positions"]
         result[role + "_triangles"] = built[role + "_triangles"]
         result[role + "_guide_ids"] = gids
         result[role + "_source_indices"] = source_indices
+        result[role + "_source_identity_unique"] = unique_source_identity
         receipt[role] = {"maximum_import_error_cm": max(errors), "ambiguous": 0, "unmatched": 0}
         if role == "sim":
             expected = [source["weights"][i] for i in source_indices]
@@ -342,14 +347,39 @@ def _publish(unreal, source_asset, binding_path, target, owner, content):
             raise ValueError("Cloth output belongs to another asset: " + target)
         old_content = unreal.EditorAssetLibrary.get_metadata_tag(final, CONTENT)
         old_binding = unreal.EditorAssetLibrary.get_metadata_tag(final, binding_key)
-        fg, fc, _, fn, fi = _graph(unreal, final)
+        fg, fc, fs, fn, fi = _graph(unreal, final)
         imports = [n for n, info in fi.items() if info["type"] == "FChaosClothAssetImportNode"]
         terminals = [n for n, info in fi.items() if "TerminalNode" in info["type"]]
-        if len(fn) != 2 or len(imports) != 1 or len(terminals) != 1 or not old_binding:
+        if imports != ["GeneratorBindings"] or len(terminals) != 1 or not old_binding:
+            raise ValueError("Existing cloth graph has user changes; it remains unchanged")
+        # Solver/material-response configuration and the body collider downstream
+        # of our owned import belong to the artist. Preserve them when replacing
+        # only binding data, including a cheaper collider chosen for this hair.
+        # Geometry/weight-map/proxy nodes are not configuration overrides.
+        configs = set(fn) - set(imports) - set(terminals)
+        if any(fi[n]["type"] != "FChaosClothAssetSetPhysicsAssetNode" and
+               not re.fullmatch(r"FChaosClothAssetSimulation\w*ConfigNode(?:_v\d+)?", fi[n]["type"])
+               for n in configs):
+            raise ValueError("Existing cloth graph has user changes; it remains unchanged")
+        incoming = {(e["toNode"], e["toPin"]): e["fromNode"] for e in fs["connections"]
+                    if e["fromPin"] == "Collection"}
+        visited = set()
+        for pin in fi[terminals[0]]["inputPins"]:
+            if not pin["name"].startswith("CollectionLods["):
+                continue
+            current = incoming.get((terminals[0], pin["name"]))
+            chain = set()
+            while current in configs and current not in chain:
+                chain.add(current)
+                current = incoming.get((current, "Collection"))
+            if current != imports[0]:
+                raise ValueError("Existing cloth graph has user changes; it remains unchanged")
+            visited.update(chain)
+        if visited != configs:
             raise ValueError("Existing cloth graph has user changes; it remains unchanged")
         # GetNodeInfo exports actual property values as Unreal text, e.g.
         # /Script/ChaosClothAsset.ChaosClothAsset'/Game/Hair/Data.Data'. Metadata
-        # alone cannot prove that the artist left this two-node graph unchanged.
+        # alone cannot prove that the artist left the owned import unchanged.
         previous_import = fi[imports[0]].get("properties", {})
         reference = previous_import.get("ClothAsset")
         if isinstance(reference, str):
@@ -365,6 +395,10 @@ def _publish(unreal, source_asset, binding_path, target, owner, content):
             fc("UpdateNode", fn[imports[0]], json.dumps({"ClothAsset": binding_path, "ImportLod": 0}))
             unreal.DataflowBlueprintLibrary.evaluate_terminal_node_by_name(fg, terminals[0], final)
             actual = _native(unreal.CodexClothToolsLibrary.dump_cloth_collection_colors(target))
+            # This native audit contains geometry, normals, colours, weight maps
+            # and deformer bindings, not solver/config property values. Keeping
+            # its full comparison permits physics overrides without accepting
+            # changes to the validated simulation/render correspondence.
             if actual["collections"][0] != before["collections"][0]:
                 raise RuntimeError("Published cloth differs from its verified collection")
             unreal.EditorAssetLibrary.set_metadata_tag(final, CONTENT, content)
@@ -447,6 +481,165 @@ def build_in_editor(record, output_directory):
     return receipt
 
 
+_LIVE_STATE_TAG = "Send2UE.HairGuideCloth.LiveState:"
+_LIVE_HELPER_TAG = "Send2UE.HairGuideCloth.RenderHelper:"
+
+
+def _refresh_live_components(record, final=None):
+    """Propagate verified output to exact existing owners, retaining scene setup.
+
+    Asset package reload does not rebuild an already-instantiated cloth proxy.
+    State tags make render-only transitions reversible across Python reloads.
+    No scene actor, unrelated cloth, or imported source asset is replaced.
+    """
+    import unreal
+    expected = VERSION + ":" + record["render_asset_path"]
+    target = _target(record)
+    enabled = record["simulation_enabled"]
+    sub = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    render = (final or unreal.load_asset(record["render_asset_path"])) if not enabled else None
+    rows = []
+
+    def tags(component):
+        return [str(t) for t in component.get_editor_property("component_tags")]
+
+    def visibility(component):
+        return {"visible": bool(component.get_editor_property("visible")),
+                "hidden_in_game": bool(component.get_editor_property("hidden_in_game"))}
+
+    def set_visibility(component, state):
+        component.set_visibility(state["visible"], False)
+        component.set_hidden_in_game(state["hidden_in_game"], False)
+
+    def set_flags(component, state):
+        component.set_enable_simulation(state["enabled"])
+        # bSuspendSimulation shadows the same-named Python method in UE 5.8.
+        component.call_method("SuspendSimulation" if state["suspended"] else "ResumeSimulation", args=())
+
+    def flags(component):
+        # IsSimulationEnabled also tests proxy validity and p.ClothPhysics;
+        # IsSimulationSuspended folds disabled into suspended. Those effective
+        # queries cannot preserve the user's actual two independent flags.
+        return {"enabled": bool(component.get_editor_property("enable_simulation")),
+                "suspended": bool(component.get_editor_property("suspend_simulation"))}
+
+    for actor in sub.get_all_level_actors():
+        cloth_names = [c.get_name() for c in actor.get_components_by_class(unreal.ChaosClothComponent)]
+        for cloth_name in cloth_names:
+            # Native instance authoring may rebuild SCS components. Never keep
+            # the original component iterator alive across another helper add.
+            cloth = next((c for c in actor.get_components_by_class(unreal.ChaosClothComponent)
+                          if c.get_name() == cloth_name), None)
+            if cloth is None:
+                continue
+            asset = cloth.get_asset()
+            if not asset:
+                continue
+            if (_path(asset.get_path_name()) != target and
+                    unreal.EditorAssetLibrary.get_metadata_tag(asset, OWNER) != expected):
+                continue
+            original_tags = tags(cloth)
+            helper_tag = _LIVE_HELPER_TAG + expected + ":" + cloth.get_name()
+            states = [json.loads(t[len(_LIVE_STATE_TAG):]) for t in original_tags if t.startswith(_LIVE_STATE_TAG)]
+            state = next((s for s in states if s.get("owner") == expected), None)
+            if enabled:
+                current = flags(cloth)
+                # SetAsset may be a no-op for an identical UObject. Explicitly
+                # rebuild the proxy/config even on the second import of that ID.
+                cloth.set_asset(final)
+                cloth.reset_config_properties()
+                cloth.recreate_cloth_simulation_proxy()
+                set_flags(cloth, state or current)
+                if state:
+                    for component in actor.get_components_by_class(unreal.SkeletalMeshComponent):
+                        if component == cloth:
+                            continue
+                        if helper_tag in tags(component):
+                            component.call_method("K2_DestroyComponent", args=(actor,))
+                        elif component.get_name() == state.get("renderer"):
+                            set_visibility(component, state["renderer_visibility"])
+                    cloth.set_editor_property("component_tags", [t for t in original_tags
+                        if not (t.startswith(_LIVE_STATE_TAG) and json.loads(t[len(_LIVE_STATE_TAG):]).get("owner") == expected)])
+                    # Tag notifications and helper teardown may reregister cloth
+                    # and restore its default visibility; authored flags win last.
+                    set_flags(cloth, state)
+                    set_visibility(cloth, state)
+                rows.append({"component": cloth.get_path_name(), "status": "simulation_refreshed",
+                             "asset": final.get_path_name(), "enabled": cloth.is_simulation_enabled()})
+                continue
+
+            if state is None:
+                state = dict(visibility(cloth), owner=expected, **flags(cloth))
+            leader = cloth.get_editor_property("leader_pose_component")
+            siblings = [c for c in actor.get_components_by_class(unreal.SkeletalMeshComponent) if c != cloth]
+            helper = next((c for c in siblings if helper_tag in tags(c)), None)
+            renderer = next((c for c in siblings if c.get_name() == state.get("renderer")), None)
+            if not renderer:
+                matches = [c for c in siblings if c.get_skinned_asset() == render
+                           and c.get_editor_property("leader_pose_component") == leader
+                           and c.get_attach_parent() == cloth.get_attach_parent()
+                           and c.get_relative_transform() == cloth.get_relative_transform()]
+                renderer = helper or (matches[0] if len(matches) == 1 else None)
+            if renderer is None:
+                # The editor subsystem calls native AddInstanceComponent. Its
+                # CreationMethod/InstanceComponents fields are protected and
+                # cannot be authored through Python property setters in UE 5.8.
+                data_sub = unreal.get_engine_subsystem(unreal.SubobjectDataSubsystem)
+                data_lib = unreal.SubobjectDataBlueprintFunctionLibrary
+                handles = data_sub.k2_gather_subobject_data_for_instance(actor)
+                actor_handle = next(h for h in handles
+                    if data_lib.get_associated_object(data_lib.get_data(h)) == actor)
+                cloth_name = cloth.get_name()
+                relative = cloth.get_relative_transform()
+                socket = cloth.get_attach_socket_name()
+                parent = cloth.get_attach_parent()
+                parent_name = parent.get_name() if parent and parent.get_owner() == actor else None
+                leader_name = leader.get_name() if leader and leader.get_owner() == actor else None
+                tick_option = cloth.get_editor_property("visibility_based_anim_tick_option")
+                forced_lod = cloth.get_editor_property("forced_lod_model")
+                overrides = list(cloth.get_editor_property("override_materials"))
+                handle, failure = data_sub.add_new_subobject(unreal.AddNewSubobjectParams(
+                    parent_handle=actor_handle, new_class=unreal.SkeletalMeshComponent,
+                    blueprint_context=None, skip_mark_blueprint_modified=True,
+                    conform_transform_to_parent=False))
+                if not data_lib.is_handle_valid(handle):
+                    raise RuntimeError("Could not create render-only hair instance: " + str(failure))
+                renderer = data_lib.get_associated_object(data_lib.get_data(handle))
+                # Instance authoring can rerun construction. Resolve the current
+                # components again before restoring the captured scene setup.
+                current_components = {c.get_name(): c for c in actor.get_components_by_class(unreal.ActorComponent)}
+                cloth = current_components[cloth_name]
+                parent = current_components[parent_name] if parent_name else parent
+                leader = current_components[leader_name] if leader_name else leader
+                renderer.set_editor_property("component_tags", [helper_tag])
+                if parent:
+                    renderer.attach_to_component(parent, socket, unreal.AttachmentRule.KEEP_RELATIVE,
+                        unreal.AttachmentRule.KEEP_RELATIVE, unreal.AttachmentRule.KEEP_RELATIVE, False)
+                renderer.set_relative_transform(relative, False, True)
+                renderer.set_leader_pose_component(leader)
+                renderer.set_editor_property("visibility_based_anim_tick_option", tick_option)
+                renderer.set_editor_property("forced_lod_model", forced_lod)
+                renderer.set_skeletal_mesh_asset(render)
+                # Assigning a different mesh clears material overrides.
+                renderer.set_editor_property("override_materials", overrides)
+            if helper_tag in tags(renderer):
+                renderer.set_skeletal_mesh_asset(render)
+            if "renderer" not in state:
+                state.update(renderer=renderer.get_name(), renderer_visibility=visibility(renderer))
+            # Write restoration data before modifying the user's component.
+            cloth.set_editor_property("component_tags", [t for t in original_tags
+                if not (t.startswith(_LIVE_STATE_TAG) and json.loads(t[len(_LIVE_STATE_TAG):]).get("owner") == expected)]
+                + [_LIVE_STATE_TAG + json.dumps(state, separators=(",", ":"))])
+            set_visibility(renderer, state)
+            cloth.set_enable_simulation(False)
+            cloth.call_method("SuspendSimulation", args=())
+            cloth.set_visibility(False, False)
+            cloth.set_hidden_in_game(True, False)
+            rows.append({"component": cloth.get_path_name(), "status": "render_only",
+                         "renderer": renderer.get_path_name(), "enabled": False})
+    return rows
+
+
 def _apply_hair_guide_cloth(record):
     """Ordinary Send2UE post-import entry. Require a completed verified receipt."""
     import unreal
@@ -457,7 +650,9 @@ def _apply_hair_guide_cloth(record):
             raise ValueError("Imported render mesh is missing: " + record["render_asset_path"])
         if not unreal.EditorAssetLibrary.save_loaded_asset(render):
             raise RuntimeError("Imported render-only hair mesh could not be saved")
-        return _render_only_receipt(record, packet)
+        receipt = _render_only_receipt(record, packet)
+        receipt["live_components"] = _refresh_live_components(record, render)
+        return receipt
     assets = []
     for key in ("sim_asset_path", "render_asset_path", "cloth_template_asset_path",
                 "body_mesh_asset_path", "physics_asset_path"):
@@ -515,6 +710,7 @@ def _apply_hair_guide_cloth(record):
     if (unreal.EditorAssetLibrary.get_metadata_tag(final, CONTENT) != receipt["manifest_sha256"] or
             unreal.EditorAssetLibrary.get_metadata_tag(final, "Send2UE.HairGuideCloth.BindingData") != receipt["binding_asset_path"]):
         raise RuntimeError("The editor still has an older cloth result loaded")
+    receipt["live_components"] = _refresh_live_components(record, final)
     return receipt
 
 

@@ -161,6 +161,7 @@ class NoGuideContractTests(unittest.TestCase):
             status='guide_weights_all_zero', guide='UnpaintedGuide', authored_weight_present=False)
         render = object()
         unreal = SimpleNamespace(load_asset=Mock(return_value=render),
+            EditorActorSubsystem=object, get_editor_subsystem=lambda cls: SimpleNamespace(get_all_level_actors=lambda: []),
             EditorAssetLibrary=SimpleNamespace(save_loaded_asset=Mock(return_value=True)))
         with tempfile.TemporaryDirectory() as directory, patch.dict('sys.modules', {'unreal': unreal}):
             result = M.apply_hair_guide_cloth(file_record(directory, packet))
@@ -239,7 +240,8 @@ class NoGuideContractTests(unittest.TestCase):
         _, packet = render_only_packet()
         render = object()
         library = SimpleNamespace(save_loaded_asset=Mock(return_value=True))
-        unreal = SimpleNamespace(EditorAssetLibrary=library, load_asset=Mock(return_value=render))
+        unreal = SimpleNamespace(EditorAssetLibrary=library, load_asset=Mock(return_value=render),
+            EditorActorSubsystem=object, get_editor_subsystem=lambda cls: SimpleNamespace(get_all_level_actors=lambda: []))
         with tempfile.TemporaryDirectory() as directory, patch.dict('sys.modules', {'unreal': unreal}):
             record = file_record(directory, packet, cloth_asset_path='/Game/Hair/OldFallback')
             result = M.apply_hair_guide_cloth(record)
@@ -316,6 +318,7 @@ class ApplyHarness:
         self.loading = SimpleNamespace(get_dirty_content_packages=Mock(return_value=[]),
                                        fully_load_assets=Mock(), reload_packages=Mock(return_value=True))
         self.unreal = SimpleNamespace(load_asset=lambda path: self.assets[path], EditorAssetLibrary=self.library,
+            EditorActorSubsystem=object, get_editor_subsystem=lambda cls: SimpleNamespace(get_all_level_actors=lambda: []),
             EditorLoadingAndSavingUtils=self.loading,
             Paths=SimpleNamespace(convert_relative_path_to_full=lambda value: value,
                 get_project_file_path=lambda: str(self.root/'Project.uproject'),
@@ -374,7 +377,7 @@ class EditorHandoffTests(unittest.TestCase):
                 return True
             h.loading.reload_packages.side_effect = reload
             result = h.apply()
-            self.assertEqual(result, h.receipt)
+            self.assertEqual(result, dict(h.receipt, live_components=[]))
             saved = [call.args[0] for call in h.library.save_loaded_asset.call_args_list]
             self.assertEqual(saved, [h.assets[h.record['sim_asset_path']], h.assets[h.record['render_asset_path']]])
 
@@ -401,6 +404,7 @@ class PublishHarness:
         self.bad_stage = False
         self.stage_save_fails = False
         self.fail_next_target_save = False
+        self.bad_target_config = False
         self.source = self.asset(self.source_path, self.new_binding, source=True)
         if existing:
             final = self.asset(self.target, self.old_binding)
@@ -421,14 +425,18 @@ class PublishHarness:
         node_types = {'ClothAssetTerminal': 'FChaosClothAssetTerminalNode',
                       ('SourceInput' if source else 'GeneratorBindings'):
                       ('FChaosClothAssetSkeletalMeshImportNode_v2' if source else 'FChaosClothAssetImportNode')}
-        asset = SimpleNamespace(path=path, binding=binding, metadata={}, node_types=node_types, import_lod=0)
+        asset = SimpleNamespace(path=path, binding=binding, metadata={}, node_types=node_types, import_lod=0,
+            config_properties={}, connections=[dict(fromNode='SourceInput' if source else 'GeneratorBindings',
+                fromPin='Collection',toNode='ClothAssetTerminal',toPin='CollectionLods[0]')])
         asset.get_path_name = lambda: path + '.' + path.rsplit('/', 1)[-1]
         self.assets[path] = asset
         return asset
 
     def snapshot(self, asset):
         return {'binding': asset.binding, 'metadata': copy.deepcopy(asset.metadata),
-                'nodes': dict(asset.node_types), 'import_lod': asset.import_lod}
+                'nodes': dict(asset.node_types), 'import_lod': asset.import_lod,
+                'config_properties': copy.deepcopy(asset.config_properties),
+                'connections': copy.deepcopy(asset.connections)}
 
     def duplicate(self, source, destination):
         original = self.assets[source.split('.', 1)[0]]
@@ -437,6 +445,8 @@ class PublishHarness:
         # First-publication metadata therefore needs explicit writes on final.
         asset.node_types = dict(original.node_types)
         asset.import_lod = original.import_lod
+        asset.config_properties = copy.deepcopy(original.config_properties)
+        asset.connections = copy.deepcopy(original.connections)
         return asset
 
     def save(self, asset):
@@ -453,6 +463,8 @@ class PublishHarness:
         binding = path if path in (self.old_binding, self.new_binding) else self.assets[path].binding
         if self.bad_stage and path.endswith('_FinalStage'):
             binding = 'invalid-stage-collection'
+        if self.bad_target_config and path == self.target and binding == self.new_binding:
+            binding = 'config-changed-geometry-or-weights'
         return json.dumps({'collections': [{'binding_revision': binding}]})
 
     def graph(self, unreal, asset):
@@ -469,6 +481,8 @@ class PublishHarness:
         def call(operation, *args):
             if operation == 'RemoveNode':
                 del asset.node_types[args[1].name]
+                asset.connections = [e for e in asset.connections
+                    if args[1].name not in (e['fromNode'], e['toNode'])]
             elif operation == 'AddNode':
                 _, typ, name, props, _, _ = args
                 asset.node_types[name] = typ
@@ -479,20 +493,103 @@ class PublishHarness:
                 asset.import_lod = props['ImportLod']
                 self.updates.append((asset.path, asset.binding))
             elif operation == 'ConnectNodePins':
+                asset.connections.append(dict(fromNode=args[0].name,fromPin=args[1],
+                    toNode=args[2].name,toPin=args[3]))
                 return True
             else:
                 raise AssertionError('Unexpected graph operation: ' + operation)
             return True
 
-        return asset, call, {}, nodes, infos
+        return asset, call, {'connections': asset.connections}, nodes, infos
+
+    def add_solver(self):
+        final = self.assets[self.target]
+        final.node_types['ExtraSolverStability'] = 'FChaosClothAssetSimulationSolverConfigNode'
+        final.config_properties['ExtraSolverStability'] = {'NumIterations': 8, 'MaxNumIterations': 12, 'NumSubsteps': 8}
+        final.connections = [
+            dict(fromNode='GeneratorBindings',fromPin='Collection',toNode='ExtraSolverStability',toPin='Collection'),
+            dict(fromNode='ExtraSolverStability',fromPin='Collection',toNode='ClothAssetTerminal',toPin='CollectionLods[0]')]
+        self.saved[self.target] = self.snapshot(final)
 
     def publish(self):
         with patch.object(M, '_graph', side_effect=self.graph):
             return M._publish(self.unreal, self.source, self.new_binding,
                               self.target, self.owner, 'new-content')
 
+    def add_capsule_collision(self):
+        final = self.assets[self.target]
+        final.node_types['HairBodyCapsules'] = 'FChaosClothAssetSetPhysicsAssetNode'
+        final.node_types['HairCapsuleCollision'] = 'FChaosClothAssetSimulationCollisionConfigNode'
+        final.config_properties['HairBodyCapsules'] = {'PhysicsAsset': '/Game/Body/PA_Capsules'}
+        final.config_properties['HairCapsuleCollision'] = {
+            'bEnableSkinnedTriangleMeshCollisions': False, 'bEnableSimpleColliders': True,
+            'bUseCCD': False, 'FrictionCoefficientWeighted': {'Low': .65, 'High': .8}}
+        for edge in final.connections:
+            if edge['fromNode'] == 'GeneratorBindings':
+                edge['fromNode'] = 'HairCapsuleCollision'
+        final.connections += [
+            dict(fromNode='GeneratorBindings', fromPin='Collection',
+                 toNode='HairBodyCapsules', toPin='Collection'),
+            dict(fromNode='HairBodyCapsules', fromPin='Collection',
+                 toNode='HairCapsuleCollision', toPin='Collection')]
+        self.saved[self.target] = self.snapshot(final)
+
 
 class PublicationTests(unittest.TestCase):
+    def test_reexport_saves_capsule_collision_and_artist_solver_across_revisions(self):
+        h = PublishHarness(); h.add_solver(); h.add_capsule_collision()
+        before = h.snapshot(h.assets[h.target])
+        for next_binding in ('/Game/Hair/BindingsNew', '/Game/Hair/BindingsNext'):
+            h.new_binding = next_binding
+            h.publish()
+            saved = h.saved[h.target]
+            self.assertEqual(saved['binding'], next_binding)
+            self.assertEqual(saved['config_properties'], before['config_properties'])
+            self.assertEqual(saved['nodes'], before['nodes'])
+            self.assertEqual(saved['connections'], before['connections'])
+            h.old_binding = next_binding
+
+    def test_disconnected_body_override_is_not_a_valid_published_graph(self):
+        h = PublishHarness(); h.add_capsule_collision()
+        final = h.assets[h.target]
+        final.connections = [edge for edge in final.connections
+                             if edge['toNode'] != 'HairBodyCapsules']
+        before = h.snapshot(final)
+        with self.assertRaisesRegex(ValueError, 'user changes'):
+            h.publish()
+        self.assertEqual(h.snapshot(final), before)
+        self.assertEqual(h.updates, [])
+
+    def test_reexports_preserve_downstream_solver_configuration_and_connections(self):
+        h = PublishHarness(); h.add_solver()
+        final = h.assets[h.target]
+        original = h.snapshot(final)
+        for revision in ('new-content', 'next-content'):
+            h.publish()
+            self.assertEqual(final.binding, h.new_binding)
+            self.assertEqual(final.config_properties, original['config_properties'])
+            self.assertEqual(final.node_types, original['nodes'])
+            self.assertEqual(final.connections, original['connections'])
+            h.old_binding = h.new_binding
+            h.new_binding = '/Game/Hair/BindingsNext'
+
+    def test_configuration_that_changes_verified_geometry_or_weights_rolls_back(self):
+        h = PublishHarness(); h.add_solver(); h.bad_target_config = True
+        before = h.snapshot(h.assets[h.target])
+        with self.assertRaisesRegex(RuntimeError, 'differs from its verified collection'):
+            h.publish()
+        self.assertEqual(h.snapshot(h.assets[h.target]), before)
+        self.assertEqual(h.saved[h.target], before)
+
+    def test_config_not_downstream_of_owned_import_is_not_accepted(self):
+        h = PublishHarness(); h.add_solver()
+        h.assets[h.target].connections[0]['fromNode'] = 'ExtraSolverStability'
+        before = h.snapshot(h.assets[h.target])
+        with self.assertRaisesRegex(ValueError, 'user changes'):
+            h.publish()
+        self.assertEqual(h.snapshot(h.assets[h.target]), before)
+        self.assertEqual(h.updates, [])
+
     def test_first_publication_is_explicitly_saved_without_source_control(self):
         h = PublishHarness(existing=False)
         h.publish()
