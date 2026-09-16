@@ -147,3 +147,26 @@ does not claim final motion quality. The next refinement should introduce only
 small differences in guide response while keeping the common wind flow. It must
 retain each child's generating parent and must not animate simulation vertices
 directly or assign large unrelated phase offsets to individual clumps.
+
+## Reimporting configured cloth and explicitly skinned cards
+
+Reimport preserves the existing downstream solver and collider graph. Simulation
+WeightMap nodes are also supported when their data can be carried forward without
+guessing: unchanged topology keeps authored values, a verified binary kinematic
+mask follows the rebuilt kinematic selection, and `CodexParentForceKey` is rebuilt
+from stable source-guide/spline identities. Arbitrary paint on changed topology,
+active paint snapshots, and invalid provenance still stop publication. Failed
+publication restores the previous import, map values and metadata.
+
+For Hair Tool cards with **Transfer Weights** enabled, the configured Transfer
+Source is evaluated through the installed Vertex Data Tools operator before the
+FBX export mesh is bound. It must supply valid deform weights and its expected
+Armature modifier. Such assets do not require a head bone. Ordinary hair keeps
+the existing rigid head-binding behavior. This supports tail rigs through normal
+Send to Unreal without a separate exporter.
+
+After changing an installed add-on junction, reload extensions in every running
+Blender that will export. A previously loaded extension can retain its former
+absolute pipeline path even when the junction and Git checkout have changed.
+Preserve scene settings across Reload Extensions and verify the live material
+and cloth pipeline paths before sending.

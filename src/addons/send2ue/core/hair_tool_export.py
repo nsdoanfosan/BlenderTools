@@ -191,6 +191,45 @@ def _get_armature(scene_object):
     )
 
 
+def _bind_export_skin(export_object, armature_object):
+    """Explicit Transfer Weights takes precedence over the rigid hair binding."""
+    import math
+    if getattr(export_object, 'ue_unique_transfer_weights', False):
+        settings = getattr(export_object, 'vdt_object_props', None)
+        if not settings or not settings.transfer_source:
+            raise RuntimeError('Hair Tool weight transfer source is missing')
+        active = bpy.context.view_layer.objects.active
+        selected = list(bpy.context.selected_objects)
+        try:
+            bpy.ops.object.select_all(action='DESELECT')
+            export_object.select_set(True)
+            bpy.context.view_layer.objects.active = export_object
+            outcome = bpy.ops.object.vdt_pointer_transfer_weights()
+            if 'FINISHED' not in outcome:
+                raise RuntimeError('Hair Tool source weight transfer did not finish')
+        finally:
+            bpy.ops.object.select_all(action='DESELECT')
+            for obj in selected:
+                obj.select_set(True)
+            bpy.context.view_layer.objects.active = active
+        deform = {bone.name for bone in armature_object.data.bones if bone.use_deform}
+        indices = {group.index for group in export_object.vertex_groups if group.name in deform}
+        for vertex in export_object.data.vertices:
+            weights = [item.weight for item in vertex.groups if item.group in indices]
+            if (not weights or any(not math.isfinite(w) or w < 0 for w in weights)
+                    or sum(weights) <= 1e-8):
+                raise RuntimeError('Hair Tool transferred skin has unweighted or invalid vertices')
+    else:
+        # Keep the existing head-only contract for ordinary card/guide hair.
+        group = export_object.vertex_groups.new(name=_get_head_bone_name(armature_object))
+        group.add(range(len(export_object.data.vertices)), 1.0, 'REPLACE')
+    modifier = next((m for m in export_object.modifiers
+                     if m.type == 'ARMATURE' and m.object == armature_object), None)
+    if modifier is None:
+        modifier = export_object.modifiers.new(name='Armature', type='ARMATURE')
+    modifier.object = armature_object
+
+
 def _get_head_bone_name(armature_object):
     deform_bones = [bone for bone in armature_object.data.bones if bone.use_deform]
 
@@ -1351,18 +1390,7 @@ def prepare():
                 )
             armature_object = next(iter(armatures), None)
             if armature_object:
-                head_bone_name = _get_head_bone_name(armature_object)
-                vertex_group = temporary_object.vertex_groups.new(name=head_bone_name)
-                vertex_group.add(
-                    range(len(temporary_object.data.vertices)),
-                    1.0,
-                    'REPLACE',
-                )
-                armature_modifier = temporary_object.modifiers.new(
-                    name='Armature',
-                    type='ARMATURE',
-                )
-                armature_modifier.object = armature_object
+                _bind_export_skin(temporary_object, armature_object)
 
             if guide_capture_complete:
                 try:
