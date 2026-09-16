@@ -1794,6 +1794,17 @@ class TestUeMaterialTextureImport(unittest.TestCase):
         self.assertEqual(remap["Opacity Map"], "Opacity Map")
         self.assertNotIn("Transmission", remap)
 
+    def test_stem_layer_excludes_unsupported_opacity_and_keeps_subsurface(self):
+        preset = {"key": "tree", "tree_shading": "stem"}
+        entry = {"material_layer": {"texture_remap": {
+            "Albedo": "Albedo", "Opacity Map": "Opacity Map",
+            "Alpha": "Opacity Map", "Subsurface": "Subsurface",
+        }}}
+        remap = self.module._layer_texture_remap(preset, entry)
+        self.assertNotIn("Opacity Map", remap.values())
+        self.assertEqual(remap["Albedo"], "Albedo")
+        self.assertEqual(remap["Subsurface"], "Subsurface")
+
     def _contract_export_path(self, mesh_name="SK_CommonGrass"):
         path = Path(self.temp_dir.name) / f"{mesh_name}.fbx"
         if not path.exists():

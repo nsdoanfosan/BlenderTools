@@ -546,6 +546,14 @@ def export(**keywords):
     export_fbx_bin.fbx_data_object_elements = fbx_data_object_elements
     export_fbx_bin.fbx_data_bindpose_element = fbx_data_bindpose_element
 
+    # Skeletal FBX uses Blender's native unit conversion and bind matrices.
+    # Do not apply the legacy additional 100x armature/animation compensation.
+    if any(obj.type == 'ARMATURE' for obj in bpy.context.selected_objects):
+        export_fbx_bin.fbx_animations_do = original_fbx_animations_do
+        export_fbx_bin.fbx_data_armature_elements = original_fbx_data_armature_elements
+        export_fbx_bin.fbx_data_object_elements = original_fbx_data_object_elements
+        export_fbx_bin.fbx_data_bindpose_element = original_fbx_data_bindpose_element
+
     # patch in a report method on self to fake the fbx export operator class
     try:
         self = type(

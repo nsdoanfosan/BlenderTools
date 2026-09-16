@@ -64,6 +64,17 @@ def export(**keywords):
 
     convert_rad_to_deg_iter = units_convertor_iter("radian", "degree")
 
+    conversion_factor = SCALE_FACTOR
+    if any(obj.type == 'ARMATURE' for obj in bpy.context.selected_objects):
+        from io_scene_fbx.fbx_utils import units_blender_to_fbx_factor
+        # Keep the skin bind matrices and skeleton in the same FBX centimetre
+        # basis. Native object-level unit scaling leaves scale on the root bone
+        # after Unreal removes the Armature node; a Leader Pose then replaces it.
+        # Derive the conversion from the document, not a character-size override.
+        keywords['apply_scale_options'] = 'FBX_SCALE_NONE'
+        unit_factor = units_blender_to_fbx_factor(bpy.context.scene) if keywords.get('apply_unit_scale', True) else 100.0
+        conversion_factor = unit_factor * keywords.get('global_scale', 1.0)
+
     from io_scene_fbx.export_fbx_bin import fbx_data_element_custom_properties
 
     def fbx_data_from_scene_without_textures(scene, depsgraph, settings):
@@ -212,13 +223,13 @@ def export(**keywords):
                     #
                     # send2ue: Scale shennanigans
                     #
-                    location_multiple = 100
+                    location_multiple = conversion_factor
                     scale_factor = 1
                     # if this curve is the object root then keep its scale at 1
                     if len(str(ob_obj).split('|')) == 1:
                         location_multiple = 1
                         # Todo add to FBX addon
-                        scale_factor = SCALE_FACTOR
+                        scale_factor = conversion_factor
 
 
 
@@ -357,7 +368,7 @@ def export(**keywords):
 
             tmpl = elem_props_template_init(scene_data.templates, b"Bone")
             props = elem_properties(fbx_bo)
-            elem_props_template_set(tmpl, props, "p_double", b"Size", bo.head_radius * bone_radius_scale * SCALE_FACTOR)
+            elem_props_template_set(tmpl, props, "p_double", b"Size", bo.head_radius * bone_radius_scale * conversion_factor)
             elem_props_template_finalize(tmpl, props)
 
             # Custom properties.
@@ -432,12 +443,10 @@ def export(**keywords):
                     # Todo add to FBX addon
                     transform_matrix = mat_world_bones[bo_obj].inverted_safe() @ mat_world_obj
                     transform_link_matrix = mat_world_bones[bo_obj]
-                    transform_associate_model_matrix = mat_world_arm
-
-                    transform_matrix = transform_matrix.LocRotScale(
-                        [i * SCALE_FACTOR for i in transform_matrix.to_translation()],
-                        transform_matrix.to_quaternion(),
-                        [i * SCALE_FACTOR for i in transform_matrix.to_scale()],
+                    transform_associate_model_matrix = mat_world_arm.LocRotScale(
+                        mat_world_arm.to_translation(),
+                        mat_world_arm.to_quaternion(),
+                        mat_world_arm.to_scale() / conversion_factor,
                     )
 
                     elem_data_single_float64_array(fbx_clstr, b"Transform", matrix4_to_array(transform_matrix))
@@ -496,9 +505,15 @@ def export(**keywords):
 
         # Todo add to FBX addon
         if ob_obj.type == 'ARMATURE':
-            scale = Vector((scale[0] / SCALE_FACTOR, scale[1] / SCALE_FACTOR, scale[2] / SCALE_FACTOR))
+            scale = scale / conversion_factor
             if bpy.context.scene.send2ue.use_object_origin:
                 loc = Vector((0, 0, 0))
+
+        elif ob_obj.is_bone:
+            # Bind poses below already use centimetre translations. The node
+            # hierarchy must agree, including when Unreal falls back to it for
+            # combined meshes with several skin/bind-pose records.
+            loc = loc * conversion_factor
 
         elif ob_obj.type == 'EMPTY':
             if bpy.context.scene.send2ue.use_object_origin:
@@ -598,7 +613,7 @@ def export(**keywords):
                             # https://github.com/EpicGamesExt/BlenderTools/issues/610
                             if bpy.context.scene.send2ue.extensions.instance_assets.place_in_active_level:
                                 rot = (0, 0, 0)
-                                scale = (1.0 * SCALE_FACTOR, 1.0 * SCALE_FACTOR, 1.0 * SCALE_FACTOR)
+                                scale = (conversion_factor, conversion_factor, conversion_factor)
                 else:
                     loc = Vector((0, 0, 0))
 
@@ -680,7 +695,7 @@ def export(**keywords):
             mat_world_arm = mat_world_arm.LocRotScale(
                 mat_world_arm.to_translation(),
                 mat_world_arm.to_quaternion(),
-                [i / SCALE_FACTOR for i in mat_world_arm.to_scale()],
+                [i / conversion_factor for i in mat_world_arm.to_scale()],
             )
 
             elem_data_single_float64_array(fbx_posenode, b"Matrix", matrix4_to_array(mat_world_arm))
@@ -689,7 +704,6 @@ def export(**keywords):
         mat_world_bones = {}
         for bo_obj in bones:
             bomat = bo_obj.fbx_object_matrix(scene_data, rest=True, global_space=True)
-            mat_world_bones[bo_obj] = bomat
             fbx_posenode = elem_empty(fbx_pose, b"PoseNode")
             elem_data_single_int64(fbx_posenode, b"Node", bo_obj.fbx_uuid)
 
@@ -697,8 +711,13 @@ def export(**keywords):
             bomat = bomat.LocRotScale(
                 bomat.to_translation(),
                 bomat.to_quaternion(),
-                [i / SCALE_FACTOR for i in bomat.to_scale()]
+                [i / conversion_factor for i in bomat.to_scale()]
             )
+
+            # Cluster TransformLink and PoseNode must contain the same matrix.
+            # Keeping the pre-conversion matrix here made combined skin bind
+            # poses invalid and let Unreal reconstruct a differently sized rig.
+            mat_world_bones[bo_obj] = bomat
 
             elem_data_single_float64_array(fbx_posenode, b"Matrix", matrix4_to_array(bomat))
 

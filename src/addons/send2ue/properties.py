@@ -217,6 +217,11 @@ def get_scene_property_class():
             default=PathModes.SEND_TO_PROJECT.value,
             description="Select which type of paths you want to export to"
         ) # type: ignore
+        auto_sync_unreal_mesh_folder: bpy.props.BoolProperty(
+            name="Sync Mesh Folder with Blend Location",
+            default=True,
+            description="Update the Unreal mesh folder on load and save; disable to keep an explicit import folder"
+        ) # type: ignore
         unreal_mesh_folder_path: bpy.props.StringProperty(
             name="Mesh Folder (Unreal)",
             default=r"/Game/untitled_category/untitled_asset/",
