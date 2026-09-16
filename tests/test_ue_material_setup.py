@@ -2459,6 +2459,149 @@ class TestRuntimeTolerantMaterialProcess(unittest.TestCase):
 
         self.module._assign_slot = assign_slot
 
+    def test_managed_existing_hair_preserves_master_and_unsynchronized_overrides(self):
+        preset = dict(self.module.MASTER_PRESETS["hair"], key="hair")
+        target_path = preset["mi_folder"] + "/MI_HT_Example"
+        for parent_path in (
+            "/Game/Material/HairTool/Master/M_HT_SoftFuzz",
+            "/Game/Artist/Materials/M_CustomHair",
+        ):
+            with self.subTest(parent=parent_path):
+                parent = FakeMaterialInstanceConstant(parent_path)
+                retained_texture = FakeTextureParameterValue("Opacity Map")
+                existing = FakeMaterialInstanceConstant(
+                    target_path, parent=parent,
+                    texture_parameter_values=[retained_texture],
+                )
+                existing.scalar_values_by_name["Hair Distance Coverage Gain"] = 4.0
+                existing.vector_values_by_name["Artist Tint"] = (0.2, 0.3, 0.4, 1.0)
+                self.runtime.assets[target_path] = existing
+                self.runtime.assets[preset["master"]] = FakeMaterialInstanceConstant(
+                    preset["master"]
+                )
+                entry = {
+                    "name": "M_HT_Example", "slot_index": 0,
+                    "material_instance_path": target_path,
+                    "create_if_missing": False,
+                    "manage_existing_material_instance": True,
+                    "material_instance_ownership": "pipeline",
+                    "textures": [], "layers": [],
+                    "hair_tool": {
+                        "sync_parameters": ["HT Base Color"],
+                        "scalar_parameters": {"Hair Distance Coverage Gain": 1.0},
+                        "vector_parameters": {
+                            "HT Base Color": [0.6, 0.5, 0.4, 1.0],
+                            "Artist Tint": [1.0, 1.0, 1.0, 1.0],
+                        },
+                    },
+                }
+                self.configure_process({"materials": [entry]}, preset)
+
+                self.assertTrue(self.module.process_mesh(self.mesh_path))
+
+                self.assertIs(self.assignments[-1][1], existing)
+                self.assertIs(existing.parent, parent)
+                self.assertEqual(existing.texture_parameter_values, [retained_texture])
+                self.assertEqual(existing.scalar_values_by_name["Hair Distance Coverage Gain"], 4.0)
+                self.assertEqual(existing.vector_values_by_name["Artist Tint"], (0.2, 0.3, 0.4, 1.0))
+                self.assertEqual(existing.vector_values_by_name["HT Base Color"], (0.6, 0.5, 0.4, 1.0))
+                self.assertEqual(self.runtime.parent_changes, [])
+                self.assertEqual(self.runtime.texture_parameter_sets, [])
+                self.assertEqual(self.runtime.created_assets, [])
+
+
+    def test_hair_missing_assignment_only_target_does_not_create_or_import(self):
+        preset = dict(self.module.MASTER_PRESETS["hair"], key="hair")
+        entry = {
+            "name": "M_HT_Missing", "slot_index": 0,
+            "create_if_missing": False,
+            "manage_existing_material_instance": True,
+            "material_instance_ownership": "pipeline",
+        }
+        self.configure_process({"materials": [entry]}, preset)
+
+        self.assertFalse(self.module.process_mesh(self.mesh_path))
+
+        self.assertEqual(self.assignments, [])
+        self.assertEqual(self.runtime.created_assets, [])
+        self.assertEqual(self.runtime.import_tasks, [])
+
+
+    def test_hair_parent_change_requires_explicit_intent_and_is_saved(self):
+        preset = dict(self.module.MASTER_PRESETS["hair"], key="hair")
+        target_path = preset["mi_folder"] + "/MI_HT_Example"
+        existing = FakeMaterialInstanceConstant(
+            target_path, parent=FakeMaterialInstanceConstant("/Game/Artist/M_Fur")
+        )
+        master = FakeMaterialInstanceConstant(preset["master"])
+        self.runtime.assets.update({target_path: existing, preset["master"]: master})
+        entry = {
+            "name": "M_HT_Example", "slot_index": 0,
+            "create_if_missing": False,
+            "manage_existing_material_instance": True,
+            "reparent_existing_material_instance": True,
+        }
+        self.configure_process({"materials": [entry]}, preset)
+
+        self.assertTrue(self.module.process_mesh(self.mesh_path))
+
+        self.assertIs(existing.parent, master)
+        self.assertIn(target_path, self.runtime.save_calls)
+        self.assertEqual(self.runtime.parent_changes, [(target_path, preset["master"])])
+
+
+    def test_existing_hair_checkout_scope_uses_resolved_base_master(self):
+        preset = dict(self.module.MASTER_PRESETS["hair"], key="hair")
+        target_path = preset["mi_folder"] + "/MI_HT_Example"
+        parent = FakeMaterialInstanceConstant("/Game/Artist/M_Fur")
+        existing = FakeMaterialInstanceConstant(target_path, parent=parent)
+        existing.get_base_material = lambda: parent
+        self.runtime.assets[target_path] = existing
+        entry = {
+            "name": "M_HT_Example", "master_preset": "hair",
+            "create_if_missing": False,
+            "manage_existing_material_instance": True,
+        }
+
+        paths = self.module._material_pipeline_mutation_paths(
+            self.mesh_path, {"materials": [entry]}
+        )
+
+        self.assertEqual(paths, [self.mesh_path, parent.get_path_name(), target_path])
+
+
+    def test_new_hair_initializes_preset_master_and_legacy_controls(self):
+        preset = dict(self.module.MASTER_PRESETS["hair"], key="hair")
+        master = FakeMaterialInstanceConstant(preset["master"])
+        self.runtime.assets[preset["master"]] = master
+        entry = {
+            "name": "M_HT_NewExample", "slot_index": 0,
+            "create_if_missing": True,
+            "hair_tool": {"scalar_parameters": {"Roughness Minimum": 0.35}},
+        }
+        self.configure_process({"materials": [entry]}, preset)
+
+        self.assertTrue(self.module.process_mesh(self.mesh_path))
+
+        created = self.assignments[0][1]
+        self.assertIs(created.parent, master)
+        self.assertEqual(created.scalar_values_by_name["Roughness Minimum"], 0.35)
+        self.assertEqual(self.runtime.created_assets, [preset["mi_folder"] + "/MI_HT_NewExample"])
+
+
+    def test_hair_explicit_reparent_opt_in_is_not_truthiness_of_false_string(self):
+        for value in (False, None, "false", "0", "off", "unexpected"):
+            with self.subTest(value=value):
+                self.assertFalse(self.module._entry_reparents_existing_hair_material(
+                    {"reparent_existing_material_instance": value}
+                ))
+        for value in (True, "true", "1", "on"):
+            with self.subTest(value=value):
+                self.assertTrue(self.module._entry_reparents_existing_hair_material(
+                    {"reparent_existing_material_instance": value}
+                ))
+
+
     def test_non_tree_layer_skips_tree_function_normalization(self):
         calls = []
         self.module._normalize_material_layer_asset = (
@@ -3402,6 +3545,7 @@ class TestHairToolBridgeParameterSync(unittest.TestCase):
                 "sync_parameters": [
                     "System Color 01",
                     "System Color Influence",
+                    "Root Blend Mode",
                 ],
                 "vector_parameters": {
                     "System Color 01": [0.1, 0.2, 0.3, 1.0],
