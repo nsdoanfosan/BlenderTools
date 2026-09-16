@@ -2411,6 +2411,29 @@ class TestVerifiedHairNaniteSettings(unittest.TestCase):
 
 
 class TestRuntimeTolerantMaterialProcess(unittest.TestCase):
+    def test_external_base_material_and_fuzz_instance_keep_all_slots_and_parent(self):
+        class BaseMaterial:
+            def __init__(self,path): self.path=path
+            def get_path_name(self): return self.path
+        self.runtime.unreal_module.MaterialInterface=(BaseMaterial,FakeMaterialInstanceConstant)
+        parent=FakeMaterialInstanceConstant('/Game/Hair/M_SoftFuzz')
+        materials=[BaseMaterial('/Game/Tail/Ornament'),BaseMaterial('/Game/Tail/Base'),
+                   FakeMaterialInstanceConstant('/Game/Hair/MI_Fuzz',parent=parent)]
+        entries=[]
+        for i,material in enumerate(materials):
+            path=material.get_path_name()
+            self.runtime.assets[path]=material
+            entries.append(dict(name='Slot'+str(i),slot_index=i,material_instance_path=path,
+                material_instance_ownership='external',manage_existing_material_instance=False,
+                create_if_missing=False,textures=[],layers=[]))
+        self.configure_process({'materials':entries},dict(self.module.MASTER_PRESETS['prop'],key='prop'))
+        self.module._slot_index_for_entry=lambda mesh,entry,name:entry['slot_index']
+        self.assertTrue(self.module.process_mesh(self.mesh_path))
+        self.assertEqual([row[1] for row in self.assignments],materials)
+        self.assertIs(materials[2].parent,parent)
+        self.assertEqual(self.runtime.parent_changes,[])
+        self.assertEqual(self.runtime.created_assets,[])
+
     def setUp(self):
         self.runtime = FakeRuntime()
         self.runtime.unreal_module.StaticMesh = FakeStaticMesh
