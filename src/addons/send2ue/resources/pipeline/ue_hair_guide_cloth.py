@@ -307,7 +307,136 @@ def _build_source(unreal, record, path):
     return asset, audit
 
 
-def _publish(unreal, source_asset, binding_path, target, owner, content):
+def _guide_identity_rows(packet, owner):
+    sim = packet['meshes']['sim']
+    parts = packet['parts']
+    by_source = defaultdict(list)
+    vertex_owner = {}
+    for part in parts:
+        gid, source = int(part['gid']), part['source_guide']
+        indices, local = part['sim_vertex_indices'], part['source_vertex_indices']
+        if not indices or len(indices) != len(local) or len(set(local)) != len(local):
+            raise ValueError('Missing or ambiguous source vertex identity')
+        for index, local_index in zip(indices, local):
+            if index in vertex_owner or sim['guide_ids'][index] != gid:
+                raise ValueError('Duplicate or inconsistent packet guide ownership')
+            vertex_owner[index] = (gid, source, local_index)
+        by_source[source].append(part)
+    if set(vertex_owner) != set(range(len(sim['vertices']))):
+        raise ValueError('Every packet simulation vertex needs one source guide')
+
+    # Reconstruct native source islands from topology, not the transient exported gid order.
+    adjacency = {source: {v: set() for p in ps for v in p['source_vertex_indices']}
+                 for source, ps in by_source.items()}
+    for triangle in sim['triangles']:
+        owners = [vertex_owner[i] for i in triangle]
+        if len({v[0] for v in owners}) != 1:
+            raise ValueError('Packet triangle crosses parent guides')
+        source = owners[0][1]
+        local = [v[2] for v in owners]
+        if len(set(local)) != 3:
+            raise ValueError('Degenerate triangle identity')
+        for a, b in ((0, 1), (1, 2), (2, 0)):
+            adjacency[source][local[a]].add(local[b])
+            adjacency[source][local[b]].add(local[a])
+
+    rows = {}
+    for source, source_parts in by_source.items():
+        graph = adjacency[source]
+        remaining = set(graph)
+        islands = []
+        while remaining:
+            stack = [min(remaining)]
+            component = set()
+            while stack:
+                vertex = stack.pop()
+                if vertex not in remaining:
+                    continue
+                remaining.remove(vertex)
+                component.add(vertex)
+                stack.extend(graph[vertex] & remaining)
+            islands.append(component)
+        mapping = source_parts[0]['simulation_mesh']['native_island_to_spline']
+        if set(map(int, mapping)) != set(range(len(islands))) or len(islands) != len(source_parts):
+            raise ValueError('Source island-to-spline identity cannot be reconciled')
+        source_sets = {frozenset(p['source_vertex_indices']): p for p in source_parts}
+        if len(source_sets) != len(source_parts):
+            raise ValueError('Duplicate source island')
+        for local_island, vertices in enumerate(islands):
+            part = source_sets.get(frozenset(vertices))
+            if part is None or part['simulation_mesh']['native_island_to_spline'] != mapping:
+                raise ValueError('Each part must match one complete native island')
+            gid, spline = int(part['gid']), int(mapping[str(local_island)])
+            if gid in rows:
+                raise ValueError('Duplicate exported gid')
+            key = json.dumps([source, int(spline)], ensure_ascii=False, separators=(",", ":"))
+            weight = (1 + int.from_bytes(hashlib.sha256(b"codex-parent-force-v1\0" + key.encode()).digest()[:8], "big") % (16777216 - 1)) / 16777216
+            rows[gid] = {'source': source, 'spline': spline, 'key': key,
+                         'native_island': local_island, 'weight': weight}
+    if len({r['key'] for r in rows.values()}) != len(rows):
+        raise ValueError('Multiple guide islands share one parent-spline identity')
+
+    gids = owner['sim_guide_ids']
+    if len(gids) != len(owner['sim_source_indices']) or not all(owner['sim_source_identity_unique']):
+        raise ValueError('Native source correspondence is ambiguous')
+    if set(gids) != set(rows):
+        raise ValueError('Native and packet guide sets differ')
+    for gid, source_index in zip(gids, owner['sim_source_indices']):
+        if vertex_owner[source_index][0] != gid:
+            raise ValueError('Native-to-packet correspondence crosses parent guides')
+    weights = [rows[gid]['weight'] for gid in gids]
+    return weights, rows
+
+
+
+def _weight_map_updates(full_graph, old, new, packet, ownership):
+    """Rebuild known generated maps; reject unexplained authored paint changes."""
+    updates = {}
+    old_native, new_native = old['built_mapping'], new['built_mapping']
+    old_count = len(old_native['sim_positions'])
+    new_count = len(new_native['sim_positions'])
+    for node in full_graph['nodes']:
+        if node['type'] != 'FChaosClothAssetWeightMapNode':
+            continue
+        props = node['props']
+        if (props.get('MeshTarget') != 'Simulation' or props.get('MapOverrideType') != 'ReplaceAll'
+                or props.get('Snapshots') != '(ActiveSnapshot=-1)' or props.get('bIsFrozen') != 'False'):
+            raise ValueError('Unsupported authored WeightMap state: ' + node['name'])
+        values = [float(v) for v in props['VertexWeights'].strip('()').split(',') if v]
+        if len(values) != old_count or any(not math.isfinite(v) for v in values):
+            raise ValueError('Incomplete authored WeightMap: ' + node['name'])
+        output = re.fullmatch(r'\(StringValue="([^"\n]+)"\)', props['OutputName'])
+        if not output:
+            raise ValueError('WeightMap output name is not explicit')
+        name = output.group(1)
+        if name == 'CodexParentForceKey':
+            if not packet or not ownership:
+                raise ValueError('Parent force keys require generator provenance')
+            if any(not 0 < value < 1 for value in values):
+                raise ValueError('Parent force key contract is invalid')
+            for tri in old_native['sim_triangles']:
+                if len({values[i] for i in tri}) != 1:
+                    raise ValueError('Parent force keys vary within a guide')
+            weights, rows = _guide_identity_rows(packet, ownership)
+            if len({row['weight'] for row in rows.values()}) != len(rows):
+                raise ValueError('Parent force key hash collision')
+        elif (old_native['sim_positions'] == new_native['sim_positions'] and
+              old_native['sim_triangles'] == new_native['sim_triangles']):
+            weights = values
+        else:
+            old_kin = set(old_native['kinematic_sim_indices'])
+            if not old_kin or len(old_kin) == old_count or not all(
+                    value == (0.0 if i in old_kin else 1.0) for i, value in enumerate(values)):
+                raise ValueError('WeightMap needs explicit source correspondence: ' + node['name'])
+            new_kin = set(new_native['kinematic_sim_indices'])
+            weights = [0.0 if i in new_kin else 1.0 for i in range(new_count)]
+        if len(weights) != new_count:
+            raise ValueError('WeightMap vertex count differs from the rebuilt simulation')
+        updates[node['name']] = (name, values, weights)
+    return updates
+
+
+def _publish(unreal, source_asset, binding_path, target, owner, content, packet=None, ownership=None):
     # Verify a new two-node graph before touching a previously published asset.
     stage_path = source_asset.get_path_name().split(".", 1)[0] + "_FinalStage"
     stage = unreal.EditorAssetLibrary.duplicate_asset(source_asset.get_path_name(), stage_path)
@@ -357,7 +486,7 @@ def _publish(unreal, source_asset, binding_path, target, owner, content):
         # only binding data, including a cheaper collider chosen for this hair.
         # Geometry/weight-map/proxy nodes are not configuration overrides.
         configs = set(fn) - set(imports) - set(terminals)
-        if any(fi[n]["type"] != "FChaosClothAssetSetPhysicsAssetNode" and
+        if any(fi[n]["type"] not in ("FChaosClothAssetSetPhysicsAssetNode", "FChaosClothAssetWeightMapNode") and
                not re.fullmatch(r"FChaosClothAssetSimulation\w*ConfigNode(?:_v\d+)?", fi[n]["type"])
                for n in configs):
             raise ValueError("Existing cloth graph has user changes; it remains unchanged")
@@ -391,7 +520,15 @@ def _publish(unreal, source_asset, binding_path, target, owner, content):
         if (reference not in expected_references or
                 str(previous_import.get("ImportLod", "")).strip() != "0"):
             raise ValueError("Existing cloth Import values have user changes; it remains unchanged")
+        maps = {}
+        if any(fi[n]['type'] == 'FChaosClothAssetWeightMapNode' for n in configs):
+            full_graph = _native(unreal.CodexClothToolsLibrary.dump_dataflow_nodes(fg.get_path_name()))
+            old_collection = _native(unreal.CodexClothToolsLibrary.dump_cloth_collection_colors(target))
+            maps = _weight_map_updates(full_graph, old_collection['collections'][0],
+                                       before['collections'][0], packet, ownership)
         try:
+            for name, (_, _, weights) in maps.items():
+                fc('UpdateNode', fn[name], json.dumps({'VertexWeights': weights}))
             fc("UpdateNode", fn[imports[0]], json.dumps({"ClothAsset": binding_path, "ImportLod": 0}))
             unreal.DataflowBlueprintLibrary.evaluate_terminal_node_by_name(fg, terminals[0], final)
             actual = _native(unreal.CodexClothToolsLibrary.dump_cloth_collection_colors(target))
@@ -399,13 +536,20 @@ def _publish(unreal, source_asset, binding_path, target, owner, content):
             # and deformer bindings, not solver/config property values. Keeping
             # its full comparison permits physics overrides without accepting
             # changes to the validated simulation/render correspondence.
-            if actual["collections"][0] != before["collections"][0]:
+            compared = json.loads(json.dumps(actual['collections'][0]))
+            added_names = {row[0] for row in maps.values()}
+            for key in ('weight_maps', 'sim_float_attributes'):
+                if key in compared:
+                    compared[key] = [item for item in compared[key] if item['name'] not in added_names]
+            if compared != before["collections"][0]:
                 raise RuntimeError("Published cloth differs from its verified collection")
             unreal.EditorAssetLibrary.set_metadata_tag(final, CONTENT, content)
             unreal.EditorAssetLibrary.set_metadata_tag(final, binding_key, binding_path)
             if not unreal.EditorAssetLibrary.save_loaded_asset(final):
                 raise RuntimeError("Updated cloth could not be saved")
         except Exception:
+            for name, (_, values, _) in maps.items():
+                fc('UpdateNode', fn[name], json.dumps({'VertexWeights': values}))
             fc("UpdateNode", fn[imports[0]], json.dumps({"ClothAsset": old_binding, "ImportLod": 0}))
             unreal.DataflowBlueprintLibrary.evaluate_terminal_node_by_name(fg, terminals[0], final)
             unreal.EditorAssetLibrary.set_metadata_tag(final, CONTENT, old_content)
@@ -464,7 +608,7 @@ def build_in_editor(record, output_directory):
     binding = unreal.load_asset(binding_path)
     if not binding or not unreal.EditorAssetLibrary.save_loaded_asset(binding):
         raise RuntimeError("Validated binding collection could not be saved")
-    final = _publish(unreal, source, binding_path, target, owner, content)
+    final = _publish(unreal, source, binding_path, target, owner, content, packet, ownership)
     native = final["collections"][0]["built_mapping"]
     receipt = {"verified": True, "version": record["version"], "cloth_asset_path": target,
                "simulation_enabled": True, "no_guide_policy": "render_only_skinning",
