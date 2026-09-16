@@ -1107,6 +1107,9 @@ def _final_export_sources(export_collection):
 def prepare():
     """Create export-only mesh copies for Hair Tool systems in the Export collection."""
     cleanup()
+    from . import hair_guide_cloth
+    guide_cloth_enabled = hair_guide_cloth.enabled()
+    hair_guide_cloth.begin()
 
     # M_LayerBlend height in Blender is a clearance/silhouette preview only.
     # Send to Unreal must export the authored base mesh so Unreal applies Nanite
@@ -1199,7 +1202,21 @@ def prepare():
         for asset_parent, asset_sources in grouped_sources.items():
             ao_configuration = _asset_ao_configuration(asset_parent)
             parts = []
+            guide_captures = []
+            guide_capture_complete = guide_cloth_enabled
             for source_object in asset_sources:
+                if guide_cloth_enabled:
+                    captured = hair_guide_cloth.capture_source(
+                        source_object, state,
+                        include_system_ao=(ao_configuration['evaluation_mode'] == 'PER_SYSTEM'),
+                        ao_settings=ao_configuration,
+                    )
+                    if captured is not None:
+                        source_parts, guide_capture = captured
+                        parts.extend(source_parts)
+                        guide_captures.append(guide_capture)
+                        continue
+                    guide_capture_complete = False
                 source_parts = _evaluated_mesh_objects(
                     source_object,
                     state,
@@ -1252,7 +1269,10 @@ def prepare():
 
             armatures = {
                 armature
-                for armature in (_get_armature(source) for source in asset_sources)
+                for armature in (
+                    (hair_guide_cloth.resolve_export_armature(source) if guide_cloth_enabled else _get_armature(source))
+                    for source in asset_sources
+                )
                 if armature
             }
             if len(armatures) > 1:
@@ -1273,6 +1293,16 @@ def prepare():
                     type='ARMATURE',
                 )
                 armature_modifier.object = armature_object
+
+            if guide_capture_complete:
+                try:
+                    hair_guide_cloth.finish_asset(
+                        temporary_object, guide_captures, asset_name,
+                        armature_object, export_collection, state,
+                    )
+                except Exception as error:
+                    # Optional cloth preparation never replaces ordinary export.
+                    hair_guide_cloth.diagnostic(asset_name, str(error))
 
     except Exception:
         cleanup()

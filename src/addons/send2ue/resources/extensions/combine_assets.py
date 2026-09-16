@@ -3,7 +3,7 @@
 import os
 import bpy
 from send2ue.core.extension import ExtensionBase
-from send2ue.core import utilities
+from send2ue.core import nested_pivots, utilities
 from send2ue.constants import BlenderTypes, ToolInfo, UnrealTypes
 
 
@@ -148,6 +148,22 @@ class CombineAssetsExtension(ExtensionBase):
                     exclude_postfix_tokens=True,
                     required_collection=bpy.data.collections.get(ToolInfo.EXPORT_COLLECTION.value),
                 )
+                # A directly exported pivot nested in another exported pivot
+                # owns a separate FBX. Keep the existing selector for ordinary
+                # empties, armatures, helpers, and collection instances.
+                if asset_data.get('_asset_type') == UnrealTypes.STATIC_MESH:
+                    if nested_pivots.get_assembly_root(
+                        mesh_object.parent,
+                        bpy.data.collections.get(ToolInfo.EXPORT_COLLECTION.value),
+                    ) is not None:
+                        # Assemblies need each FBX centered on its own pivot.
+                        # This per-asset flag leaves the scene option untouched.
+                        self.update_asset_data({'_nested_pivot_origin': True})
+                    nested_pivots.prune_nested_pivot_selection(
+                        mesh_object.parent,
+                        bpy.data.collections.get(ToolInfo.EXPORT_COLLECTION.value),
+                        list(bpy.context.selected_objects),
+                    )
                 # rename the asset to match the empty if this is a static mesh export
                 if mesh_object.parent.type == 'EMPTY':
                     path, ext = os.path.splitext(asset_data['file_path'])

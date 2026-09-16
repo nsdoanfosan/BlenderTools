@@ -5,7 +5,12 @@
 # Unreal to process the imported mesh through the shared surface-layer pipeline.
 
 import hashlib
+import importlib.util
 import json
+import math
+import os
+import struct
+import tempfile
 from pathlib import Path
 
 import bpy
@@ -29,6 +34,182 @@ MATERIAL_PIPELINE_JSON_SHA256_KEY = "_material_pipeline_json_sha256"
 # list always reaches the System Console.
 HANDOFF_ERROR_REPORT_LIMIT = 10
 _POST_OPERATION_SKELETAL_ASSET_PATHS = []
+_PROTOTYPE_FINALIZED_SIDECARS = {}
+PROTOTYPE_HANDOFF_KEY = "speedtree_prototype_handoff"
+PROTOTYPE_IDENTITY_OBJECT_KEY = "speedtree_cluster_prototype_identity"
+PROTOTYPE_IDENTITY_MEMBERS_OBJECT_KEY = (
+    "speedtree_cluster_prototype_identity_members"
+)
+
+
+def _prototype_identity_api():
+    module_path = Path(PIPELINE_DIR) / "prototype_identity.py"
+    spec = importlib.util.spec_from_file_location(
+        "_send2ue_prototype_identity", module_path
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(
+            f"Could not load prototype identity rules: {module_path}"
+        )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _atomic_write_bytes(path, payload):
+    path = Path(path)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=str(path.parent),
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def _canonical_float32(value):
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("export geometry contains a non-finite coordinate")
+    if number == 0.0:
+        number = 0.0
+    return struct.pack("<f", number).hex()
+
+
+def _mesh_output_record(obj, target_inverse):
+    mesh = obj.data
+    mesh.calc_loop_triangles()
+    transform = target_inverse @ obj.matrix_world
+    uv_layer = mesh.uv_layers.active if mesh.uv_layers else None
+    triangles = []
+    for triangle in mesh.loop_triangles:
+        corners = []
+        for loop_index in triangle.loops:
+            vertex_index = mesh.loops[loop_index].vertex_index
+            position = transform @ mesh.vertices[vertex_index].co
+            uv = (
+                uv_layer.data[loop_index].uv
+                if uv_layer is not None
+                else (0.0, 0.0)
+            )
+            corners.append(
+                tuple(
+                    _canonical_float32(value)
+                    for value in (
+                        position[0],
+                        position[1],
+                        position[2],
+                        uv[0],
+                        uv[1],
+                    )
+                )
+            )
+        triangles.append(min(
+            corners,
+            corners[1:] + corners[:1],
+            corners[2:] + corners[:2],
+        ))
+    triangles.sort()
+    return {
+        "vertex_count": len(mesh.vertices),
+        "triangle_count": len(triangles),
+        "oriented_position_uv_triangles": triangles,
+    }
+
+
+def _prototype_lineage_for_target(target):
+    custom_get = getattr(target, "get", None)
+    if not callable(custom_get):
+        return None
+    identity_raw = custom_get(PROTOTYPE_IDENTITY_OBJECT_KEY)
+    members_raw = custom_get(PROTOTYPE_IDENTITY_MEMBERS_OBJECT_KEY)
+    if identity_raw is None and members_raw is None:
+        return None
+    try:
+        identity = json.loads(str(identity_raw or ""))
+        members = json.loads(str(members_raw or ""))
+        identity = _prototype_identity_api().validate_lineage(
+            identity, members
+        )
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"Invalid prototype lineage on Blender export target {target.name}: {exc}"
+        ) from exc
+    return identity, members
+
+
+def _prototype_handoff_for_target(target, export_path, export_objects=None):
+    lineage = _prototype_lineage_for_target(target)
+    if lineage is None:
+        return None
+    identity, members = lineage
+    descendants = []
+    # The normal exporter passes its final selection so combined siblings and
+    # nested-pivot exclusions have the same scope as the FBX. The target-tree
+    # fallback remains for offline provenance callers without an export context.
+    pending = list(export_objects) if export_objects is not None else [target]
+    seen = set()
+    while pending:
+        obj = pending.pop()
+        marker = id(obj)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        if getattr(obj, "type", None) == "MESH":
+            descendants.append(obj)
+        if export_objects is None:
+            pending.extend(list(getattr(obj, "children", ()) or ()))
+    if not descendants:
+        raise RuntimeError(
+            f"Prototype export target {target.name} contains no current Mesh geometry."
+        )
+    target_inverse = target.matrix_world.inverted_safe()
+    mesh_records = sorted(
+        (_mesh_output_record(obj, target_inverse) for obj in descendants),
+        key=lambda row: json.dumps(row, sort_keys=True, separators=(",", ":")),
+    )
+    output_contract = {
+        "kind": "speedtree_blender_export_geometry",
+        "schema_version": 1,
+        "mesh_count": len(mesh_records),
+        "meshes": mesh_records,
+    }
+    output_digest = hashlib.sha256(
+        json.dumps(
+            output_contract,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    identity_api = _prototype_identity_api()
+    return {
+        "schema_version": 2,
+        "prototype_identity": identity,
+        "prototype_identity_members": members,
+        "blender_geometry_content": {
+            "kind": "speedtree_blender_export_geometry_content",
+            "schema_version": 1,
+            "algorithm": "sha256",
+            "digest": output_digest,
+        },
+        "output_content": identity_api.file_content_identity(
+            export_path,
+            identity_api.BLENDER_FBX_CONTENT_KIND,
+        ),
+    }
 
 
 def _library_name(library):
@@ -52,10 +233,12 @@ class MaterialPipelineExtension(ExtensionBase):
 
     def pre_operation(self, properties):
         _POST_OPERATION_SKELETAL_ASSET_PATHS.clear()
+        _PROTOTYPE_FINALIZED_SIDECARS.clear()
 
     def post_operation(self, properties):
         asset_paths = list(dict.fromkeys(_POST_OPERATION_SKELETAL_ASSET_PATHS))
         _POST_OPERATION_SKELETAL_ASSET_PATHS.clear()
+        _PROTOTYPE_FINALIZED_SIDECARS.clear()
         if not self.enabled or not asset_paths:
             return
 
@@ -84,6 +267,7 @@ class MaterialPipelineExtension(ExtensionBase):
         target = bpy.data.objects.get(asset_data.get("_mesh_object_name", ""))
         if not target:
             return
+        _prototype_lineage_for_target(target)
 
         refresh_result = self._refresh_unreal_handoff_json_or_error(target)
 
@@ -99,29 +283,35 @@ class MaterialPipelineExtension(ExtensionBase):
         transfer = self._transfer_entry_for_target(sidecar, target)
         shape_keys = bool(transfer.get("shape_keys"))
         weights = bool(transfer.get("weights"))
-        if not shape_keys and not weights:
-            return
+        if shape_keys or weights:
+            if not hasattr(target, "vdt_object_props"):
+                utilities.report_error(
+                    "Vertex Data Tools object props are unavailable.",
+                    "The UE Unique JSON requests transfer postprocess, but VDT is not available in Blender.",
+                )
 
-        if not hasattr(target, "vdt_object_props"):
-            utilities.report_error(
-                "Vertex Data Tools object props are unavailable.",
-                "The UE Unique JSON requests transfer postprocess, but VDT is not available in Blender.",
-            )
+            source_name = transfer.get("source")
+            source = bpy.data.objects.get(source_name) if source_name else None
+            if source is None:
+                utilities.report_error(
+                    f'Transfer source "{source_name or "-"}" not found for "{target.name}".',
+                    "Run Check Unreal Handoff again after setting Export Transfer Source.",
+                )
 
-        source_name = transfer.get("source")
-        source = bpy.data.objects.get(source_name) if source_name else None
-        if source is None:
-            utilities.report_error(
-                f'Transfer source "{source_name or "-"}" not found for "{target.name}".',
-                "Run Check Unreal Handoff again after setting Export Transfer Source.",
-            )
-
-        target.vdt_object_props.transfer_source = source
-        self._run_vertex_data_transfer(target, shape_keys, weights)
+            target.vdt_object_props.transfer_source = source
+            self._run_vertex_data_transfer(target, shape_keys, weights)
 
     def post_mesh_export(self, asset_data, properties):
         target_name = (asset_data or {}).get("_mesh_object_name", "")
-        self._restore_textureless_fbx_materials(target_name)
+        try:
+            target = bpy.data.objects.get(target_name)
+            if self.enabled and target is not None:
+                self._finalize_prototype_sidecar_for_export(
+                    asset_data or {},
+                    target,
+                )
+        finally:
+            self._restore_textureless_fbx_materials(target_name)
 
     def _prepare_textureless_fbx_materials(self, target):
         if target.name in _TEXTURELESS_FBX_RESTORE:
@@ -186,6 +376,7 @@ class MaterialPipelineExtension(ExtensionBase):
                     "Unreal handoff validation failed before Send to Unreal.",
                     self._handoff_validation_details(target, errors),
                 )
+            self._restore_finalized_prototype_sidecars_after_refresh()
 
             json_paths = result.get("json_paths") or []
             if not json_paths:
@@ -357,6 +548,109 @@ class MaterialPipelineExtension(ExtensionBase):
         asset_data[MATERIAL_PIPELINE_JSON_FROM_EXPORT_KEY] = True
         return sidecar
 
+    def _finalize_prototype_sidecar_for_export(self, asset_data, target):
+        lineage = _prototype_lineage_for_target(target)
+        if lineage is None:
+            return
+        json_path = str(
+            asset_data.get(MATERIAL_PIPELINE_JSON_PATH_KEY) or ""
+        ).strip()
+        export_path = str(asset_data.get("file_path") or "").strip()
+        expected_sha256 = str(
+            asset_data.get(MATERIAL_PIPELINE_JSON_SHA256_KEY) or ""
+        ).strip().casefold()
+        if not json_path or not export_path or not expected_sha256:
+            utilities.report_error(
+                "Prototype sidecar finalization evidence is incomplete.",
+                f' Target: "{target.name}".',
+            )
+            return
+        try:
+            payload = Path(json_path).read_bytes()
+        except OSError as exc:
+            utilities.report_error(
+                f"Could not read prototype sidecar after FBX export: {json_path}",
+                str(exc),
+            )
+            return
+        if hashlib.sha256(payload).hexdigest() != expected_sha256:
+            utilities.report_error(
+                "Prototype sidecar changed during FBX export.",
+                f' Target: "{target.name}".',
+            )
+            return
+        try:
+            sidecar = json.loads(payload.decode("utf-8"))
+            handoff = _prototype_handoff_for_target(
+                target, export_path,
+                export_objects=getattr(bpy.context, "selected_objects", None),
+            )
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            utilities.report_error(
+                "Could not finalize content-addressed prototype handoff.",
+                f' Target: "{target.name}". {exc}',
+            )
+            return
+        base_sidecar = dict(sidecar)
+        base_sidecar.pop(PROTOTYPE_HANDOFF_KEY, None)
+        sidecar[PROTOTYPE_HANDOFF_KEY] = handoff
+        payload = (
+            json.dumps(
+                sidecar,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+        try:
+            _atomic_write_bytes(json_path, payload)
+        except OSError as exc:
+            utilities.report_error(
+                f"Could not bind prototype identity to JSON sidecar: {json_path}",
+                str(exc),
+            )
+            return
+        asset_data[MATERIAL_PIPELINE_JSON_SHA256_KEY] = hashlib.sha256(
+            payload
+        ).hexdigest()
+        _PROTOTYPE_FINALIZED_SIDECARS[json_path] = {
+            'asset_data': asset_data,
+            'target_name': target.name,
+            'export_path': export_path,
+            'base_sidecar': base_sidecar,
+            'handoff': handoff,
+        }
+
+    def _restore_finalized_prototype_sidecars_after_refresh(self):
+        """Keep current-run FBX signatures through whole-Export JSON refreshes.
+
+        Never reuse previous-run files or overwrite changed material intent.
+        The cache contains only payloads finalized by this operation, and the
+        source identity and exact FBX bytes are rechecked before restoring it.
+        """
+        for json_path, record in _PROTOTYPE_FINALIZED_SIDECARS.items():
+            path = Path(json_path)
+            current = json.loads(path.read_text(encoding='utf-8'))
+            current.pop(PROTOTYPE_HANDOFF_KEY, None)
+            if current != record['base_sidecar']:
+                raise RuntimeError('Prototype material intent changed during export: ' + json_path)
+            target = bpy.data.objects.get(record['target_name'])
+            lineage = _prototype_lineage_for_target(target)
+            handoff = record['handoff']
+            if lineage != (handoff['prototype_identity'], handoff['prototype_identity_members']):
+                raise RuntimeError('Prototype source lineage changed during export: ' + json_path)
+            api = _prototype_identity_api()
+            actual = api.file_content_identity(record['export_path'], api.BLENDER_FBX_CONTENT_KIND)
+            if actual != handoff['output_content']:
+                raise RuntimeError('Prototype FBX payload changed during export: ' + record['export_path'])
+            current[PROTOTYPE_HANDOFF_KEY] = handoff
+            payload = (json.dumps(current, ensure_ascii=False, allow_nan=False,
+                                  sort_keys=True, separators=(',', ':')) + '\n').encode('utf-8')
+            _atomic_write_bytes(path, payload)
+            record['asset_data'][MATERIAL_PIPELINE_JSON_SHA256_KEY] = hashlib.sha256(payload).hexdigest()
+
     def _resolve_json_path_for_export(
         self,
         asset_data,
@@ -411,22 +705,79 @@ class MaterialPipelineExtension(ExtensionBase):
         return name
 
     def _transfer_entry_for_target(self, sidecar, target):
+        # Prototype lineage is an opt-in binding. Preserve the existing
+        # contract for ordinary meshes while enforcing immutable prototype IDs.
+        if _prototype_lineage_for_target(target) is None:
+            transfer = sidecar.get("transfer_source")
+            if isinstance(transfer, dict) and transfer.get("enabled"):
+                return transfer
+            transfers = [
+                entry for entry in sidecar.get("transfer_sources", [])
+                if isinstance(entry, dict) and entry.get("enabled")
+            ]
+            if not transfers:
+                return {}
+            for entry in transfers:
+                if entry.get("target") == target.name:
+                    return entry
+            return transfers[0]
         transfer = sidecar.get("transfer_source")
-        if isinstance(transfer, dict) and transfer.get("enabled"):
-            return transfer
-
-        transfers = [
+        transfers = (
+            [transfer]
+            if isinstance(transfer, dict) and transfer.get("enabled")
+            else []
+        )
+        transfers.extend(
             entry
             for entry in sidecar.get("transfer_sources", [])
             if isinstance(entry, dict) and entry.get("enabled")
-        ]
+        )
         if not transfers:
             return {}
 
-        for entry in transfers:
-            if entry.get("target") == target.name:
-                return entry
-        return transfers[0]
+        lineage = _prototype_lineage_for_target(target)
+        if lineage is not None:
+            target_identity, target_members = lineage
+            matches = []
+            for entry in transfers:
+                try:
+                    entry_members = entry.get(
+                        "prototype_identity_members"
+                    )
+                    entry_identity = (
+                        _prototype_identity_api().validate_lineage(
+                            entry.get("prototype_identity"),
+                            entry_members,
+                        )
+                    )
+                except (TypeError, ValueError):
+                    continue
+                if (
+                    entry_identity == target_identity
+                    and entry_members == target_members
+                ):
+                    matches.append(entry)
+        else:
+            matches = [
+                entry
+                for entry in transfers
+                if str(entry.get("target") or "") == target.name
+            ]
+            if (
+                not matches
+                and len(transfers) == 1
+                and transfers[0] is transfer
+                and not str(transfer.get("target") or "").strip()
+            ):
+                matches = [transfer]
+        if len(matches) != 1:
+            utilities.report_error(
+                "UE Unique JSON transfer target is missing or ambiguous.",
+                f' Expected exactly one immutable transfer binding for '
+                f'"{target.name}", found {len(matches)}.',
+            )
+            return {}
+        return matches[0]
 
     def _run_vertex_data_transfer(self, target, shape_keys, weights):
         active = bpy.context.view_layer.objects.active
@@ -484,6 +835,11 @@ class MaterialPipelineExtension(ExtensionBase):
         from_mesh_export = bool(
             asset_data.pop(MATERIAL_PIPELINE_JSON_FROM_EXPORT_KEY, False)
         )
+        export_file_path = (
+            str(asset_data.get("file_path") or "").replace("\\", "/")
+            if from_mesh_export
+            else ""
+        )
         json_path = (
             asset_data.get(MATERIAL_PIPELINE_JSON_PATH_KEY)
             if from_mesh_export
@@ -507,7 +863,10 @@ class MaterialPipelineExtension(ExtensionBase):
         sidecar_sha256 = str(
             asset_data.get(MATERIAL_PIPELINE_JSON_SHA256_KEY) or ""
         ).strip()
-        if from_mesh_export and (not expected_mesh_name or not sidecar_sha256):
+        if from_mesh_export and (
+            not expected_mesh_name
+            or not sidecar_sha256
+        ):
             utilities.report_error(
                 "Export-bound JSON sidecar evidence is incomplete.",
                 f' Asset: "{asset_path}".',
@@ -523,6 +882,7 @@ class MaterialPipelineExtension(ExtensionBase):
         json_arg = repr(json_path)
         expected_name_arg = repr(expected_mesh_name)
         sidecar_sha_arg = repr(sidecar_sha256)
+        export_file_arg = repr(export_file_path)
         commands = [
             "import sys",
             "import importlib.util",
@@ -540,7 +900,8 @@ class MaterialPipelineExtension(ExtensionBase):
                 "_p.preflight_mesh_materials("
                 f"_asset_path, json_path={json_arg}, "
                 f"expected_mesh_name={expected_name_arg}, "
-                f"sidecar_sha256={sidecar_sha_arg})"
+                f"sidecar_sha256={sidecar_sha_arg}, "
+                f"export_file_path={export_file_arg})"
             ),
         ]
         run_commands(commands)
@@ -588,6 +949,9 @@ class MaterialPipelineExtension(ExtensionBase):
         json_arg = repr(str(json_path))
         expected_name_arg = repr(expected_mesh_name)
         sidecar_sha_arg = repr(sidecar_sha256)
+        export_file_arg = repr(
+            str(asset_data.get("file_path") or "").replace("\\", "/")
+        )
 
         commands = [
             "import sys",
@@ -615,7 +979,8 @@ class MaterialPipelineExtension(ExtensionBase):
                 "\t_p.process_mesh("
                 f"_asset_path, json_path={json_arg}, "
                 f"expected_mesh_name={expected_name_arg}, "
-                f"sidecar_sha256={sidecar_sha_arg})"
+                f"sidecar_sha256={sidecar_sha_arg}, "
+                f"export_file_path={export_file_arg})"
             ),
             "finally:",
             "\t_sync_to_imported_asset(_asset_path)",

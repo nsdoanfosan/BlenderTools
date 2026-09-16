@@ -48,6 +48,7 @@ class RemoteExecutionConfig(object):
         # The endpoint tuple for the TCP command connection hosted by this client (that the remote client will connect to)
         command_host, command_port = preferences.command_endpoint.split(':')
         self.command_endpoint = (command_host, int(command_port))
+        self.command_response_timeout = max(float(getattr(preferences, 'rpc_response_timeout', 60)), 0.1)
 
         # Multicast and command endpoints can legitimately use different local
         # addresses. In particular, Unreal may bind discovery to a LAN adapter
@@ -110,15 +111,21 @@ class RemoteExecution(object):
         '''
         return self._command_connection is not None
 
-    def open_command_connection(self, remote_node_id):
+    def open_command_connection(self, remote_node_id, timeout=5.0):
         '''
         Open a command connection to the given remote "node" (a Unreal Editor instance running Python), closing any command connection that may currently be open.
 
         Args:
             remote_node_id (string): The ID of the remote node (this can be obtained by querying `remote_nodes`).
         '''
-        self._command_connection = _RemoteExecutionCommandConnection(self._config, self._node_id, remote_node_id)
-        self._command_connection.open(self._broadcast_connection)
+        self.close_command_connection()
+        connection = _RemoteExecutionCommandConnection(self._config, self._node_id, remote_node_id)
+        try:
+            connection.open(self._broadcast_connection, timeout=timeout)
+        except Exception:
+            connection.close(self._broadcast_connection)
+            raise
+        self._command_connection = connection
 
     def close_command_connection(self):
         '''
@@ -406,9 +413,9 @@ class _RemoteExecutionCommandConnection(object):
         self._node_id = node_id
         self._remote_node_id = remote_node_id
         self._command_listen_socket = None
-        self._command_channel_socket = _socket.socket() # This type is only here to appease PyLint
+        self._command_channel_socket = None
 
-    def open(self, broadcast_connection):
+    def open(self, broadcast_connection, timeout=5.0):
         '''
         Open the TCP based command connection, and wait to accept the connection from the remote party.
 
@@ -417,7 +424,7 @@ class _RemoteExecutionCommandConnection(object):
         '''
         self._nodes = _RemoteExecutionBroadcastNodes()
         self._init_command_listen_socket()
-        self._try_accept(broadcast_connection)
+        self._try_accept(broadcast_connection, timeout=timeout)
 
     def close(self, broadcast_connection):
         '''
@@ -426,7 +433,11 @@ class _RemoteExecutionCommandConnection(object):
         Args:
             broadcast_connection (_RemoteExecutionBroadcastConnection): The broadcast connection to send UDP based messages over.
         '''
-        broadcast_connection.broadcast_close_connection(self._remote_node_id)
+        try:
+            broadcast_connection.broadcast_close_connection(self._remote_node_id)
+        except OSError:
+            # Always release local sockets even if the editor/network disappeared.
+            pass
         if self._command_channel_socket:
             self._command_channel_socket.close()
             self._command_channel_socket = None
@@ -506,18 +517,25 @@ class _RemoteExecutionCommandConnection(object):
         self._command_listen_socket.listen(1)
         self._command_listen_socket.settimeout(5)
 
-    def _try_accept(self, broadcast_connection):
+    def _try_accept(self, broadcast_connection, timeout=5.0):
         '''
-        Wait to accept a connection on the TCP based command connection. This makes 6 attempts to receive a connection, waiting for 5 seconds between each attempt (30 seconds total).
+        Accept a command connection within the caller's remaining discovery budget.
 
         Args:
             broadcast_connection (_RemoteExecutionBroadcastConnection): The broadcast connection to send UDP based messages over.
         '''
-        for _n in range(6):
+        deadline = _time.monotonic() + max(float(timeout), 0.0)
+        while True:
+            remaining = deadline - _time.monotonic()
+            if remaining <= 0:
+                break
+            self._command_listen_socket.settimeout(min(1.0, remaining))
             broadcast_connection.broadcast_open_connection(self._remote_node_id)
             try:
                 self._command_channel_socket = self._command_listen_socket.accept()[0]
-                self._command_channel_socket.setblocking(True)
+                self._command_channel_socket.settimeout(
+                    getattr(self._config, 'command_response_timeout', 60.0)
+                )
                 return
             except _socket.timeout:
                 continue

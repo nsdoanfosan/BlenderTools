@@ -350,6 +350,14 @@ def get_scene_property_class():
                 " origin"
             )
         ) # type: ignore
+        export_render_bevels: bpy.props.BoolProperty(
+            name="Export Render Bevels",
+            default=False,
+            description=(
+                "For static meshes, temporarily evaluate render-enabled Bevel modifiers hidden in the viewport. "
+                "Requires Apply Modifiers Viewport and Render. Collision meshes and linked objects are unchanged"
+            )
+        ) # type: ignore
         import_meshes: bpy.props.BoolProperty(
             name="Meshes",
             default=True,

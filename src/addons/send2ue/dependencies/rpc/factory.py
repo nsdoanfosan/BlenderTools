@@ -102,7 +102,9 @@ class RPCFactory:
         :param callable function: A callable.
         :return str: The new code of the callable with all its references added.
         """
-        import_code = self.default_imports
+        # Each registration gets its own imports. A previous function must not
+        # contaminate every later call through the shared decorator defaults.
+        import_code = list(self.default_imports)
 
         client_module = inspect.getmodule(function)
         self.file_path = get_source_file_path(function)
@@ -211,6 +213,18 @@ class RPCFactory:
         :param tuple(Any) args: The function's arguments.
         :return callable: A remote callable.
         """
+        # Decorators in other modules can retain a callable after its source
+        # module has been reloaded. inspect.getsource() then uses the old line
+        # number against the new file and can transmit an unrelated code block.
+        # Resolve the current callable by its qualified name before inspecting it.
+        current = inspect.getmodule(function)
+        for part in function.__qualname__.split('.'):
+            current = getattr(current, part, None)
+        if (inspect.isfunction(current)
+                and current.__module__ == function.__module__
+                and current.__qualname__ == function.__qualname__):
+            function = current
+
         validate_arguments(function, args)
 
         # get the remote function instance
