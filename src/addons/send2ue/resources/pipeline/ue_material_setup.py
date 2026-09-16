@@ -4458,6 +4458,14 @@ def _delete_wrong_generated_hair_materials(mat_name: str, entry: dict, preset: d
     return deleted
 
 
+def _entry_reparents_existing_hair_material(entry: dict) -> bool:
+    """Parent choice is separate from ownership of synchronized hair controls."""
+    value = entry.get("reparent_existing_material_instance", False)
+    if isinstance(value, str):
+        return value.strip().casefold() in {"1", "true", "yes", "on"}
+    return value is True
+
+
 def _load_or_create_hair_material(
     asset_tools,
     mat_name: str,
@@ -4473,6 +4481,11 @@ def _load_or_create_hair_material(
     existing = _load_exact_material_instance(target_path)
     if existing is not None and preserve_existing:
         _log(f"  user-owned hair MI reused unchanged: {target_path}")
+        return existing, target_path, False
+    if existing is not None and not _entry_reparents_existing_hair_material(entry):
+        # Hair and short-fur instances can share the export contract while using
+        # different BSDF masters. Parameter synchronization never implies reparent.
+        _log(f"  existing hair MI parent preserved: {target_path}")
         return existing, target_path, False
     if existing is None and not _entry_create_if_missing(entry, preset):
         _log(f"  requested hair MI is unavailable; slot left unchanged: {target_path}")
@@ -4492,12 +4505,17 @@ def _load_or_create_hair_material(
     )
     if mi is None:
         return None, target_path, False
+    if not created and not _entry_reparents_existing_hair_material(entry):
+        # A concurrent creator can resolve an MI after the initial lookup.
+        return mi, target_path, False
     try:
         current_parent = mi.get_editor_property("parent")
     except Exception:
         current_parent = None
     if not _same_asset(current_parent, master):
         unreal.MaterialEditingLibrary.set_material_instance_parent(mi, master)
+        unreal.MaterialEditingLibrary.update_material_instance(mi)
+        _save_material_texture_update(target_path)
         _log(f"  hair MI parent update: {target_path} -> {master.get_path_name()}")
     return mi, target_path, bool(created)
 
@@ -4546,11 +4564,12 @@ def _assign_hair_tool_parameters(
     synced_parameters = {
         str(name) for name in (hair_tool.get("sync_parameters") or [])
     }
+    # Existing instances own every control outside this explicit source list.
+    # New instances can still initialize a legacy payload without a sync list.
     for name, value in (hair_tool.get("scalar_parameters") or {}).items():
         name = str(name)
         if (
             not initialize_instance_owned_parameters
-            and name in HAIR_INSTANCE_OWNED_SCALAR_PARAMETERS
             and name not in synced_parameters
         ):
             _log(f"  preserve existing hair MI scalar: {name}")
@@ -4563,7 +4582,6 @@ def _assign_hair_tool_parameters(
         name = str(name)
         if (
             not initialize_instance_owned_parameters
-            and name in HAIR_INSTANCE_OWNED_VECTOR_PARAMETERS
             and name not in synced_parameters
         ):
             _log(f"  preserve existing hair MI vector: {name}")
@@ -4827,6 +4845,16 @@ def _material_pipeline_mutation_paths(mesh_path: str, data: dict) -> list:
                 continue
 
         master_path = str(preset.get("master") or "").split(".")[0]
+        if (
+            preset.get("key") == "hair"
+            and target_path
+            and not _entry_reparents_existing_hair_material(entry)
+        ):
+            existing_hair = _load_exact_material_instance(target_path)
+            if existing_hair is not None:
+                # Skeletal/Nanite usage repair acts on the resolved base master,
+                # which may be the independently authored short-fur material.
+                master_path = _asset_base_material_path(existing_hair).split(".")[0]
         if master_path:
             paths.append(master_path)
         parent_layer = _layer_parent_path(preset, entry)
@@ -5196,7 +5224,7 @@ def process_mesh(
                     entry,
                     layer_maps,
                     initialize_instance_owned_parameters=mi_created,
-                    clear_missing_managed=True,
+                    clear_missing_managed=mi_created,
                 ):
                     _save_material_texture_update(mi_path)
             _log(f"  hair slot[{slot_index}] '{mat_name}' -> {mi_path}")
