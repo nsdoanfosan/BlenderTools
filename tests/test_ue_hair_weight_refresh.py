@@ -25,6 +25,25 @@ def fixture():
 
 
 class WeightRefreshTests(unittest.TestCase):
+    def test_flat_grid_native_island_identity_survives_global_gid_renumbering(self):
+        packet = {'meshes': {'sim': {'vertices': [[0,0,0],[1,0,0],[0,1,0]],
+            'triangles': [[0,1,2]], 'guide_ids': [7,7,7]}}, 'parts': [{
+            'gid': 7, 'source_guide': 'FlatGuide', 'sim_vertex_indices': [0,1,2],
+            'source_vertex_indices': [0,1,2], 'provenance': 'hair_tool_grid_src_island_index',
+            'simulation_mesh': {'effective_mode': 'ORIGINAL', 'status': 'flat_preserved'}}]}
+        owner = {'sim_guide_ids': [7,7,7], 'sim_source_indices': [0,1,2],
+                 'sim_source_identity_unique': [True,True,True]}
+        before, _ = M._guide_identity_rows(packet, owner)
+        packet['meshes']['sim']['guide_ids'] = [90,90,90]
+        packet['parts'][0]['gid'] = 90
+        owner['sim_guide_ids'] = [90,90,90]
+        after, rows = M._guide_identity_rows(packet, owner)
+        self.assertEqual(before, after)
+        self.assertEqual(rows[90]['native_island'], 0)
+        packet['parts'][0]['simulation_mesh']['status'] = 'unknown'
+        with self.assertRaisesRegex(ValueError, 'identity mapping is missing'):
+            M._guide_identity_rows(packet, owner)
+
     def test_exact_kinematic_mask_follows_new_binding(self):
         graph, old, new = fixture()
         result = M._weight_map_updates(graph, old, new, None, None)

@@ -356,7 +356,18 @@ def _guide_identity_rows(packet, owner):
                 component.add(vertex)
                 stack.extend(graph[vertex] & remaining)
             islands.append(component)
-        mapping = source_parts[0]['simulation_mesh']['native_island_to_spline']
+        receipts = [part['simulation_mesh'] for part in source_parts]
+        mapping = receipts[0].get('native_island_to_spline')
+        if mapping is None:
+            # Flat guides keep their authored mesh. Hair Tool Grid explicitly
+            # identifies its native source island; there is no ribbon conversion
+            # or spline remapping receipt in this export mode.
+            if not all(receipt.get('effective_mode') == 'ORIGINAL' and
+                       receipt.get('status') == 'flat_preserved' and
+                       part.get('provenance') == 'hair_tool_grid_src_island_index'
+                       for part, receipt in zip(source_parts, receipts)):
+                raise ValueError('Source guide identity mapping is missing')
+            mapping = {str(index): index for index in range(len(islands))}
         if set(map(int, mapping)) != set(range(len(islands))) or len(islands) != len(source_parts):
             raise ValueError('Source island-to-spline identity cannot be reconciled')
         source_sets = {frozenset(p['source_vertex_indices']): p for p in source_parts}
@@ -364,7 +375,7 @@ def _guide_identity_rows(packet, owner):
             raise ValueError('Duplicate source island')
         for local_island, vertices in enumerate(islands):
             part = source_sets.get(frozenset(vertices))
-            if part is None or part['simulation_mesh']['native_island_to_spline'] != mapping:
+            if part is None or part['simulation_mesh'].get('native_island_to_spline', mapping) != mapping:
                 raise ValueError('Each part must match one complete native island')
             gid, spline = int(part['gid']), int(mapping[str(local_island)])
             if gid in rows:
