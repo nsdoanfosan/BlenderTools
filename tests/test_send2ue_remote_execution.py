@@ -68,6 +68,8 @@ class FakeRemoteExecution:
         self.open_calls = 0
         self.close_calls = 0
         self.command_calls = 0
+        self.probe_calls = 0
+        self.fail_next_probe = False
         self.connected = False
         self._config = types.SimpleNamespace(
             multicast_group_endpoint=("239.0.0.1", 6766),
@@ -105,6 +107,12 @@ class FakeRemoteExecution:
         return self.connected
 
     def run_command(self, command, unattended=False):
+        if command == 'None' and unattended:
+            self.probe_calls += 1
+            if self.fail_next_probe:
+                self.fail_next_probe = False
+                raise ConnectionResetError('stale editor socket')
+            return {'success': True, 'output': [], 'result': 'None'}
         self.command_calls += 1
         if self.command_error:
             raise self.command_error
@@ -245,6 +253,18 @@ class TestRunUnrealPythonCommands(unittest.TestCase):
 
         self.assertIs(raised.exception.__cause__, root_cause)
         self.assertGreater(remote_exec.close_calls, 0)
+
+    def test_stale_readiness_socket_is_reconnected_before_dispatch(self):
+        remote_exec = FakeRemoteExecution()
+        remote_exec.fail_next_probe = True
+        clock = FakeClock()
+        monotonic_patch, sleep_patch = self._clock_patches(clock)
+        with monotonic_patch, sleep_patch:
+            result = UNREAL.run_unreal_python_commands(remote_exec, ["print('probe')"])
+        self.assertEqual(result, 'remote probe ok')
+        self.assertEqual(remote_exec.probe_calls, 2)
+        self.assertEqual(remote_exec.open_calls, 2)
+        self.assertEqual(remote_exec.command_calls, 1)
 
     def test_dispatched_command_is_not_retried(self):
         root_cause = RuntimeError("response socket closed")

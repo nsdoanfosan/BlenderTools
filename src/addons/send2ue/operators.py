@@ -14,6 +14,7 @@ from .core import (
     hair_tool_export,
     armature_modifier_fix,
     preview_modifier_guard,
+    grouppro_export,
 )
 from .ui import file_browser, dialog, addon_preferences
 from .dependencies import unreal
@@ -102,15 +103,12 @@ class Send2Ue(bpy.types.Operator):
     def invoke(self, context, event):
         if utilities.is_unreal_connected():
             properties = bpy.context.scene.send2ue
-            self.pre_operation()
-
-            # initialize the progress bar
-            self.execution_queue.queue.clear()
-            context.window_manager.send2ue.progress = 0
-            bpy.context.workspace.status_text_set_internal('Validating...')
-
             # run the full send to unreal operation which queues all the jobs
             try:
+                self.pre_operation()
+                self.execution_queue.queue.clear()
+                context.window_manager.send2ue.progress = 0
+                bpy.context.workspace.status_text_set_internal('Validating...')
                 export.send2ue(properties)
             # if validations fail
             except Exception as error:
@@ -136,19 +134,17 @@ class Send2Ue(bpy.types.Operator):
     def execute(self, context):
         if utilities.is_unreal_connected():
             properties = bpy.context.scene.send2ue
-            self.pre_operation()
-
-            self.execution_queue.queue.clear()
-            export.send2ue(properties)
-
-            # process the queued functions
-            while not self.execution_queue.empty():
-                function, args, kwargs, message, asset_id, attribute = self.execution_queue.get()
-                # set the current asset id
-                context.window_manager.send2ue.asset_id = asset_id
-                # run the function
-                function(*args, **kwargs)
-
+            try:
+                self.pre_operation()
+                self.execution_queue.queue.clear()
+                export.send2ue(properties)
+                while not self.execution_queue.empty():
+                    function, args, kwargs, message, asset_id, attribute = self.execution_queue.get()
+                    context.window_manager.send2ue.asset_id = asset_id
+                    function(*args, **kwargs)
+            except BaseException as error:
+                self.escape_operation(context, error=error)
+                raise
             self.post_operation()
         return {'FINISHED'}
 
@@ -177,6 +173,10 @@ class Send2Ue(bpy.types.Operator):
         # get the current state of the scene and its objects
         self.state['context'] = utilities.get_current_context()
 
+        # Expose the current contents of open GroupPro groups before extensions
+        # inspect Export. The exact editable state is restored during cleanup.
+        grouppro_export.prepare_edits(bpy.context.scene.send2ue)
+
         # unpack the textures for export if needed
         self.state['unpacked_files'] = utilities.unpack_textures()
 
@@ -199,7 +199,13 @@ class Send2Ue(bpy.types.Operator):
         # displacement indicators) must never be baked into the exported mesh.
         preview_modifier_guard.prepare()
 
+        # GroupPro Empty geometry needs Mesh objects for validation, material
+        # discovery and FBX selection. These native groups are temporary.
+        grouppro_export.prepare(bpy.context.scene.send2ue)
+
     def post_operation(self):
+        grouppro_export.cleanup()
+
         # Restore preview visibility before returning the user's scene state.
         preview_modifier_guard.cleanup()
 

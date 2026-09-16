@@ -453,7 +453,15 @@ class MaterialPipelineExtension(ExtensionBase):
         renamed = []
         skipped_linked = []
 
+        seen_materials = []
         for material in materials:
+            # Geometry Nodes / GroupPro can report evaluated material IDs.
+            # Their names are read-only even when library is None. Normalize
+            # the source ID once, never a dependency-graph temporary copy.
+            material = getattr(material, "original", material)
+            if any(material == seen for seen in seen_materials):
+                continue
+            seen_materials.append(material)
             old_name = str(material.name)
             clean_name = clean_token(old_name)
             base_name = (
@@ -465,7 +473,7 @@ class MaterialPipelineExtension(ExtensionBase):
             suffix = 2
             while (
                 candidate.casefold() in used_names
-                and used_names[candidate.casefold()] is not material
+                and used_names[candidate.casefold()] != material
             ):
                 candidate = f"{base_name}_{suffix:02d}"
                 suffix += 1
@@ -479,7 +487,10 @@ class MaterialPipelineExtension(ExtensionBase):
             if library is not None:
                 skipped_linked.append((old_name, candidate, _library_name(library)))
                 continue
-            if used_names.get(old_name.casefold()) is material:
+            if getattr(material, "is_property_readonly", lambda _name: False)("name"):
+                skipped_linked.append((old_name, candidate, "evaluated material"))
+                continue
+            if used_names.get(old_name.casefold()) == material:
                 used_names.pop(old_name.casefold(), None)
             material.name = candidate
             actual_name = str(material.name)

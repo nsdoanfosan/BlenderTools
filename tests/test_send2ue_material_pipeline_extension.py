@@ -365,6 +365,31 @@ class TestMaterialPipelineExactSidecar(unittest.TestCase):
         )
         self.assertEqual(skipped_linked, [])
 
+    def test_evaluated_material_uses_source_id_without_false_collision(self):
+        from unittest.mock import patch
+        constants = types.ModuleType('ue_unique_export_names_addon.constants')
+        constants.MATERIAL_PREFIX = 'M_'
+        utils = types.ModuleType('ue_unique_export_names_addon.utils')
+        utils.clean_token = str
+        source = types.SimpleNamespace(name='M_Wood', library=None)
+        class EvaluatedMaterial:
+            original = source
+            @property
+            def name(self):
+                return source.name
+            @name.setter
+            def name(self, value):
+                raise AttributeError('evaluated material name is read-only')
+        self.module.bpy.data.materials = [source]
+        api = types.SimpleNamespace(collect_handoff_data=lambda context, scope: {
+            'materials': [EvaluatedMaterial(), EvaluatedMaterial(), source]
+        })
+        with patch.dict(sys.modules, {
+            constants.__name__: constants, utils.__name__: utils,
+        }):
+            self.assertEqual(self.extension._normalize_export_material_names(api), ([], []))
+        self.assertEqual(source.name, 'M_Wood')
+
     def test_linked_materials_are_skipped_not_renamed(self):
         package_name = "ue_unique_export_names_addon"
         constants_name = f"{package_name}.constants"
