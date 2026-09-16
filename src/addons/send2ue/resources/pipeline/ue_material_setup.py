@@ -5180,6 +5180,22 @@ def process_mesh(
                 continue
             slot_index = int(entry.get("slot_index", 0))
 
+        # Explicit artist-owned assignments can reference a base Material as
+        # well as an MI. Never reparent, initialize or synchronize either.
+        if (target_material_path and
+                entry.get('material_instance_ownership') == 'external' and
+                entry.get('manage_existing_material_instance') is False and
+                entry.get('create_if_missing') is False):
+            assigned = unreal.load_asset(target_material_path)
+            if assigned is None or not isinstance(assigned, unreal.MaterialInterface):
+                raise RuntimeError('Existing material interface missing: ' + target_material_path)
+            if _is_skeletal_mesh(mesh):
+                skeletal_slot_assignments[slot_index] = (slot_name, assigned)
+            if _assign_slot(mesh, slot_index, assigned, slot_name):
+                changed = True
+            _log(f'  existing material retained in slot[{slot_index}]: {target_material_path}')
+            continue
+
         preset = _master_preset(data, entry, mesh_path)
         profile_target = instance_profile_targets.get(entry_index)
         if (
