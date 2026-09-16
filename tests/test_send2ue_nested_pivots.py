@@ -44,7 +44,7 @@ class Object:
 
 class TestNestedPivotBoundary(unittest.TestCase):
     def setUp(self):
-        self.export = object()
+        self.export = types.SimpleNamespace(all_objects=[])
         self.root = Object('window_wood_single_02', collection=self.export)
         self.frame = Object('window_02014', 'MESH', self.root, self.export)
         self.frame_two = Object('window_02014.001', 'MESH', self.root, self.export)
@@ -135,6 +135,7 @@ class TestNestedPivotBoundary(unittest.TestCase):
 
     def _load_extension(self):
         objects = [self.root, self.frame, self.frame_two, self.glass, self.glass_mesh, self.glass_two]
+        self.export.all_objects = objects
         test_case = self
 
         class Context:
@@ -166,10 +167,11 @@ class TestNestedPivotBoundary(unittest.TestCase):
 
         utilities.select_all_children = select_all_children
         utilities.select_asset_collisions = lambda *_args: None
-        # The unchanged real combine filter must still schedule one mesh per pivot.
+        # The real owner resolver and filter must still schedule one mesh per pivot.
         tree = ast.parse((ADDON / 'core' / 'utilities.py').read_text(encoding='utf-8'))
-        node = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'get_unique_parent_mesh_objects')
-        exec(compile(ast.Module(body=[node], type_ignores=[]), '<unique-parent-filter>', 'exec'), utilities.__dict__)
+        nodes = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in {'get_unique_parent_mesh_objects', 'get_combined_export_parent'}]
+        utilities.bpy = bpy
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), '<unique-parent-filter>', 'exec'), utilities.__dict__)
         core = types.ModuleType('send2ue.core')
         core.utilities = utilities
         core.nested_pivots = PIVOTS
@@ -183,6 +185,7 @@ class TestNestedPivotBoundary(unittest.TestCase):
         constants = types.ModuleType('send2ue.constants')
         constants.BlenderTypes = types.SimpleNamespace(MESH='MESH')
         constants.ToolInfo = types.SimpleNamespace(EXPORT_COLLECTION=types.SimpleNamespace(value='Export'))
+        utilities.ToolInfo = constants.ToolInfo
         constants.UnrealTypes = types.SimpleNamespace(STATIC_MESH='StaticMesh')
         replacements = {
             'bpy': bpy, 'send2ue': types.ModuleType('send2ue'), 'send2ue.core': core,

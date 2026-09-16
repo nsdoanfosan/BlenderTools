@@ -20,6 +20,7 @@ class Send2UnrealDialog(bpy.types.Panel):
             PathModes.SEND_TO_DISK_THEN_PROJECT.value
         ]:
             self.draw_property(properties, layout, 'unreal_mesh_folder_path', header_label=True)
+            self.draw_property(properties, layout, 'auto_sync_unreal_mesh_folder')
             self.draw_property(properties, layout, 'unreal_animation_folder_path', header_label=True)
             self.draw_property(properties, layout, 'unreal_groom_folder_path', header_label=True)
             self.draw_property(properties, layout, 'unreal_skeleton_asset_path', header_label=True)

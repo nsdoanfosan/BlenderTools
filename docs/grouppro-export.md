@@ -7,9 +7,12 @@ Collection geometry, realization/proxy settings, downstream modifiers, transform
 and custom properties are retained. The editable Empties and source collections
 are restored after successful exports, cancellation and preparation failures.
 
-GroupPro must be enabled. Close any open GroupPro group edit before exporting;
-an edited group is temporarily detached from Export and would otherwise be omitted.
-The exporter reports this condition before preparing objects. Export-only names
+GroupPro must be enabled. Open group edits, including nested edits in Mesh Edit
+Mode, are temporarily exposed under their original Export parents. The adapter
+uses GroupPro's link/transform helpers and restores the saved transforms and
+collection links directly after success or failure. It preserves edited mesh
+contents, the edit stack, active object, selection and mode; it does not invoke
+Close Group's library-writing or empty-group deletion behavior. Export-only names
 use Send2UE's normal name cleanup and reject collisions with existing objects.
 
 For older GroupPro Empty groups whose geometry intermittently vanishes in
@@ -34,3 +37,7 @@ The smoke test compares generated geometry and material sets, checks rollback
 after an injected preparation failure, runs the regular Send2UE disk export, and
 reads the FBX back to verify every group is present. It does not save the source
 blend or user preferences.
+
+`tests/blender_grouppro_open_export.py -- <source.blend>` additionally checks a
+nested mirrored/non-uniform fixture against native Close Group geometry, keeps a
+new source-vertex edit, and verifies Edit Mode restoration after injected failure.

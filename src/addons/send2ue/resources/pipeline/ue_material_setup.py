@@ -622,6 +622,20 @@ def _validate_speedtree_handoff_contract(
     marker requires the current descriptor and material intent contract.
     """
     materials = data.get("materials", []) if isinstance(data, dict) else []
+    for entry in materials:
+        if not isinstance(entry, dict) or not entry.get("speedtree_intent"):
+            continue
+        if entry.get("tree_shading") != "foliage":
+            continue
+        layers = _entry_layers(entry, {"key": "tree"})
+        if not any(
+            texture.get("param") == "Albedo" and texture.get("file")
+            for layer in layers for texture in layer.get("textures", [])
+        ):
+            raise RuntimeError(
+                "SpeedTree foliage has no Albedo payload; import blocked before mutation: "
+                + str(entry.get("name") or "<unnamed>")
+            )
     has_intent = any(
         isinstance(entry, dict) and "speedtree_intent" in entry
         for entry in materials
@@ -2782,6 +2796,33 @@ def _slot_index_for_entry(mesh, entry: dict, mat_name: str):
     return None
 
 
+def _sync_fbx_duplicate_material_slots(mesh, data):
+    """Assign FBX's duplicate-name aliases from the exact authored slot."""
+    property_name, slots = _mesh_material_entries(mesh)
+    if property_name != "static_materials":
+        return False
+    entries = {str(entry.get("name") or ""): entry for entry in (data or {}).get("materials", [])}
+    changed = False
+    for index, slot in enumerate(slots):
+        try:
+            imported = str(slot.get_editor_property("imported_material_slot_name"))
+        except Exception:
+            continue
+        if imported in entries:
+            continue
+        match = re.fullmatch(r"(.+)_ncl\d+_\d+", imported)
+        if not match or match.group(1) not in entries:
+            continue
+        name = match.group(1)
+        source_index = _slot_index_for_entry(mesh, entries[name], name)
+        if source_index is None or source_index == index:
+            continue
+        material = slots[source_index].get_editor_property("material_interface")
+        if material is not None and _set_material_interface(mesh, index, material):
+            changed = True
+    return changed
+
+
 def _slot_index_for_material_name(mesh, mat_name: str):
     """메쉬의 실제 슬롯 중 import 된 머티리얼명이 mat_name 인 슬롯 인덱스. 없으면 None.
     Empty 결합(combine child meshes) export 처럼 JSON 의 slot_index 가 실제 결합 슬롯 순서와
@@ -3797,6 +3838,12 @@ def _layer_texture_remap(preset: dict, entry: dict) -> dict:
         result["Alpha"] = "Opacity Map"
         result["Opacity"] = "Opacity Map"
         result["Opacity Map"] = "Opacity Map"
+        # MY_Tree_Branch has no opacity parameter. Stem exports may still
+        # contain an opaque SBS output; do not send it to the layer helper.
+        if preset.get("tree_shading") == "stem":
+            for source, target in list(result.items()):
+                if target == "Opacity Map":
+                    result.pop(source)
         if preset.get("tree_shading") != "wood":
             result["Subsurface"] = "Subsurface"
         else:
@@ -3995,6 +4042,21 @@ def _assign_material_layer_instance(
     entry: dict,
     clear_missing_managed: bool = False,
 ) -> bool:
+    # Missing SpeedTree textures must not erase an existing MYI's overrides.
+    if (entry or {}).get("speedtree_intent") and entry.get("tree_shading") == "foliage":
+        imported = _first_layer_textures(layer_maps)
+        declared = {
+            texture.get("param")
+            for layer in _entry_layers(entry, preset)
+            for texture in layer.get("textures", [])
+        }
+        missing = (declared | {"Albedo"}) - set(imported)
+        if missing:
+            raise RuntimeError(
+                "SpeedTree foliage texture handoff is incomplete; existing MYI preserved: "
+                + str(entry.get("name") or mat_base)
+                + "; missing=" + ",".join(sorted(missing))
+            )
     helper = getattr(unreal, "CodexMaterialToolsLibrary", None)
     if not helper or not hasattr(helper, "create_or_update_material_layer_instance"):
         _warn("  CodexMaterialTools layer instance helper missing; MYI assignment skipped")
@@ -5338,6 +5400,9 @@ def process_mesh(
             skeletal_slot_assignments[slot_index] = (slot_name, assigned_mi)
         if _assign_slot(mesh, slot_index, assigned_mi, slot_name):
             changed = True
+
+    if _sync_fbx_duplicate_material_slots(mesh, data):
+        changed = True
 
     # 이번 처리에서 새로 import 된 텍스처가 있으면 캐시 갱신
     if _normalize_skeletal_material_slots(mesh, skeletal_slot_assignments):

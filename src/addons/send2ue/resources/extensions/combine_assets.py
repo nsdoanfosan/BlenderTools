@@ -141,9 +141,10 @@ class CombineAssetsExtension(ExtensionBase):
             mesh_object_name = asset_data.get('_mesh_object_name', '')
             mesh_object = bpy.data.objects.get(mesh_object_name)
             if mesh_object and mesh_object.parent:
+                export_parent = utilities.get_combined_export_parent(mesh_object)
                 # select the child hierarchy of the mesh parent excluding socket, collision, etc.
                 utilities.select_all_children(
-                    mesh_object.parent,
+                    export_parent,
                     BlenderTypes.MESH,
                     exclude_postfix_tokens=True,
                     required_collection=bpy.data.collections.get(ToolInfo.EXPORT_COLLECTION.value),
@@ -153,19 +154,19 @@ class CombineAssetsExtension(ExtensionBase):
                 # empties, armatures, helpers, and collection instances.
                 if asset_data.get('_asset_type') == UnrealTypes.STATIC_MESH:
                     if nested_pivots.get_assembly_root(
-                        mesh_object.parent,
+                        export_parent,
                         bpy.data.collections.get(ToolInfo.EXPORT_COLLECTION.value),
                     ) is not None:
                         # Assemblies need each FBX centered on its own pivot.
                         # This per-asset flag leaves the scene option untouched.
                         self.update_asset_data({'_nested_pivot_origin': True})
                     nested_pivots.prune_nested_pivot_selection(
-                        mesh_object.parent,
+                        export_parent,
                         bpy.data.collections.get(ToolInfo.EXPORT_COLLECTION.value),
                         list(bpy.context.selected_objects),
                     )
                 # rename the asset to match the empty if this is a static mesh export
-                if mesh_object.parent.type == 'EMPTY':
+                if export_parent.type == 'EMPTY':
                     path, ext = os.path.splitext(asset_data['file_path'])
                     asset_folder = asset_data['asset_folder']
 
@@ -174,9 +175,9 @@ class CombineAssetsExtension(ExtensionBase):
                         utilities.select_asset_collisions(selected_mesh.name, properties)
 
                     self.update_asset_data({
-                        'file_path': os.path.join(os.path.dirname(path), f'{mesh_object.parent.name}{ext}'),
-                        'asset_path': f'{asset_folder}{mesh_object.parent.name}',
-                        'empty_object_name': mesh_object.parent.name
+                        'file_path': os.path.join(os.path.dirname(path), f'{export_parent.name}{ext}'),
+                        'asset_path': f'{asset_folder}{export_parent.name}',
+                        'empty_object_name': export_parent.name
                     })
 
     def pre_groom_export(self, asset_data, properties):

@@ -22,6 +22,7 @@ def signature(mesh):
     coords=np.empty(len(mesh.vertices)*3,dtype=np.float32)
     mesh.vertices.foreach_get('co',coords)
     return {'vertices':len(mesh.vertices),'polygons':len(mesh.polygons),
+            'custom_normals':mesh.has_custom_normals,
             'coords':hashlib.sha256(coords.tobytes()).hexdigest(),
             'uvs':[u.name for u in mesh.uv_layers],
             'colors':[a.name for a in mesh.color_attributes],
@@ -67,23 +68,8 @@ try:
     props.disk_groom_folder_path=str(OUT)
     bpy.context.scene.ue_unique_names.texture_export_dir=str(OUT/'textures')
     before=state()
-    # GroupPro intentionally omits its UI properties in background mode.
-    # Exercise the UI-only preflight without registering or saving preferences.
-    from types import SimpleNamespace
-    real_bpy=gp_export.bpy
-    gp_export.bpy=SimpleNamespace(data=bpy.data,context=SimpleNamespace(
-        scene=SimpleNamespace(storedGroupSettings=[SimpleNamespace(currentEmptyName='FixtureGroupBeingEdited')]))
-    )
-    try:
-        try:
-            gp_export.prepare(props)
-            raise AssertionError('Expected edited-group preflight failure')
-        except RuntimeError as error:
-            assert 'Close the edited GroupPro groups' in str(error)
-        assert state()==before and not gp_export._prepared
-        report['edited_group_guard']=True
-    finally:
-        gp_export.bpy=real_bpy
+    # Open/nested GroupPro edit sessions have their own native regression in
+    # blender_grouppro_open_export.py, including failure and Edit Mode restore.
     preview_modifier_guard.prepare()
     dg=bpy.context.evaluated_depsgraph_get()
     dg.update()
@@ -142,6 +128,10 @@ try:
     report['fbx_meshes']={o.name:signature(o.data) for o in bpy.context.scene.objects if o.type=='MESH'}
     for name in actual:
         assert name.replace('.','_') in report['fbx_meshes'],name
+    if 'Roof_Main_01' in report['fbx_meshes']:
+        assert report['fbx_meshes']['Roof_Main_01']['custom_normals']
+    if any('house_Cliff_ornament_01_low' == o.name for o in bpy.context.scene.objects):
+        assert report['fbx_meshes']['house_Cliff_ornament_01_low']['vertices']>0
     report['status']='passed'
 except BaseException:
     report['status']='failed'

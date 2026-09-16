@@ -171,6 +171,19 @@ def run_unreal_python_commands(
             if not remote_exec.has_command_connection():
                 continue
 
+            # A socket accepted during a long editor build can already be
+            # stale when the next import stage starts. Retry only a harmless
+            # readiness roundtrip, never a possibly executed asset mutation.
+            try:
+                remote_exec.run_command('None', unattended=True)
+            except Exception as error:
+                last_connection_error = error
+                try:
+                    remote_exec.close_command_connection()
+                except Exception:
+                    pass
+                continue
+
             try:
                 global unreal_response
                 unreal_response = remote_exec.run_command(

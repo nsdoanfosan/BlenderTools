@@ -642,6 +642,21 @@ def get_related_mesh_asset_data_from_groom_asset_data(groom_asset_data):
     return mesh_asset_data
 
 
+def get_combined_export_parent(mesh_object):
+    """Keep an in-scope control Empty inside its directly exported owner."""
+    parent = mesh_object.parent
+    export_collection = bpy.data.collections.get(ToolInfo.EXPORT_COLLECTION.value)
+    if not parent or parent.type != 'EMPTY' or export_collection is None:
+        return parent
+    scope = set(export_collection.all_objects)
+    ancestor = parent
+    while ancestor is not None and ancestor in scope and ancestor.type == 'EMPTY':
+        if export_collection in ancestor.users_collection:
+            return ancestor
+        ancestor = ancestor.parent
+    return parent
+
+
 def get_unique_parent_mesh_objects(rig_objects, mesh_objects):
     """
     Gets only meshes that have a unique same armature parent.
@@ -655,11 +670,12 @@ def get_unique_parent_mesh_objects(rig_objects, mesh_objects):
     unique_parent_empties = []
     meshes_with_unique_parents = []
     for mesh_object in mesh_objects:
+        export_parent = get_combined_export_parent(mesh_object)
         if mesh_object.parent:
             # for static meshes it combines by empty
-            if mesh_object.parent.type == 'EMPTY' and mesh_object.parent not in unique_parent_empties:
+            if export_parent.type == 'EMPTY' and export_parent not in unique_parent_empties:
                 meshes_with_unique_parents.append(mesh_object)
-                unique_parent_empties.append(mesh_object.parent)
+                unique_parent_empties.append(export_parent)
 
             # for skeletal meshes it combines by armature
             if mesh_object.parent.type == 'ARMATURE' and (
@@ -1221,7 +1237,8 @@ def sync_unreal_mesh_folder_path(*args):
     ...\\Forestportfolio\\00_common\\prop\\foo.blend -> /Game/Meshes/00_common/prop/
 
     Runs on file load (via setup_project) and after save, so a "Save As" into a new folder
-    updates the path too. Files outside the anchor folder are left untouched.
+    updates the path too. Files outside the anchor folder and scenes with
+    auto_sync_unreal_mesh_folder disabled are left untouched.
 
     :param args: This soaks up the extra arguments for the app handler.
     """
@@ -1258,6 +1275,8 @@ def sync_unreal_mesh_folder_path(*args):
     try:
         for scene in bpy.data.scenes:
             scene_properties = getattr(scene, ToolInfo.NAME.value, None)
+            if scene_properties and not getattr(scene_properties, 'auto_sync_unreal_mesh_folder', True):
+                continue
             # only assign when the value actually changes, so repeated saves of the same file
             # don't re-run the update callback at all
             if scene_properties and scene_properties.unreal_mesh_folder_path != unreal_path:

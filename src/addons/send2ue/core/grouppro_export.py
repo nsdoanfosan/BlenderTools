@@ -8,7 +8,7 @@ expose the equivalent GroupPro Mesh representation only during an export.
 import sys
 import bpy
 
-from . import utilities
+from . import utilities, grouppro_edit_export
 from ..constants import ToolInfo
 
 
@@ -30,10 +30,7 @@ def prepare(properties):
     export = bpy.data.collections.get(ToolInfo.EXPORT_COLLECTION.value)
     if export is None or not properties.import_meshes:
         return
-    editing = getattr(bpy.context.scene, 'storedGroupSettings', ())
-    if editing:
-        raise RuntimeError('Close the edited GroupPro groups before sending to Unreal: '
-                           + ', '.join(item.currentEmptyName for item in editing))
+    prepare_edits(properties)
     sources = [obj for obj in export.all_objects
                if obj.type == 'EMPTY' and obj.instance_collection
                and obj.modifiers.get('GPro_RealizeAndProxy')
@@ -82,8 +79,6 @@ def prepare(properties):
 
 
 def cleanup():
-    if not _prepared:
-        return
     while _prepared:
         state = _prepared.pop()
         proxy = state['proxy']
@@ -93,3 +88,14 @@ def cleanup():
         source.name = state['name']
         source.hide_set(state['hidden'])
     bpy.context.view_layer.update()
+    grouppro_edit_export.cleanup()
+
+
+def prepare_edits(properties):
+    if not properties.import_meshes or not bpy.data.collections.get(ToolInfo.EXPORT_COLLECTION.value):
+        return
+    if getattr(bpy.context.scene, 'storedGroupSettings', ()):
+        gp = _provider()
+        if gp is None:
+            raise RuntimeError('Enable GroupPro before exporting its edited groups.')
+        grouppro_edit_export.prepare(gp)

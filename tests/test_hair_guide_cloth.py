@@ -101,6 +101,34 @@ class GuidePolicyTests(unittest.TestCase):
         self.assertNotIn('sim_asset_path', record)
         self.assertNotIn('sim_fbx', record)
 
+    def test_whole_static_guide_uses_ordinary_render_before_ownership_validation(self):
+        for raw in (None, [0., 0., 0.], [-.1, 0., 0.]):
+            with self.subTest(raw=raw):
+                guide, source = Mock(), Mock()
+                guide.name, source.name = 'ActualGuide', 'Render'
+                gm = SimpleNamespace(vertices=[None] * 3, attributes={}, users=0)
+                if raw is not None:
+                    gm.attributes['ChaosWeight'] = SimpleNamespace(domain='POINT', data_type='FLOAT',
+                        data=[SimpleNamespace(value=w) for w in raw])
+                self.bpy.context.scene = SimpleNamespace(collection=SimpleNamespace(objects=Mock()))
+                self.bpy.data.objects = Mock()
+                self.bpy.data.meshes = Mock()
+                search = {'status': 'resolved', 'guide': guide.name, 'search_stages': ['all stages']}
+                self.api.find_guide = Mock(return_value=(guide, [], search))
+                self.api._stamp_group = Mock(return_value=SimpleNamespace(users=1))
+                self.api._copy_mesh = Mock(return_value=gm)
+                render_only = self.api._capture_render_only = Mock(return_value='ordinary render')
+                with patch.dict(sys.modules, {'producer_fixture': SimpleNamespace(hair_tool_export=Mock())}):
+                    self.assertEqual(self.api.capture_source(source, {}), 'ordinary render')
+                self.api._copy_mesh.assert_called_once_with(guide.copy.return_value)
+                receipt = render_only.call_args.args[2]
+                self.assertEqual(receipt['status'], 'guide_weights_all_zero')
+                self.assertEqual(receipt['guide'], 'ActualGuide')
+                self.assertEqual(receipt['guide_search_status'], 'resolved')
+                self.assertEqual(receipt['excluded_sim_vertices'], 3)
+                self.assertEqual(receipt['authored_weight_present'], raw is not None)
+                self.assertFalse(self.api.state()['diagnostics'])
+
     def test_mixed_record_keeps_guided_sim_and_full_render_exports(self):
         package = {'packet': {'simulation_enabled': True}, 'manifest_path': 'fixture.json',
                    'manifest_sha256': 'abc', 'exports': {
