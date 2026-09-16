@@ -1728,6 +1728,11 @@ def _set_nanite(
     voxel_opacity=None,
 ) -> bool:
     """Set mesh Nanite settings. Returns True when any value changed."""
+    # The material post-import pass must not undo the importer's morph guard.
+    # UE 5.8 skeletal Nanite currently suppresses these deformations.
+    if _is_skeletal_mesh(mesh) and mesh.get_editor_property("morph_targets"):
+        enabled = False
+        _log("  Skeletal morph targets detected: using classic skinned rendering")
     nanite = mesh.get_editor_property("nanite_settings")
     changed = False
     if bool(nanite.get_editor_property("enabled")) != enabled:

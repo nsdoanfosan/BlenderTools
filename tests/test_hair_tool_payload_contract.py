@@ -71,11 +71,14 @@ class FakeAsset:
     def __init__(self):
         self.nanite_settings = FakeNaniteSettings()
         self.notified = False
+        self.morph_targets = []
 
     def get_class(self):
         return FakeClass()
 
     def get_editor_property(self, name):
+        if name == "morph_targets":
+            return self.morph_targets
         if name == "nanite_settings":
             return self.nanite_settings
         raise KeyError(name)
@@ -177,6 +180,32 @@ class TestHairToolPayloadContract(unittest.TestCase):
         self.importer.ensure_hair_tool_nanite(["/Game/Test/SK_Hair"])
         self.assertTrue(self.asset.nanite_settings.enabled)
         self.assertTrue(self.asset.notified)
+
+    def test_morph_import_overrides_hair_nanite_and_is_idempotent(self):
+        self.asset.morph_targets = ["Eye_Blink_L"]
+        self.asset.nanite_settings.enabled = True
+        saved = []
+        fake_unreal.EditorAssetLibrary = types.SimpleNamespace(
+            save_loaded_asset=lambda mesh: saved.append(mesh) or True)
+        self.importer.ensure_hair_tool_nanite(["/Game/Test/SK_Hair"])
+        self.importer.ensure_hair_tool_nanite(["/Game/Test/SK_Hair"])
+        self.assertFalse(self.asset.nanite_settings.enabled)
+        self.assertEqual(saved, [self.asset])
+
+    def test_non_hair_morph_import_is_also_protected(self):
+        self.importer._asset_data.pop("_hair_tool_payload")
+        self.asset.morph_targets = ["Expression"]
+        self.asset.nanite_settings.enabled = True
+        fake_unreal.EditorAssetLibrary = types.SimpleNamespace(save_loaded_asset=lambda mesh: True)
+        self.importer.ensure_hair_tool_nanite(["/Game/Test/Face"])
+        self.assertFalse(self.asset.nanite_settings.enabled)
+
+    def test_morph_guard_save_failure_is_not_reported_as_success(self):
+        self.asset.morph_targets = ["Eye_Blink_L"]
+        self.asset.nanite_settings.enabled = True
+        fake_unreal.EditorAssetLibrary = types.SimpleNamespace(save_loaded_asset=lambda mesh: False)
+        with self.assertRaisesRegex(RuntimeError, "Morph-safe import failed"):
+            self.importer.ensure_hair_tool_nanite(["/Game/Test/SK_Hair"])
 
     def test_enables_full_precision_uvs_for_packed_random_depth(self):
         self.importer.ensure_hair_tool_uv_precision(["/Game/Test/SK_Hair"])
