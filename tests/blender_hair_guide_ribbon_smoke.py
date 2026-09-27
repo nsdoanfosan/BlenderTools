@@ -24,6 +24,21 @@ assert addon_utils.enable('send2ue', default_set=False)
 from send2ue.core import hair_guide_cloth as cloth, hair_guide_ribbon as ribbon
 from send2ue.core import hair_tool_export as hair
 
+# A per-guide decision must survive an unrelated scene-wide export default.
+cloth.settings().simulation_mesh_mode = 'RIBBON'
+assert cloth.simulation_mode(None) == 'RIBBON'
+override_guide = bpy.data.objects.new('ProfilePolicyFixture', None)
+override_guide[cloth.SIMULATION_MODE_OVERRIDE] = 'ORIGINAL'
+assert cloth.simulation_mode(override_guide) == 'ORIGINAL'
+override_guide[cloth.SIMULATION_MODE_OVERRIDE] = 'invalid'
+try:
+    cloth.simulation_mode(override_guide)
+except ValueError:
+    pass
+else:
+    raise AssertionError('Invalid per-guide export policy was accepted')
+bpy.data.objects.remove(override_guide)
+
 parser = argparse.ArgumentParser()
 parser.add_argument('--hair-library', type=Path, default=Path(bpy.utils.user_resource('SCRIPTS')) /
                     'addons/hair_tool/hair_baking/hsystem_nodes_lib_5.2.blend')
@@ -286,6 +301,10 @@ original, converted, owners, converted_owners, original_receipt = run_plan(guide
 assert converted is original and converted_owners == owners
 assert original_receipt['effective_mode'] == 'ORIGINAL'
 assert geometry(original) == baseline_geometry
+assert original_receipt['status'] == 'original_profile_verified'
+assert set(original_receipt['native_island_to_spline'].values()) == {0, 1, 2}
+assert original_receipt['simulation_counts']['vertices'] == len(original.vertices)
+assert original_receipt['verification_ribbon_counts']['vertices'] * 2 == len(original.vertices)
 dispose_mesh(original)
 
 # Already planar Hair Tool input stays planar and is not regenerated.
