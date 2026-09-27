@@ -308,15 +308,6 @@ class RibbonPlan:
             bpy.context.view_layer.update()
             mesh = copy_mesh(obj)
             owners, validation = validate_pair(original_mesh, mesh, native_islands, own_weights)
-            if self.receipt['requested_mode'] == 'ORIGINAL':
-                # Keep the authored profile, but retain independently verified
-                # curve/sample identity for refreshing an existing cloth graph.
-                # The temporary ribbon is only a lineage check in this mode.
-                self.receipt.update(validation, effective_mode='ORIGINAL',
-                    status='original_profile_verified', fallback_reason=None,
-                    verification_ribbon_counts=validation['simulation_counts'],
-                    simulation_counts=_counts(original_mesh))
-                return original_mesh, native_islands, self.receipt
             self.receipt.update(validation, effective_mode='RIBBON', status='converted', fallback_reason=None)
             result, mesh = mesh, None
             return result, owners, self.receipt
@@ -336,7 +327,10 @@ class RibbonPlan:
 def prepare(guide_copy, requested_mode='RIBBON'):
     """Prepare stamps on a disposable guide; keep the original profile shape."""
     plan = RibbonPlan(guide_copy, requested_mode)
-    if requested_mode not in {'RIBBON', 'ORIGINAL'}:
+    if requested_mode == 'ORIGINAL':
+        plan.receipt['status'] = 'original_requested'
+        return plan
+    if requested_mode != 'RIBBON':
         plan.fallback('Unsupported simulation mesh mode: ' + str(requested_mode))
         return plan
     try:

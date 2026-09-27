@@ -236,19 +236,6 @@ def _capture_render_only(source, export_state, search, include_system_ao, ao_set
         'source': {**search, 'simulation_enabled': False}, 'simulation_enabled': False}
 
 
-SIMULATION_MODE_OVERRIDE = 'send2ue_hair_simulation_shape'
-
-
-def simulation_mode(guide):
-    """Keep a validated guide profile when the scene default serves other hair."""
-    mode = guide.get(SIMULATION_MODE_OVERRIDE) if guide else None
-    if mode is None:
-        mode = getattr(settings(), 'simulation_mesh_mode', 'RIBBON')
-    if mode not in {'RIBBON', 'ORIGINAL'}:
-        raise ValueError('Invalid simulation guide shape override: ' + repr(mode))
-    return mode
-
-
 def capture_source(source, export_state, include_system_ao=False, ao_settings=None):
     """Return (temporary render parts, physical source packet), or defer safely."""
     from . import hair_tool_export as hair
@@ -278,7 +265,7 @@ def capture_source(source, export_state, include_system_ao=False, ao_settings=No
                 'status': 'guide_weights_all_zero', 'guide_search_status': search['status'],
                 'excluded_sim_vertices': len(original_guide_mesh.vertices),
                 'simulation_mesh': {'version': 'send2ue.guide_ribbon.v1',
-                    'requested_mode': simulation_mode(guide),
+                    'requested_mode': getattr(settings(), 'simulation_mesh_mode', 'RIBBON'),
                     'effective_mode': 'ORIGINAL', 'status': 'source_all_zero',
                     'fallback_reason': None, 'simulation_counts': {'vertices': 0, 'triangles': 0}}}
             return _capture_render_only(source, export_state, static_source, include_system_ao, ao_settings)
@@ -290,7 +277,8 @@ def capture_source(source, export_state, include_system_ao=False, ao_settings=No
         copies.append(render_copy)
         if guide:
             from . import hair_guide_ribbon as ribbon
-            ribbon_plan = ribbon.prepare(guide_copy, simulation_mode(guide))
+            ribbon_plan = ribbon.prepare(guide_copy,
+                getattr(settings(), 'simulation_mesh_mode', 'RIBBON'))
             group = _stamp_group()
             stamp = guide_copy.modifiers.new('Send2UE Export Ownership', 'NODES')
             stamp.node_group = group
