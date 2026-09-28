@@ -476,7 +476,6 @@ OPACITY_ALPHA_COVERAGE_THRESHOLD = 0.3333
 # import 되는 StaticMesh 를 자동으로 Nanite 로 등록할지(반투명 머티리얼 메쉬는 자동 제외).
 ENABLE_NANITE = True
 ENABLE_SKELETAL_NANITE_VOXELIZE = True
-ENABLE_HAIR_NANITE_VOXEL_OPACITY = True
 DYNAMIC_WIND_JSON_SUFFIX = "_dynamic_wind_import_from_megaplant_groups.json"
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -2051,6 +2050,30 @@ def _uses_verified_hair_uv_payload(data: dict, mesh_path: str) -> bool:
         ):
             return True
     return False
+
+
+def _set_skeletal_material_nanite(mesh, data, mesh_path):
+    """Material assignment must preserve artist-authored hair Nanite settings."""
+    uses_hair = any(
+        _master_preset(data, entry, mesh_path).get("key") == "hair"
+        for entry in (data or {}).get("materials", [])
+        if isinstance(entry, dict)
+    )
+    enabled = not _is_translucent(data)
+    if uses_hair:
+        enabled = enabled and bool(
+            mesh.get_editor_property("nanite_settings").get_editor_property("enabled")
+        )
+        # UV payload tags describe vertex data, not permission to voxelize it.
+        # Keep None/PreserveArea/Voxelize, NDF, opacity and artist-disabled Nanite.
+        return _set_nanite(mesh, enabled)
+    voxelize = (
+        _nanite_shape_preservation_voxelize()
+        if ENABLE_SKELETAL_NANITE_VOXELIZE
+        and _uses_tree_material_preset(data, mesh_path)
+        else None
+    )
+    return _set_nanite(mesh, enabled, voxelize)
 
 
 def _load_master_material(preset: dict):
@@ -5125,24 +5148,7 @@ def process_mesh(
         if isinstance(mesh, unreal.StaticMesh) and _set_nanite(mesh, nanite_enabled):
             save_mesh_asset()
         elif _is_skeletal_mesh(mesh):
-            uses_tree_voxelize = _uses_tree_material_preset(data, mesh_path)
-            uses_hair_voxel_opacity = (
-                ENABLE_HAIR_NANITE_VOXEL_OPACITY
-                and _uses_verified_hair_uv_payload(data, mesh_path)
-            )
-            voxelize = (
-                _nanite_shape_preservation_voxelize()
-                if ENABLE_SKELETAL_NANITE_VOXELIZE
-                and (uses_tree_voxelize or uses_hair_voxel_opacity)
-                else None
-            )
-            if _set_nanite(
-                mesh,
-                nanite_enabled,
-                voxelize,
-                voxel_ndf=True if uses_hair_voxel_opacity else None,
-                voxel_opacity=True if uses_hair_voxel_opacity else None,
-            ):
+            if _set_skeletal_material_nanite(mesh, data, mesh_path):
                 save_mesh_asset()
 
     if data is None:

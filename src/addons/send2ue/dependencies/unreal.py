@@ -993,6 +993,15 @@ class UnrealImportAsset(Unreal):
             # Reimports must preserve facial deformation, even when a preset or
             # the hair payload requests Nanite. New assets are checked after import.
             existing = unreal.load_asset(self._asset_data.get('asset_path', ''))
+            self._hair_nanite_before = None
+            if (hair_payload and existing
+                    and existing.get_class().get_name() == 'SkeletalMesh'):
+                self._hair_nanite_before = existing.get_editor_property('nanite_settings').copy()
+                try:
+                    import_data.set_editor_property(
+                        'build_nanite', self._hair_nanite_before.get_editor_property('enabled'))
+                except Exception:
+                    pass  # Restored and verified after legacy FBX import below.
             if (existing and existing.get_class().get_name() == 'SkeletalMesh'
                     and existing.get_editor_property('morph_targets')):
                 try:
@@ -1025,7 +1034,7 @@ class UnrealImportAsset(Unreal):
         return meshes
 
     def ensure_hair_tool_nanite(self, imported_object_paths):
-        """Preserve morph rendering for all skeletal imports; enable Nanite for rigid hair."""
+        """Preserve existing hair settings; new rigid hair may enable Nanite."""
         for asset_path, mesh in self._imported_skeletal_meshes(imported_object_paths):
             # UE 5.8 skeletal Nanite skips the morph deformation demonstrated by
             # the blink regression. Inspect real imported data, not mesh names.
@@ -1033,9 +1042,19 @@ class UnrealImportAsset(Unreal):
             if not has_morphs and not self._asset_data.get('_hair_tool_payload'):
                 continue
             enabled = not has_morphs
+            prior = getattr(self, '_hair_nanite_before', None)
+            if str(asset_path).split('.', 1)[0] != str(self._asset_data.get('asset_path', '')).split('.', 1)[0]:
+                prior = None
             try:
                 settings = mesh.get_editor_property('nanite_settings')
-                if bool(settings.get_editor_property('enabled')) == enabled:
+                if prior is not None:
+                    enabled = not has_morphs and bool(prior.get_editor_property('enabled'))
+                    restored = prior.copy()
+                    restored.set_editor_property('enabled', enabled)
+                    if settings.export_text() == restored.export_text():
+                        continue
+                    settings = restored
+                elif bool(settings.get_editor_property('enabled')) == enabled:
                     continue
                 settings.set_editor_property('enabled', enabled)
                 mesh.set_editor_property('nanite_settings', settings)
@@ -1051,15 +1070,15 @@ class UnrealImportAsset(Unreal):
                     except Exception:
                         pass
                     break
-                if has_morphs:
+                if has_morphs or prior is not None:
                     if not unreal.EditorAssetLibrary.save_loaded_asset(mesh):
-                        raise RuntimeError('Could not persist morph-safe Nanite settings')
-                    unreal.log(f'Skeletal Nanite disabled to preserve morph targets: "{asset_path}".')
+                        raise RuntimeError('Could not persist preserved Nanite settings')
+                    unreal.log(f'Skeletal Nanite settings preserved (morph guard={has_morphs}): "{asset_path}".')
                 else:
                     unreal.log(f'Hair Tool Skeletal Nanite enabled after import: "{asset_path}".')
             except Exception as error:
-                if has_morphs:
-                    raise RuntimeError(f'Morph-safe import failed for "{asset_path}": {error}') from error
+                if has_morphs or prior is not None:
+                    raise RuntimeError(f'Morph-safe import failed / Nanite preservation failed for "{asset_path}": {error}') from error
                 unreal.log_warning(
                     f'Hair Tool Skeletal Nanite could not be enabled for '
                     f'"{asset_path}": {error}. Import remains successful.'

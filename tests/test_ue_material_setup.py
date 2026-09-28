@@ -2409,6 +2409,28 @@ class TestVerifiedHairNaniteSettings(unittest.TestCase):
         self.assertTrue(mesh.nanite_settings.properties["voxel_opacity"])
         self.assertTrue(mesh.notified)
 
+    def test_hair_material_handoff_preserves_all_artist_nanite_settings(self):
+        for enabled in (False, True):
+            for shape in ("NONE", "PRESERVE_AREA", "VOXELIZE"):
+                with self.subTest(enabled=enabled, shape=shape):
+                    mesh = FakeNaniteMesh()
+                    mesh.nanite_settings.properties.update(
+                        enabled=enabled, shape_preservation=shape,
+                        voxel_ndf=False, voxel_opacity=True, max_edge_length_factor=0.5)
+                    before = dict(mesh.nanite_settings.properties)
+                    for _ in range(2):
+                        self.assertFalse(self.module._set_skeletal_material_nanite(
+                            mesh, self.tagged_hair_data(), "/Game/Meshes/Hair_Ornament"))
+                    self.assertEqual(mesh.nanite_settings.properties, before)
+                    self.assertFalse(mesh.notified)
+
+    def test_tree_material_handoff_retains_voxelize_policy(self):
+        mesh = FakeNaniteMesh()
+        self.module._nanite_shape_preservation_voxelize = lambda: "VOXELIZE"
+        self.assertTrue(self.module._set_skeletal_material_nanite(
+            mesh, {"materials": [{"name": "M_Tree", "master_preset": "tree"}]}, "/Game/Tree"))
+        self.assertEqual(mesh.nanite_settings.properties["shape_preservation"], "VOXELIZE")
+
 
     def test_material_pass_cannot_reenable_nanite_for_morph_mesh(self):
         mesh = FakeNaniteMesh()
