@@ -24,6 +24,19 @@ class FakeClass:
 class FakeNaniteSettings:
     def __init__(self, enabled=False):
         self.enabled = enabled
+        self.shape_preservation = "NONE"
+        self.max_edge_length_factor = 0.75
+
+    def copy(self):
+        value = FakeNaniteSettings()
+        value.__dict__.update(self.__dict__)
+        return value
+
+    def __eq__(self, other):
+        return isinstance(other, FakeNaniteSettings) and self.__dict__ == other.__dict__
+
+    def export_text(self):
+        return repr(sorted(self.__dict__.items()))
 
     def get_editor_property(self, name):
         if name == "enabled":
@@ -71,11 +84,14 @@ class FakeAsset:
     def __init__(self):
         self.nanite_settings = FakeNaniteSettings()
         self.notified = False
+        self.morph_targets = []
 
     def get_class(self):
         return FakeClass()
 
     def get_editor_property(self, name):
+        if name == "morph_targets":
+            return self.morph_targets
         if name == "nanite_settings":
             return self.nanite_settings
         raise KeyError(name)
@@ -177,6 +193,86 @@ class TestHairToolPayloadContract(unittest.TestCase):
         self.importer.ensure_hair_tool_nanite(["/Game/Test/SK_Hair"])
         self.assertTrue(self.asset.nanite_settings.enabled)
         self.assertTrue(self.asset.notified)
+
+    def test_import_options_snapshot_existing_settings_instead_of_enabling_hair(self):
+        self.asset.nanite_settings.enabled = False
+        self.asset.nanite_settings.shape_preservation = "PRESERVE_AREA"
+        self.importer._asset_data['_asset_type'] = 'SkeletalMesh'
+        self.importer._property_data = {'unreal': {'import_method': {'fbx': {'skeletal_mesh_import_data': {}}}}}
+        self.importer.set_skeleton = lambda: None
+        self.importer.set_physics_asset = lambda: None
+        self.importer.set_settings = lambda *args: None
+        self.importer._options = types.SimpleNamespace(skeletal_mesh_import_data=types.SimpleNamespace())
+        fake_unreal.FBXImportType = types.SimpleNamespace(FBXIT_SKELETAL_MESH='skeletal')
+        fake_unreal.VertexColorImportOption = types.SimpleNamespace(REPLACE='replace')
+        values = {}
+        fake_unreal.FbxSkeletalMeshImportData = lambda: types.SimpleNamespace(set_editor_property=lambda k,v: values.update({k:v}))
+        self.importer.set_skeletal_mesh_import_options()
+        self.assertFalse(values['build_nanite'])
+        self.asset.nanite_settings.shape_preservation = "VOXELIZE"
+        self.assertEqual(self.importer._hair_nanite_before.shape_preservation, "PRESERVE_AREA")
+
+    def test_reimport_restores_full_artist_settings_and_repeated_pass_is_noop(self):
+        for enabled in (False, True):
+            for shape in ("NONE", "PRESERVE_AREA", "VOXELIZE"):
+                with self.subTest(enabled=enabled, shape=shape):
+                    prior = FakeNaniteSettings(enabled)
+                    prior.shape_preservation = shape
+                    prior.max_edge_length_factor = 0.5
+                    self.importer._hair_nanite_before = prior.copy()
+                    self.asset.nanite_settings = FakeNaniteSettings(True)
+                    self.asset.nanite_settings.shape_preservation = "VOXELIZE"
+                    saved = []
+                    fake_unreal.EditorAssetLibrary = types.SimpleNamespace(
+                        save_loaded_asset=lambda mesh: saved.append(mesh) or True)
+                    self.importer.ensure_hair_tool_nanite(["/Game/Test/SK_Hair.SK_Hair"])
+                    self.assertEqual(self.asset.nanite_settings, prior)
+                    self.importer.ensure_hair_tool_nanite(["/Game/Test/SK_Hair"])
+                    self.assertEqual(saved, [self.asset])
+
+    def test_new_morphs_override_preserved_nanite_enabled_without_losing_shape(self):
+        prior = FakeNaniteSettings(True)
+        prior.shape_preservation = "PRESERVE_AREA"
+        self.importer._hair_nanite_before = prior.copy()
+        self.asset.morph_targets = ["Blink"]
+        fake_unreal.EditorAssetLibrary = types.SimpleNamespace(save_loaded_asset=lambda mesh: True)
+        self.importer.ensure_hair_tool_nanite(["/Game/Test/SK_Hair"])
+        self.assertFalse(self.asset.nanite_settings.enabled)
+        self.assertEqual(self.asset.nanite_settings.shape_preservation, "PRESERVE_AREA")
+        self.assertTrue(prior.enabled)
+
+    def test_preservation_save_failure_cannot_report_success(self):
+        self.importer._hair_nanite_before = FakeNaniteSettings(False)
+        self.asset.nanite_settings.enabled = True
+        fake_unreal.EditorAssetLibrary = types.SimpleNamespace(save_loaded_asset=lambda mesh: False)
+        with self.assertRaisesRegex(RuntimeError, "Nanite preservation failed"):
+            self.importer.ensure_hair_tool_nanite(["/Game/Test/SK_Hair"])
+
+    def test_morph_import_overrides_hair_nanite_and_is_idempotent(self):
+        self.asset.morph_targets = ["Eye_Blink_L"]
+        self.asset.nanite_settings.enabled = True
+        saved = []
+        fake_unreal.EditorAssetLibrary = types.SimpleNamespace(
+            save_loaded_asset=lambda mesh: saved.append(mesh) or True)
+        self.importer.ensure_hair_tool_nanite(["/Game/Test/SK_Hair"])
+        self.importer.ensure_hair_tool_nanite(["/Game/Test/SK_Hair"])
+        self.assertFalse(self.asset.nanite_settings.enabled)
+        self.assertEqual(saved, [self.asset])
+
+    def test_non_hair_morph_import_is_also_protected(self):
+        self.importer._asset_data.pop("_hair_tool_payload")
+        self.asset.morph_targets = ["Expression"]
+        self.asset.nanite_settings.enabled = True
+        fake_unreal.EditorAssetLibrary = types.SimpleNamespace(save_loaded_asset=lambda mesh: True)
+        self.importer.ensure_hair_tool_nanite(["/Game/Test/Face"])
+        self.assertFalse(self.asset.nanite_settings.enabled)
+
+    def test_morph_guard_save_failure_is_not_reported_as_success(self):
+        self.asset.morph_targets = ["Eye_Blink_L"]
+        self.asset.nanite_settings.enabled = True
+        fake_unreal.EditorAssetLibrary = types.SimpleNamespace(save_loaded_asset=lambda mesh: False)
+        with self.assertRaisesRegex(RuntimeError, "Morph-safe import failed"):
+            self.importer.ensure_hair_tool_nanite(["/Game/Test/SK_Hair"])
 
     def test_enables_full_precision_uvs_for_packed_random_depth(self):
         self.importer.ensure_hair_tool_uv_precision(["/Game/Test/SK_Hair"])
