@@ -402,7 +402,8 @@ class TestFailedOperatorCleanup(unittest.TestCase):
         operator_node = next(node for node in tree.body
                              if isinstance(node, ast.ClassDef) and node.name == 'Send2Ue')
         bpy = types.SimpleNamespace(types=types.SimpleNamespace(
-            Operator=object, STATUSBAR_HT_header=mock.Mock()), context=mock.Mock())
+            Operator=object, STATUSBAR_HT_header=mock.Mock()), context=mock.Mock(),
+            props=types.SimpleNamespace(StringProperty=lambda **kwargs: None))
         namespace = {'bpy': bpy, 'os': os, 'unreal': UNREAL, 'utilities': mock.Mock()}
         exec(compile(ast.Module(body=[operator_node], type_ignores=[]), str(path), 'exec'), namespace)
         operator = object.__new__(namespace['Send2Ue'])

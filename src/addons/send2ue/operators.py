@@ -18,6 +18,7 @@ from .core import (
 )
 from .ui import file_browser, dialog, addon_preferences
 from .dependencies import unreal
+from . import coordination
 from .dependencies.rpc import blender_server
 from .properties import register_scene_properties, unregister_scene_properties
 from . import __package__ as base_package
@@ -27,6 +28,7 @@ class Send2Ue(bpy.types.Operator):
     """Push your assets to disk and/or an open unreal editor instance"""
     bl_idname = "wm.send2ue"
     bl_label = "Push Assets"
+    workstation_phase_id: bpy.props.StringProperty(default='', options={'HIDDEN', 'SKIP_SAVE'})
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -35,6 +37,7 @@ class Send2Ue(bpy.types.Operator):
         self.done = False
         self.max_step = 0
         self.state = {}
+        self._wq_operation = None
 
         # add execution queue
         execution_queue = bpy.app.driver_namespace.get(ToolInfo.EXECUTION_QUEUE.value)
@@ -55,11 +58,24 @@ class Send2Ue(bpy.types.Operator):
 
         if event.type == 'ESC':
             self.escape = True
+            operation = getattr(self, '_wq_operation', None)
+            if operation is not None:
+                operation.fail('Native Send2UE was cancelled; confirm the editor stopped before releasing the work phase')
+                self._wq_operation = None
             # clears the queue in a thread safe manner
             with self.execution_queue.mutex:
                 self.execution_queue.queue.clear()
 
         if event.type == 'TIMER':
+            operation = getattr(self, '_wq_operation', None)
+            if operation is not None:
+                try:
+                    operation.check()
+                    operation.heartbeat()
+                except Exception as error:
+                    self.escape_operation(context, error=error)
+                    self.report({'ERROR'}, str(error))
+                    return {'CANCELLED'}
             if not self.execution_queue.empty():
                 try:
                     function, args, kwargs, message, asset_id, attribute = self.execution_queue.get()
@@ -90,7 +106,18 @@ class Send2Ue(bpy.types.Operator):
                 bpy.types.STATUSBAR_HT_header.remove(self.draw_progress)
                 context.window_manager.event_timer_remove(self.timer)
                 bpy.context.workspace.status_text_set_internal(None)
-                self.post_operation()
+                try:
+                    # Cancellation cleanup must not launch more remote mutations.
+                    if getattr(self, '_wq_operation', None) is None and getattr(self, 'workstation_phase_id', ''):
+                        with unreal.record_commands():
+                            self.post_operation()
+                    else:
+                        self.post_operation()
+                    self._complete_coordinated()
+                except Exception as error:
+                    self._fail_coordinated(error)
+                    self.report({'ERROR'}, str(error))
+                    return {'CANCELLED'}
                 return {'FINISHED'}
 
             if self.done:
@@ -101,7 +128,14 @@ class Send2Ue(bpy.types.Operator):
         return {'RUNNING_MODAL'}
 
     def invoke(self, context, event):
-        if utilities.is_unreal_connected():
+        try:
+            self._begin_coordinated(context)
+            connected = utilities.is_unreal_connected()
+        except Exception as error:
+            self._fail_coordinated(error)
+            self.report({'ERROR'}, str(error))
+            return {'CANCELLED'}
+        if connected:
             properties = bpy.context.scene.send2ue
             # run the full send to unreal operation which queues all the jobs
             try:
@@ -110,6 +144,7 @@ class Send2Ue(bpy.types.Operator):
                 context.window_manager.send2ue.progress = 0
                 bpy.context.workspace.status_text_set_internal('Validating...')
                 export.send2ue(properties)
+                self._validate_coordinated_jobs(properties)
             # if validations fail
             except Exception as error:
                 self.escape_operation(context, error=error)
@@ -129,24 +164,67 @@ class Send2Ue(bpy.types.Operator):
 
             return {'RUNNING_MODAL'}
         else:
+            self._fail_coordinated('Unreal connection was unavailable; native Send2UE did not complete')
             return {'FINISHED'}
 
     def execute(self, context):
-        if utilities.is_unreal_connected():
+        try:
+            self._begin_coordinated(context)
+            connected = utilities.is_unreal_connected()
+        except BaseException as error:
+            self._fail_coordinated(error)
+            raise
+        if connected:
             properties = bpy.context.scene.send2ue
             try:
                 self.pre_operation()
                 self.execution_queue.queue.clear()
                 export.send2ue(properties)
+                self._validate_coordinated_jobs(properties)
                 while not self.execution_queue.empty():
+                    operation = getattr(self, '_wq_operation', None)
+                    if operation is not None:
+                        operation.check()
+                        operation.heartbeat()
                     function, args, kwargs, message, asset_id, attribute = self.execution_queue.get()
                     context.window_manager.send2ue.asset_id = asset_id
                     function(*args, **kwargs)
+                self.post_operation()
+                self._complete_coordinated()
             except BaseException as error:
                 self.escape_operation(context, error=error)
                 raise
-            self.post_operation()
+        else:
+            self._fail_coordinated('Unreal connection was unavailable; native Send2UE did not complete')
         return {'FINISHED'}
+
+    def _begin_coordinated(self, context):
+        self._wq_operation = coordination.begin_operation(
+            getattr(self, 'workstation_phase_id', ''), bpy.app.driver_namespace,
+            str(bpy.data.filepath or ''),
+        )
+        coordination.require_preparation_scopes(bpy.context.scene.send2ue)
+
+    def _validate_coordinated_jobs(self, properties):
+        if getattr(self, '_wq_operation', None) is not None:
+            if properties.path_mode == 'send_to_disk' or self.execution_queue.empty():
+                raise RuntimeError('The coordinated Send2UE request produced no native Unreal import jobs')
+
+    def _complete_coordinated(self):
+        operation = getattr(self, '_wq_operation', None)
+        if operation is not None:
+            if not getattr(operation, 'imported_count', 0):
+                raise RuntimeError('No native Unreal import result was verified for this coordinated request')
+            operation.complete()
+            self._wq_operation = None
+
+    def _fail_coordinated(self, note):
+        operation = getattr(self, '_wq_operation', None)
+        if operation is not None:
+            try:
+                operation.fail(note)
+            finally:
+                self._wq_operation = None
 
     def escape_operation(self, context, error=None):
         self.escape = True
@@ -159,11 +237,14 @@ class Send2Ue(bpy.types.Operator):
             self.timer = None
         bpy.context.workspace.status_text_set_internal(None)
         context.window_manager.progress_end()
-        if isinstance(error, (ConnectionError, TimeoutError)):
+        if isinstance(error, (ConnectionError, TimeoutError)) or getattr(self, '_wq_operation', None) is not None:
             # Run local extension cleanup, but do not reconnect to a lost editor
             # for post-operation saves. Recorded commands are deliberately discarded.
-            with unreal.record_commands():
-                self.post_operation()
+            try:
+                with unreal.record_commands():
+                    self.post_operation()
+            finally:
+                self._fail_coordinated(error or 'Native Send2UE did not complete')
         else:
             self.post_operation()
         return {'FINISHED'}
@@ -215,19 +296,19 @@ class Send2Ue(bpy.types.Operator):
         # Remove export-only Hair Tool meshes before restoring the user's context.
         hair_tool_export.cleanup()
 
-        # run the post export extensions
-        extension.run_extension_tasks(ExtensionTasks.POST_OPERATION.value)
-
-        # repack the unpacked files
-        utilities.remove_unpacked_files(self.state.get('unpacked_files', {}))
-
-        # restore the previous state of the scene and its objects
-        utilities.set_context(self.state.get('context', {}))
-
-        # The captured context can contain the hidden-source state of an AO
-        # display preview. Rebuild that disposable preview only after context
-        # restoration so live Hair Tool sources never remain hidden by mistake.
-        hair_tool_export.restore_bridge_previews()
+        try:
+            operation = getattr(self, '_wq_operation', None)
+            if operation is not None and not unreal._COMMAND_RECORDING_STACK:
+                operation.check()
+                for asset_data in bpy.context.window_manager.send2ue.asset_data.values():
+                    coordination.require_asset_scopes(asset_data, bpy.context.scene.send2ue)
+            # This extension stage can save generated Skeleton dependencies.
+            extension.run_extension_tasks(ExtensionTasks.POST_OPERATION.value)
+        finally:
+            # Restore local Blender state even if the final Unreal save failed.
+            utilities.remove_unpacked_files(self.state.get('unpacked_files', {}))
+            utilities.set_context(self.state.get('context', {}))
+            hair_tool_export.restore_bridge_previews()
 
 
 class SettingsDialog(bpy.types.Operator, dialog.Send2UnrealDialog):
