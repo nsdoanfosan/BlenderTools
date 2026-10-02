@@ -254,6 +254,20 @@ MASTER_PRESETS = {
         },
         "virtual_textures": True,
     },
+    "fabric_twosided": {
+        "master": "/Game/Material/AssetSurface/Master/M_FabricTwoSided_Master",
+        "mi_folder": "/Game/Material/AssetSurface/MI/FabricTwoSided",
+        "assignment": "material_layer_instance",
+        "layer_parent": "/Game/Material/AssetSurface/Master/MaterialLayer/MY_FabricTwoSided",
+        "layer_instance_folder": "/Game/Material/AssetSurface/MYI/FabricTwoSided",
+        "layer_texture_remap": {
+            "Albedo": "BaseColor", "Extra": "ORM", "Normal": "Normal",
+            "Sheen Color": "Fuzz Color Map", "Sheen Opacity": "Fuzz Mask", "Sheen Roughness": "Fuzz Roughness Map",
+            "Backface Albedo": "Backface BaseColor", "Backface Extra": "Backface ORM", "Backface Normal": "Backface Normal",
+            "Backface Sheen Color": "Backface Fuzz Color Map", "Backface Sheen Opacity": "Backface Fuzz Mask", "Backface Sheen Roughness": "Backface Fuzz Roughness Map",
+        },
+        "virtual_textures": True,
+    },
     "cloth": {
         "master": "/Game/Material/AssetSurface/Master/M_Coat_Fabric_Substrate_Master",
         "mi_folder": "/Game/Material/AssetSurface/MI/Cloth",
@@ -357,6 +371,8 @@ DELETE_IMPORTED_SOURCE_TEXTURES = False
 
 # Shared surface-layer texture parameter names (JSON 의 param 과 동일해야 연결됨)
 KNOWN_PARAMS = {
+    "Backface Albedo", "Backface Extra", "Backface Normal",
+    "Backface Sheen Color", "Backface Sheen Opacity", "Backface Sheen Roughness",
     "Albedo",
     "Extra",
     "Normal",
@@ -872,7 +888,8 @@ def _texture_param_from_name(file_path=None, asset_name=None):
 def _effective_texture_param(param: str, file_path=None, asset_name=None) -> str:
     # A recognized filename suffix wins over a legacy JSON role. This keeps
     # existing MYI/MI JSON contracts working while fixing tree map imports.
-    return _texture_param_from_name(file_path, asset_name) or str(param or "")
+    role = _texture_param_from_name(file_path, asset_name) or str(param or "")
+    return role.removeprefix("Backface ")
 
 
 def _file_md5(file_path: str) -> str:

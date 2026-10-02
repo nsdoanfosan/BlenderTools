@@ -710,6 +710,11 @@ class TestUeMaterialTextureImport(unittest.TestCase):
             0.3333,
         )
 
+    def test_backface_fabric_maps_keep_front_import_settings(self):
+        for role in ("Albedo", "Extra", "Normal", "Sheen Color", "Sheen Opacity", "Sheen Roughness"):
+            with self.subTest(role=role):
+                self.assertEqual(self.module._desired_texture_settings("Backface " + role), self.module._desired_texture_settings(role))
+
     def test_only_opacity_roles_receive_alpha_coverage_settings(self):
         for role in ("Opacity", "Opacity Map", "Alpha"):
             with self.subTest(role=role):
