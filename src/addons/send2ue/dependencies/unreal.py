@@ -5,6 +5,7 @@ import json
 import time
 import sys
 import inspect
+import uuid
 from contextlib import contextmanager
 from xmlrpc.client import ProtocolError
 from http.client import RemoteDisconnected
@@ -225,7 +226,7 @@ def run_unreal_python_commands(
     raise ConnectionError(message)
 
 
-def run_commands(commands):
+def run_commands(commands, strict=False):
     """
     Runs a list of python commands and returns the result of the output.
 
@@ -238,8 +239,29 @@ def run_commands(commands):
 
     from . import remote_execution
 
+    # Only coordinated operations require an exact structured result. Keep the
+    # existing manual output contract, including extension command recording.
+    operation = None
+    try:
+        import bpy
+        operation = getattr(bpy.app, 'driver_namespace', {}).get('send2ue_workstation_operation')
+    except (ImportError, AttributeError):
+        pass
+    if operation is not None:
+        operation.check()
+        strict = True
+    receipt_id = str(uuid.uuid4()) if strict else None
+
     # wrap the commands in a try except so that all exceptions can be logged in the output
-    commands = ['try:'] + add_indent(commands, '\t') + ['except Exception as error:', '\tprint(error)']
+    if strict:
+        marker = '__WQ_NATIVE_RESULT__'
+        commands = ['import json as _wq_json', 'try:'] + add_indent(commands, '\t') + [
+            '\tprint(' + repr(marker) + ' + _wq_json.dumps({"request_id": ' + repr(receipt_id) + ', "success": True}))',
+            'except BaseException as _wq_error:',
+            '\tprint(' + repr(marker) + ' + _wq_json.dumps({"request_id": ' + repr(receipt_id) + ', "success": False, "error_type": type(_wq_error).__name__, "message": str(_wq_error)}))',
+        ]
+    else:
+        commands = ['try:'] + add_indent(commands, '\t') + ['except Exception as error:', '\tprint(error)']
 
     # start a connection to the engine that lets you send python-commands.md strings
     remote_exec = remote_execution.RemoteExecution()
@@ -249,7 +271,22 @@ def run_commands(commands):
     # generally idempotent.
     try:
         remote_exec.start()
-        return run_unreal_python_commands(remote_exec, commands)
+        output = run_unreal_python_commands(remote_exec, commands)
+        if strict:
+            receipt = None
+            for line in output.splitlines():
+                if line.startswith(marker):
+                    try:
+                        candidate = json.loads(line[len(marker):])
+                    except (ValueError, TypeError):
+                        continue
+                    if isinstance(candidate, dict) and candidate.get('request_id') == receipt_id:
+                        receipt = candidate
+            if receipt is None:
+                raise RuntimeError('Unreal command returned no matching native execution receipt')
+            if receipt.get('success') is not True:
+                raise RuntimeError('Unreal native command failed: ' + str(receipt.get('error_type') or '') + ': ' + str(receipt.get('message') or ''))
+        return output
     finally:
         remote_exec.stop()
 

@@ -8,6 +8,7 @@ from ..dependencies import unreal as unreal_dependency
 from ..dependencies.unreal import UnrealRemoteCalls as UnrealCalls
 from .utilities import track_progress, get_asset_id
 from ..dependencies.rpc.factory import make_remote
+from .. import coordination
 
 UnrealRemoteCalls = make_remote(UnrealCalls)
 MANIFEST_SCHEMA_VERSION = 1
@@ -73,6 +74,9 @@ def import_asset(asset_id, property_data):
     :param str asset_id: The unique id of the asset.
     :param dict property_data: A dictionary representation of the properties.
     """
+    asset_data = bpy.context.window_manager.send2ue.asset_data[asset_id]
+    coordination.require_asset_scopes(asset_data, bpy.context.scene.send2ue)
+
     # run the pre import extensions
     extension.run_extension_tasks(ExtensionTasks.PRE_IMPORT.value)
 
@@ -90,6 +94,11 @@ def import_asset(asset_id, property_data):
             groom_asset_path = import_result.get('groom_asset_path')
             if groom_asset_path:
                 asset_data['asset_path'] = groom_asset_path
+        if (asset_data.get('_asset_type') in {UnrealTypes.STATIC_MESH, UnrealTypes.SKELETAL_MESH}
+                or coordination.current_operation() is not None):
+            coordination.validate_import_result(asset_data, import_result)
+        if coordination.current_operation() is not None:
+            coordination.current_operation().imported_count += 1
 
         # import fcurves
         if asset_data.get('fcurve_file_path'):
@@ -112,6 +121,7 @@ def create_static_mesh_sockets(asset_id):
     asset_data = bpy.context.window_manager.send2ue.asset_data[asset_id]
     if asset_data.get('skip'):
         return
+    coordination.require_asset_scopes(asset_data, bpy.context.scene.send2ue)
 
     UnrealRemoteCalls.set_static_mesh_sockets(
         asset_data.get('asset_path'),
@@ -131,6 +141,7 @@ def reset_lods(asset_id, property_data):
     asset_path = asset_data.get('asset_path')
     if asset_data.get('skip'):
         return
+    coordination.require_asset_scopes(asset_data, bpy.context.scene.send2ue)
 
     if asset_data.get('_asset_type') == UnrealTypes.SKELETAL_MESH:
         UnrealRemoteCalls.reset_skeletal_mesh_lods(asset_path, property_data)
@@ -149,6 +160,7 @@ def import_lod_files(asset_id):
     lods = asset_data.get('lods', {})
     if asset_data.get('skip'):
         return
+    coordination.require_asset_scopes(asset_data, bpy.context.scene.send2ue)
 
     for index in range(1, len(lods.keys()) + 1):
         lod_file_path = lods.get(str(index))
@@ -170,6 +182,7 @@ def set_lod_build_settings(asset_id, property_data):
     lods = asset_data.get('lods', {})
     if asset_data.get('skip'):
         return
+    coordination.require_asset_scopes(asset_data, bpy.context.scene.send2ue)
 
     for index in range(0, len(lods.keys()) + 1):
         if asset_data.get('_asset_type') == UnrealTypes.SKELETAL_MESH:
