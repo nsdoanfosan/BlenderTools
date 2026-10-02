@@ -265,6 +265,7 @@ MASTER_PRESETS = {
             "Sheen Color": "Fuzz Color Map", "Sheen Opacity": "Fuzz Mask", "Sheen Roughness": "Fuzz Roughness Map",
             "Backface Albedo": "Backface BaseColor", "Backface Extra": "Backface ORM", "Backface Normal": "Backface Normal",
             "Backface Sheen Color": "Backface Fuzz Color Map", "Backface Sheen Opacity": "Backface Fuzz Mask", "Backface Sheen Roughness": "Backface Fuzz Roughness Map",
+            "Opacity Map": "Opacity Map", "Backface Opacity Map": "Backface Opacity Map",
         },
         "virtual_textures": True,
     },
@@ -371,6 +372,7 @@ DELETE_IMPORTED_SOURCE_TEXTURES = False
 
 # Shared surface-layer texture parameter names (JSON 의 param 과 동일해야 연결됨)
 KNOWN_PARAMS = {
+    "Backface Opacity Map",
     "Backface Albedo", "Backface Extra", "Backface Normal",
     "Backface Sheen Color", "Backface Sheen Opacity", "Backface Sheen Roughness",
     "Albedo",
