@@ -289,7 +289,7 @@ class NonblockingApplyTests(unittest.TestCase):
 
 
 class ApplyHarness:
-    """Exercise public editor handoff failures with an isolated no-op worker."""
+    """Exercise the current editor handoff without launching another editor."""
     def __init__(self, directory):
         self.root = Path(directory)
         self.record = {'version': 1, 'sim_asset_path': '/Game/Hair/SK_Sim',
@@ -333,10 +333,15 @@ class ApplyHarness:
 
     def apply(self):
         original = copy.deepcopy(self.record)
-        with patch.dict('sys.modules', {'unreal': self.unreal}), patch.object(M, 'validate_record', return_value=(self.record, {})), redirect_stdout(io.StringIO()):
+        with patch.dict('sys.modules', {'unreal': self.unreal}), patch.object(M, 'validate_record', return_value=(self.record, {})), patch.object(M, 'build_in_editor', side_effect=self.build), redirect_stdout(io.StringIO()):
             result = M.apply_hair_guide_cloth(self.record)
         assert self.record == original
         return result
+
+    def build(self, record, output):
+        if getattr(self, 'publish', True):
+            self.final.metadata.update({M.CONTENT: 'new-content', PublishHarness.binding_key: self.binding})
+        return dict(self.receipt)
 
 
 class EditorHandoffTests(unittest.TestCase):
@@ -353,18 +358,18 @@ class EditorHandoffTests(unittest.TestCase):
             h.loading.fully_load_assets.assert_not_called()
             self.assertFalse((h.root/'Saved').exists())
 
-    def test_reload_failure_is_not_reported_as_verified(self):
+    def test_unverified_live_build_is_not_reported_as_verified(self):
         with tempfile.TemporaryDirectory() as directory:
-            h = ApplyHarness(directory); h.loading.reload_packages.return_value = False
+            h = ApplyHarness(directory); h.receipt['verified'] = False
             result = h.apply()
             self.assertFalse(result['verified'])
             self.assertEqual(result['status'], 'cloth_not_updated')
-            self.assertIn('could not reload', result['detail'])
-            self.assertIn(h.final, h.loading.fully_load_assets.call_args.args[0])
+            self.assertIn('verified receipt', result['detail'])
+            h.loading.reload_packages.assert_not_called()
 
     def test_successful_reload_return_with_stale_metadata_is_not_verified(self):
         with tempfile.TemporaryDirectory() as directory:
-            h = ApplyHarness(directory)
+            h = ApplyHarness(directory); h.publish = False
             result = h.apply()
             self.assertFalse(result['verified'])
             self.assertIn('older cloth result', result['detail'])
@@ -380,6 +385,86 @@ class EditorHandoffTests(unittest.TestCase):
             self.assertEqual(result, dict(h.receipt, live_components=[]))
             saved = [call.args[0] for call in h.library.save_loaded_asset.call_args_list]
             self.assertEqual(saved, [h.assets[h.record['sim_asset_path']], h.assets[h.record['render_asset_path']]])
+            h.loading.reload_packages.assert_not_called()
+            h.loading.fully_load_assets.assert_not_called()
+
+
+class AuthoredMapCorrespondenceTests(unittest.TestCase):
+    def test_diagonal_flip_keeps_the_same_painted_quad_but_rejects_a_new_vertex(self):
+        from collections import Counter
+        a=Counter({(0,1,3):1,(0,2,3):1})
+        self.assertTrue(M._same_painted_vertex_support(a,Counter({(0,1,2):1,(1,2,3):1})))
+        self.assertFalse(M._same_painted_vertex_support(a,Counter({(0,1,2):1,(1,2,4):1})))
+
+    def test_rooted_ribbon_resampling_preserves_both_rails_and_endpoints(self):
+        def strip(ts):
+            return {'sim_positions':[[x,t,0] for t in ts for x in (0,1)],
+                'sim_triangles':[list(tri) for i in range(len(ts)-1)
+                    for tri in ((2*i,2*i+1,2*i+3),(2*i,2*i+3,2*i+2))],
+                'kinematic_sim_indices':[0,1]}
+        old,new=strip([0,.5,1]),strip([0,.25,.75,1])
+        match=M._ribbon_paint_correspondence(old,new,list(range(6)),list(range(8)),list(range(6)),list(range(8)))
+        paint=[0,1,2,3,4,5]
+        self.assertEqual([paint[a]*(1-t)+paint[b]*t for a,b,t in (match[i] for i in range(8))],
+                         [0,1,1,2,3,4,4,5])
+        new['sim_positions'][0][2]=1
+        with self.assertRaisesRegex(ValueError,'attachment changed'):
+            M._ribbon_paint_correspondence(old,new,list(range(6)),list(range(8)),list(range(6)),list(range(8)))
+
+    def identity_case(self):
+        props = {'MeshTarget':'Simulation','MapOverrideType':'ReplaceAll',
+                 'Snapshots':'(ActiveSnapshot=-1)','bIsFrozen':'False'}
+        nodes = [{'name':name,'type':'FChaosClothAssetWeightMapNode',
+                  'props':dict(props,OutputName='(StringValue="'+name+'")',
+                               VertexWeights='('+','.join(map(str,values))+')')}
+                 for name,values in [('CodexParentForceKey',[.125]*3),('SideRenderClearance',[.15,.6,3.17])]]
+        old={'built_mapping':{'sim_positions':[[0,0,0],[1,0,0],[0,1,0]],
+             'sim_triangles':[[0,1,2]],'kinematic_sim_indices':[0],
+             'sim_import_vertex_ids_2d':[0,1,2]}}
+        new={'built_mapping':{'sim_positions':[[0,1.5,0],[0,0,0],[1,0,0]],
+             'sim_triangles':[[1,2,0]],'kinematic_sim_indices':[1]}}
+        owner={'sim_source_indices':[2,0,1],'sim_source_identity_unique':[True]*3}
+        return {'nodes':nodes},old,new,owner
+
+    def test_parent_and_vertex_identity_preserve_paint_after_guide_position_edit(self):
+        graph,old,new,owner=self.identity_case()
+        with patch.object(M,'_guide_identity_rows',return_value=([.125]*3,{1:{'weight':.125}})):
+            maps=M._weight_map_updates(graph,old,new,{'packet':True},owner)
+        self.assertEqual(maps['SideRenderClearance'][2],[3.17,.15,.6])
+
+    def test_changed_parent_identity_cannot_reuse_same_numbered_vertex(self):
+        graph,old,new,owner=self.identity_case()
+        with patch.object(M,'_guide_identity_rows',return_value=([.25]*3,{1:{'weight':.25}})):
+            with self.assertRaisesRegex(ValueError,'geometry changed'):
+                M._weight_map_updates(graph,old,new,{'packet':True},owner)
+
+    def test_changed_triangle_support_cannot_reuse_vertex_ids(self):
+        graph,old,new,owner=self.identity_case();new['built_mapping']['sim_triangles']=[[0,1,1]]
+        with patch.object(M,'_guide_identity_rows',return_value=([.125]*3,{1:{'weight':.125}})):
+            with self.assertRaisesRegex(ValueError,'geometry changed'):
+                M._weight_map_updates(graph,old,new,{'packet':True},owner)
+
+    def test_vertex_reorder_retains_clearance_paint(self):
+        old = {'sim_positions': [[0,0,0],[1,0,0],[0,1,0]], 'sim_triangles': [[0,1,2]]}
+        new = {'sim_positions': [[0,1,0],[0,0,0],[1,0,0]], 'sim_triangles': [[1,2,0]]}
+        self.assertEqual(M._transfer_unchanged_simulation_map(old,new,[.15,3.17,.6]),[.6,.15,3.17])
+
+    def test_omitted_guide_leaves_retained_guide_paint_unchanged(self):
+        old = {'sim_positions': [[0,0,0],[1,0,0],[0,1,0],[10,0,0],[11,0,0],[10,1,0]], 'sim_triangles': [[0,1,2],[3,4,5]]}
+        new = {'sim_positions': old['sim_positions'][3:], 'sim_triangles': [[0,1,2]]}
+        self.assertEqual(M._transfer_unchanged_simulation_map(old,new,[1,2,3,4,5,6]),[4,5,6])
+
+    def test_edited_geometry_is_not_nearest_mapped(self):
+        old = {'sim_positions': [[0,0,0],[1,0,0],[0,1,0]], 'sim_triangles': [[0,1,2]]}
+        new = copy.deepcopy(old); new['sim_positions'][0][0] = .01
+        with self.assertRaisesRegex(ValueError,'geometry changed'):
+            M._transfer_unchanged_simulation_map(old,new,[1,2,3])
+
+    def test_coincident_different_paint_is_rejected(self):
+        old = {'sim_positions': [[0,0,0],[1,0,0],[0,1,0]]*2, 'sim_triangles': [[0,1,2],[3,4,5]]}
+        new = {'sim_positions': old['sim_positions'][:3], 'sim_triangles': [[0,1,2]]}
+        with self.assertRaisesRegex(ValueError,'ambiguous'):
+            M._transfer_unchanged_simulation_map(old,new,[1,2,3,4,5,6])
 
 
 class PublishHarness:

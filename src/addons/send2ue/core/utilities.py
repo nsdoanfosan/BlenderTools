@@ -491,6 +491,9 @@ def get_from_collection(object_type):
     if export_collection and not collection_objects:
         # get all the objects in the collection
         for collection_object in export_collection.all_objects: # type: ignore
+            from . import export_selection
+            if not export_selection.includes(collection_object):
+                continue
             # Export is an explicit activation collection. Objects that only
             # appear through nested working collections or parent hierarchy
             # are not enabled for export.
@@ -1397,8 +1400,10 @@ def select_all_children(
     children = scene_object.children or get_meshes_using_armature_modifier(scene_object)
     for child_object in children:
         if child_object.type == object_type:
-            from . import hair_tool_export
-            if hair_tool_export.is_prepared_source(child_object):
+            from . import hair_tool_export, export_selection
+            if not export_selection.includes(child_object):
+                pass
+            elif hair_tool_export.is_prepared_source(child_object):
                 pass
             elif required_objects and child_object not in required_objects:
                 pass

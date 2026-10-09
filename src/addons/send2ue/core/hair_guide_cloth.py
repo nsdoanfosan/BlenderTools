@@ -573,6 +573,14 @@ def _finish_asset(render, captures, asset_name, armature, export_collection, exp
                                           'basis': 'existing_send2ue_hair_tool_export_rule'}} if armature else None,
         'weight_policy': 'Own simulation ChaosWeight; whole all-zero or absent-weight sources render-only; retain all vertices of any positive-weight source; never child render G.',
         'missing_guide_policy': 'Render-only after complete guide search; no simulation geometry or proxy binding.'}
+    unit = bpy.data.objects.get(asset_name)
+    raw_transfer = unit.get('send2ue_cloth_weight_map_transfer', '') if unit else ''
+    if raw_transfer:
+        transfer = json.loads(raw_transfer)
+        if (transfer.get('version') != 1 or transfer.get('policy') != 'rooted_ribbon_arclength'
+                or not isinstance(transfer.get('guide_keys'), list)):
+            raise ValueError('Unsupported explicit cloth paint transfer policy')
+        packet['weight_map_transfer'] = transfer
     packet['content_id'] = hashlib.sha256(json.dumps(packet, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()).hexdigest()
     package = {'packet': packet, 'exports': {}, 'imported': set(), 'asset_name': asset_name}
     state()['packages'][packet['content_id']] = package

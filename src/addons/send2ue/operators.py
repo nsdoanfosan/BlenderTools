@@ -253,6 +253,8 @@ class Send2Ue(bpy.types.Operator):
         hair_tool_export.restore_debug_view()
         # get the current state of the scene and its objects
         self.state['context'] = utilities.get_current_context()
+        from .core import export_selection
+        export_selection.prepare()
 
         # Expose the current contents of open GroupPro groups before extensions
         # inspect Export. The exact editable state is restored during cleanup.
@@ -307,6 +309,8 @@ class Send2Ue(bpy.types.Operator):
         finally:
             # Restore local Blender state even if the final Unreal save failed.
             utilities.remove_unpacked_files(self.state.get('unpacked_files', {}))
+            from .core import export_selection
+            export_selection.cleanup()
             utilities.set_context(self.state.get('context', {}))
             hair_tool_export.restore_bridge_previews()
 

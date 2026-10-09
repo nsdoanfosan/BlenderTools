@@ -525,6 +525,13 @@ def export_mesh(asset_id, mesh_object, properties, lod=0):
             list(bpy.context.selected_objects),
         )
 
+    # Extensions may re-link legacy children while preparing an assembly.
+    # Enforce the explicit source contract on the final FBX selection too.
+    from . import export_selection
+    for selected in list(bpy.context.selected_objects):
+        if not export_selection.includes(selected):
+            selected.select_set(False)
+
     # Note: this is a weird work around for morph targets not exporting when
     # particle systems are on the mesh. Making them not visible fixes this bug
     existing_display_options = utilities.disable_particles(mesh_object)
@@ -780,7 +787,7 @@ def create_mesh_data(mesh_objects, rig_objects, properties):
             }
             if mesh_object.get(hair_tool_export.TEMP_PROPERTY):
                 mesh_data[asset_id]['_hair_tool_payload'] = (
-                    hair_tool_export.get_rfaos_payload_contract()
+                    hair_tool_export.get_rfaos_payload_contract(mesh_object)
                 )
             previous_asset_names.append(asset_name)
 
