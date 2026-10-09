@@ -900,9 +900,9 @@ def _write_hair_tool_uvs(mesh):
     render_uv.active_render = True
 
 
-def get_rfaos_payload_contract():
+def get_rfaos_payload_contract(mesh_object=None):
     """Return the JSON-safe contract consumed by the Unreal importer."""
-    return {
+    contract = {
         'version': RFAOS_PAYLOAD_VERSION,
         'encoding': 'HTUE_RGB_TAGGED_UV',
         'vertex_color_name': RFAOS_NAME,
@@ -938,6 +938,20 @@ def get_rfaos_payload_contract():
             RFAOS_NANITE_UV_START_INDEX + 1,
         ],
     }
+    if mesh_object is not None and mesh_object.data.shape_keys:
+        import numpy as np
+        keys = mesh_object.data.shape_keys.key_blocks
+        count = len(mesh_object.data.vertices) * 3
+        matrix = np.array(mesh_object.matrix_world.to_3x3(), dtype=np.float64)
+        maxima = {}
+        for key in keys[1:]:
+            base, shaped = np.empty(count, dtype=np.float32), np.empty(count, dtype=np.float32)
+            key.relative_key.data.foreach_get('co', base)
+            key.data.foreach_get('co', shaped)
+            delta = (shaped-base).reshape(-1, 3) @ matrix.T * 100.0
+            maxima[key.name] = float(np.linalg.norm(delta, axis=1).max())
+        contract['evaluated_morph_max_delta_cm'] = maxima
+    return contract
 
 
 def _evaluated_mesh_objects(
@@ -1166,11 +1180,13 @@ def _asset_group_key(scene_object, export_collection=None):
 
 def _export_source_candidates(export_collection):
     """Return direct, visible, render-enabled Hair Tool Export links only."""
+    from . import export_selection
     return [
         scene_object
         for scene_object in export_collection.all_objects
         if (
             export_collection in scene_object.users_collection
+            and export_selection.includes(scene_object)
             and scene_object.visible_get()
             and not scene_object.hide_render
             and is_hair_tool_object(scene_object)

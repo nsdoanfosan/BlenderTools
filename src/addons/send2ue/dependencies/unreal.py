@@ -2,6 +2,7 @@
 
 import os
 import json
+import math
 import time
 import sys
 import inspect
@@ -937,6 +938,16 @@ class Unreal:
 
 
 class UnrealImportAsset(Unreal):
+    @staticmethod
+    def preserved_morph_threshold(names, maxima, requested):
+        if not names:
+            return float(requested)
+        missing = sorted(name for name in names
+                         if maxima.get(name, 0) <= 0 or not math.isfinite(maxima[name]))
+        if missing:
+            raise RuntimeError('Source export would remove existing morphs: ' + ', '.join(missing))
+        return min(float(requested), min(maxima[name] for name in names) * .999)
+
     def __init__(self, file_path, asset_data, property_data):
         """
         Initializes the import with asset data and property data.
@@ -1041,6 +1052,17 @@ class UnrealImportAsset(Unreal):
                     pass  # Restored and verified after legacy FBX import below.
             if (existing and existing.get_class().get_name() == 'SkeletalMesh'
                     and existing.get_editor_property('morph_targets')):
+                self._morph_names_before = {m.get_name() for m in existing.get_editor_property('morph_targets')}
+                maxima = (hair_payload or {}).get('evaluated_morph_max_delta_cm')
+                if maxima is not None:
+                    # Preserve weak authored morphs near the preset noise cutoff.
+                    # The names come from the existing asset, not a character list.
+                    requested = float(import_data.get_editor_property('morph_threshold_position'))
+                    threshold = self.preserved_morph_threshold(self._morph_names_before, maxima, requested)
+                    threshold = self.set_retained_morph_threshold(existing, threshold)
+                    if threshold < requested:
+                        import_data.set_editor_property('morph_threshold_position', threshold)
+                        unreal.log('Morph removal threshold lowered from ' + str(requested) + ' to ' + str(threshold))
                 try:
                     import_data.set_editor_property('build_nanite', False)
                 except Exception:
@@ -1048,6 +1070,26 @@ class UnrealImportAsset(Unreal):
                     # mandatory post-import guard still enforces the policy.
                     pass
             self._options.skeletal_mesh_import_data = import_data
+
+    @staticmethod
+    def set_retained_morph_threshold(mesh, threshold):
+        """Legacy reimport reads retained asset/LOD settings instead of task options."""
+        retained = mesh.get_editor_property('asset_import_data')
+        subsystem = unreal.get_editor_subsystem(unreal.SkeletalMeshEditorSubsystem)
+        lod = subsystem.get_lod_build_settings(mesh, 0)
+        threshold = min(float(threshold),
+                        float(retained.get_editor_property('morph_threshold_position')),
+                        float(lod.get_editor_property('morph_threshold_position')))
+        if retained.get_editor_property('morph_threshold_position') > threshold:
+            retained.set_editor_property('morph_threshold_position', threshold)
+        if lod.get_editor_property('morph_threshold_position') > threshold:
+            lod.set_editor_property('morph_threshold_position', threshold)
+            subsystem.set_lod_build_settings(mesh, 0, lod)
+        if (retained.get_editor_property('morph_threshold_position') > threshold + 1e-9
+                or subsystem.get_lod_build_settings(mesh, 0).get_editor_property(
+                    'morph_threshold_position') > threshold + 1e-9):
+            raise RuntimeError('Legacy reimport did not retain the morph removal threshold')
+        return threshold
 
     @staticmethod
     def _plugin_json(value):
@@ -1466,6 +1508,13 @@ class UnrealImportAsset(Unreal):
                     'Assembly import result is missing or is not a StaticMesh: '
                     + expected_path
                 )
+        expected_morphs = getattr(self, '_morph_names_before', set())
+        if expected_morphs:
+            for path, mesh in self._imported_skeletal_meshes(imported_object_paths):
+                actual = {m.get_name() for m in mesh.get_editor_property('morph_targets')}
+                missing = sorted(expected_morphs - actual)
+                if missing:
+                    raise RuntimeError('Imported mesh lost existing morphs: ' + ', '.join(missing))
         self.ensure_hair_tool_uv_precision(imported_object_paths)
         self.ensure_hair_tool_nanite(imported_object_paths)
         self.audit_hair_tool_payload(imported_object_paths)

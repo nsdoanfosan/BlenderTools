@@ -41,6 +41,57 @@ REMOTE_EXECUTION = _load_dependency_module("remote_execution")
 UNREAL = _load_dependency_module("unreal")
 
 
+class MorphThresholdTests(unittest.TestCase):
+    def test_no_existing_morph_keeps_requested_threshold(self):
+        self.assertEqual(
+            UNREAL.UnrealImportAsset.preserved_morph_threshold(
+                set(), {'NewMorph': .5}, .015),
+            .015,
+        )
+
+    def test_reimport_updates_both_retained_settings_without_changing_other_fields(self):
+        class Settings:
+            def __init__(self,threshold):self.values={'morph_threshold_position':threshold,'recompute_normals':False}
+            def get_editor_property(self,name):return self.values[name]
+            def set_editor_property(self,name,value):self.values[name]=value
+        retained,lod=Settings(.015),Settings(.015)
+        mesh=types.SimpleNamespace(get_editor_property=lambda name:retained)
+        subsystem=types.SimpleNamespace(get_lod_build_settings=lambda mesh,index:lod,
+            set_lod_build_settings=lambda mesh,index,settings:None)
+        fake=types.SimpleNamespace(SkeletalMeshEditorSubsystem=object(),get_editor_subsystem=lambda _:subsystem)
+        with mock.patch.object(UNREAL,'unreal',fake,create=True):
+            threshold=UNREAL.UnrealImportAsset.set_retained_morph_threshold(mesh,.0149517)
+        self.assertEqual(retained.values['morph_threshold_position'],threshold)
+        self.assertEqual(lod.values['morph_threshold_position'],threshold)
+        self.assertFalse(lod.values['recompute_normals'])
+
+    def test_reimport_never_raises_an_existing_lower_threshold(self):
+        class Settings:
+            def __init__(self,t):self.t=t
+            def get_editor_property(self,_):return self.t
+            def set_editor_property(self,_,v):self.t=v
+        retained,lod=Settings(.001),Settings(.015)
+        sub=types.SimpleNamespace(get_lod_build_settings=lambda *_:lod,set_lod_build_settings=lambda *_:None)
+        fake=types.SimpleNamespace(SkeletalMeshEditorSubsystem=object(),get_editor_subsystem=lambda _:sub)
+        with mock.patch.object(UNREAL,'unreal',fake,create=True):
+            value=UNREAL.UnrealImportAsset.set_retained_morph_threshold(types.SimpleNamespace(get_editor_property=lambda _:retained),.0149)
+        self.assertEqual(value,.001);self.assertEqual(lod.t,.001)
+
+    def test_retains_existing_weak_morph_without_enabling_a_weaker_new_one(self):
+        sizes={'Jaw_Down':.01496668998,'V_Wide':.01683337241,'Mouth_Up_Upper_L':.01487072185}
+        threshold=UNREAL.UnrealImportAsset.preserved_morph_threshold({'Jaw_Down','V_Wide'},sizes,.015)
+        self.assertGreater(threshold,sizes['Mouth_Up_Upper_L'])
+        self.assertLess(threshold,sizes['Jaw_Down'])
+
+    def test_lower_artist_threshold_is_retained(self):
+        self.assertEqual(UNREAL.UnrealImportAsset.preserved_morph_threshold({'Blink'},{'Blink':1.0},.001),.001)
+
+    def test_missing_or_nonfinite_existing_morph_stops_before_import(self):
+        for sizes in ({},{'Blink':0.0},{'Blink':float('nan')}):
+            with self.assertRaisesRegex(RuntimeError,'remove existing morphs: Blink'):
+                UNREAL.UnrealImportAsset.preserved_morph_threshold({'Blink'},sizes,.015)
+
+
 class FakeClock:
     def __init__(self):
         self.value = 0.0

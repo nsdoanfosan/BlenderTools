@@ -14,7 +14,7 @@ from pathlib import Path
 import re
 import sys
 import uuid
-from collections import defaultdict
+from collections import defaultdict, Counter
 
 OWNER = "Send2UE.HairGuideCloth.Owner"
 CONTENT = "Send2UE.HairGuideCloth.Content"
@@ -39,10 +39,12 @@ def _path(value):
     return value
 
 
-def _native(result):
+def _native(result, evidence_path=None):
     def checked(payload, call_failed=False):
         if not isinstance(payload, dict):
             raise RuntimeError("Native cloth operation did not return an object receipt: " + str(result)[:1500])
+        if evidence_path is not None:
+            Path(evidence_path).write_text(json.dumps(payload, indent=2), encoding='utf8')
         if call_failed or payload.get("success") is False:
             raise RuntimeError("Native cloth operation failed: " + json.dumps(payload, ensure_ascii=False)[:1500])
         return payload
@@ -400,12 +402,230 @@ def _guide_identity_rows(packet, owner):
 
 
 
+def _transfer_unchanged_simulation_map(old, new, values):
+    """Transfer paint only through unchanged positions AND triangle support.
+
+    Import order and omitted whole render-only guides may differ. Coincident
+    vertices with conflicting paint are ambiguous and must remain untouched.
+    This does not interpolate paint onto edited geometry or search for guides.
+    """
+    tolerance = 0.0001  # Same centimeter contract as native ownership validation.
+    buckets = defaultdict(list)
+    def key(position):
+        return tuple(math.floor(float(x) / tolerance) for x in position)
+    for index, position in enumerate(old['sim_positions']):
+        buckets[key(position)].append(index)
+    candidates = []
+    for position in new['sim_positions']:
+        center = key(position)
+        matches = set()
+        for delta in itertools.product((-1, 0, 1), repeat=3):
+            for index in buckets.get(tuple(a+b for a, b in zip(center, delta)), ()):
+                if all(abs(float(a)-float(b)) <= tolerance
+                       for a, b in zip(position, old['sim_positions'][index])):
+                    matches.add(index)
+        if not matches:
+            raise ValueError('WeightMap source geometry changed; explicit source correspondence required')
+        candidates.append(matches)
+    incident = defaultdict(list)
+    for triangle in old['sim_triangles']:
+        for index in triangle:
+            incident[index].append(triangle)
+    for triangle in new['sim_triangles']:
+        valid = [set(), set(), set()]
+        for a in candidates[triangle[0]]:
+            for previous in incident[a]:
+                for ordered in itertools.permutations(previous):
+                    if ordered[0] == a and all(ordered[j] in candidates[triangle[j]] for j in (1, 2)):
+                        for j in range(3):
+                            valid[j].add(ordered[j])
+        if any(not support for support in valid):
+            raise ValueError('WeightMap simulation triangle support changed')
+        for j in range(3):
+            candidates[triangle[j]].intersection_update(valid[j])
+    transferred = []
+    for matches in candidates:
+        painted = {values[index] for index in matches}
+        if len(painted) != 1:
+            raise ValueError('WeightMap source correspondence is ambiguous')
+        transferred.append(painted.pop())
+    return transferred
+
+
+def _same_painted_vertex_support(old_faces, new_faces):
+    """Allow a triangulator's diagonal flip inside the same four-vertex quad."""
+    previous, current = old_faces-new_faces, new_faces-old_faces
+    if any(count!=1 or len(set(tri))!=3 for faces in (previous,current) for tri,count in faces.items()):
+        return False
+    def boundary(a,b):
+        return Counter(tuple(sorted(edge)) for tri in (a,b)
+                       for edge in ((tri[0],tri[1]),(tri[1],tri[2]),(tri[2],tri[0])))
+    while previous:
+        a=next(iter(previous));matches=[]
+        for b in previous:
+            vertices=set(a)|set(b)
+            if a==b or len(vertices)!=4 or len(set(a)&set(b))!=2:
+                continue
+            before=Counter({edge:count for edge,count in boundary(a,b).items() if count==1})
+            candidates=[tri for tri in current if set(tri)<=vertices]
+            for c,d in itertools.combinations(candidates,2):
+                if set(c)|set(d)!=vertices or len(set(c)&set(d))!=2:
+                    continue
+                after=Counter({edge:count for edge,count in boundary(c,d).items() if count==1})
+                if before==after:matches.append((b,c,d))
+        if len(matches)!=1:
+            return False
+        b,c,d=matches[0]
+        for tri in (a,b):del previous[tri]
+        for tri in (c,d):del current[tri]
+    return not current
+
+
+def _rooted_ribbon_parameters(native, indices, source_ids):
+    """Validate the source-ordered two-rail strip, then parameterize its center."""
+    indices = sorted(indices, key=lambda index: source_ids[index])
+    if len(indices) < 4 or len(indices) % 2:
+        raise ValueError('Authored paint transfer requires a complete two-rail ribbon')
+    local = {index: rank for rank, index in enumerate(indices)}
+    faces = Counter(tuple(sorted(local[i] for i in tri)) for tri in native['sim_triangles']
+                    if all(i in local for i in tri))
+    expected = Counter(tuple(sorted(tri)) for row in range(len(indices)//2-1)
+                       for tri in ((2*row,2*row+1,2*row+3),(2*row,2*row+3,2*row+2)))
+    if not _same_painted_vertex_support(faces,expected) or any(any(i in local for i in tri) and not all(i in local for i in tri)
+                                for tri in native['sim_triangles']):
+        raise ValueError('Authored paint ribbon has changed rails or triangle support')
+    kinematic = set(native['kinematic_sim_indices'])
+    fixed = [i in kinematic for i in indices]
+    if (fixed[:2] != [True, True] or any(fixed[-2:]) or
+            any(fixed[i] != fixed[i+1] for i in range(0,len(fixed),2)) or
+            any(a < b for a,b in zip(fixed,fixed[1:]))):
+        raise ValueError('Authored paint ribbon needs an unambiguous fixed root and dynamic tip')
+    positions = native['sim_positions']
+    centers = [tuple((positions[a][j]+positions[b][j])*.5 for j in range(3))
+               for a,b in zip(indices[::2],indices[1::2])]
+    lengths = [0.]
+    for a,b in zip(centers,centers[1:]):
+        length = math.dist(a,b)
+        if not math.isfinite(length) or length <= 1e-7:
+            raise ValueError('Authored paint ribbon has a degenerate center span')
+        lengths.append(lengths[-1]+length)
+    return indices, [value/lengths[-1] for value in lengths], centers, lengths[-1]
+
+
+def _ribbon_paint_correspondence(old, new, previous, indices, old_ids, new_ids):
+    """Explicit same-parent resampling; each rail retains its own painted values."""
+    previous, old_t, old_center, old_length = _rooted_ribbon_parameters(old, previous, old_ids)
+    indices, new_t, new_center, new_length = _rooted_ribbon_parameters(new, indices, new_ids)
+    # A source key alone must not authorize a replacement or reversed curve.
+    # Root is the shared attachment; require the same ribbon rail orientation.
+    if math.dist(old_center[0],new_center[0]) > .0001:
+        raise ValueError('Authored paint ribbon attachment changed')
+    for native, group in ((old,previous),(new,indices)):
+        if any(math.dist(native['sim_positions'][a],native['sim_positions'][b]) <= 1e-7
+               for a,b in zip(group[::2],group[1::2])):
+            raise ValueError('Authored paint ribbon has a collapsed cross section')
+    old_rail = [old['sim_positions'][previous[1]][j]-old['sim_positions'][previous[0]][j] for j in range(3)]
+    new_rail = [new['sim_positions'][indices[1]][j]-new['sim_positions'][indices[0]][j] for j in range(3)]
+    if sum(a*b for a,b in zip(old_rail,new_rail)) <= 0:
+        raise ValueError('Authored paint ribbon rail orientation changed')
+    # Sampling occurs in source centerline coordinates, with no mesh-space
+    # nearest-point or cross-guide search. Endpoints remain authored exactly.
+    correspondence = {}
+    span = 0
+    for sample,t in enumerate(new_t):
+        while span < len(old_t)-2 and old_t[span+1] < t:
+            span += 1
+        alpha = max(0.,min(1.,(t-old_t[span])/(old_t[span+1]-old_t[span])))
+        for rail in (0,1):
+            correspondence[indices[2*sample+rail]] = (previous[2*span+rail],previous[2*(span+1)+rail],alpha)
+    return correspondence
+
+
 def _weight_map_updates(full_graph, old, new, packet, ownership):
     """Rebuild known generated maps; reject unexplained authored paint changes."""
     updates = {}
     old_native, new_native = old['built_mapping'], new['built_mapping']
     old_count = len(old_native['sim_positions'])
     new_count = len(new_native['sim_positions'])
+    identity_mapping = None
+    paint_correspondence = None
+    key_nodes = [n for n in full_graph['nodes'] if n['type'] == 'FChaosClothAssetWeightMapNode'
+                 and n['props'].get('OutputName') == '(StringValue="CodexParentForceKey")']
+    if packet and ownership and len(key_nodes) == 1:
+        previous_keys = [float(v) for v in key_nodes[0]['props']['VertexWeights'].strip('()').split(',') if v]
+        current_keys, rows = _guide_identity_rows(packet, ownership)
+        # UE ExportText serializes float properties with six decimal places.
+        # Recover a hash only when exactly one current parent key falls in that
+        # rounding interval; never merge near hashes or infer nearest guides.
+        key_matches = {value: [key for key in set(current_keys) if abs(value-key) <= .500001e-6]
+                       for value in set(previous_keys)}
+        if (all(len(matches) == 1 for matches in key_matches.values())
+                and len({matches[0] for matches in key_matches.values()}) == len(key_matches)):
+            previous_keys = [key_matches[value][0] for value in previous_keys]
+        old_ids = old_native.get('sim_import_vertex_ids_2d', [])
+        new_ids = ownership['sim_source_indices']
+        if (len(old_ids) == old_count and len(set(old_ids)) == old_count
+                and len(previous_keys) == old_count and len(new_ids) == new_count
+                and all(ownership['sim_source_identity_unique'])):
+            lookup = dict(zip(old_ids, range(old_count)))
+            mapping = [lookup.get(index) for index in new_ids]
+            previous_counts, current_counts = Counter(previous_keys), Counter(current_keys)
+            if not (all(index is not None for index in mapping)
+                    and all(previous_keys[index] == current_keys[i] for i, index in enumerate(mapping))
+                    and all(previous_counts[parent] == count for parent,count in current_counts.items())):
+                # Exporting fewer units changes global source offsets/order.
+                # Within each stable parent-spline identity, FBX source IDs retain
+                # native local vertex order. Require the complete local topology.
+                previous_groups, current_groups = defaultdict(list), defaultdict(list)
+                for index, parent in enumerate(previous_keys):
+                    previous_groups[parent].append(index)
+                for index, parent in enumerate(current_keys):
+                    current_groups[parent].append(index)
+                mapping = [None] * new_count
+                transfer = packet.get('weight_map_transfer', {})
+                allowed = set()
+                if transfer:
+                    if transfer.get('version') != 1 or transfer.get('policy') != 'rooted_ribbon_arclength':
+                        raise ValueError('Unsupported explicit authored paint transfer')
+                    allowed = {json.dumps(key,ensure_ascii=False,separators=(',',':'))
+                               for key in transfer.get('guide_keys',[])}
+                correspondences = {}
+                row_by_weight = {row['weight']: row for row in rows.values()}
+                for parent, indices in current_groups.items():
+                    previous = previous_groups.get(parent, [])
+                    if len(previous) != len(indices):
+                        row = row_by_weight.get(parent, {})
+                        part = next((p for p in packet.get('parts',[]) if
+                                     p.get('source_guide') == row.get('source') and
+                                     p['simulation_mesh'].get('effective_mode') == 'RIBBON'), None)
+                        if not previous or row.get('key') not in allowed or part is None:
+                            break
+                        correspondences.update(_ribbon_paint_correspondence(
+                            old_native,new_native,previous,indices,old_ids,new_ids))
+                        continue
+                    previous.sort(key=lambda index: old_ids[index])
+                    indices.sort(key=lambda index: new_ids[index])
+                    for index, old_index in zip(indices, previous):
+                        mapping[index] = old_index
+                exact = {i:index for i,index in enumerate(mapping) if index is not None}
+                retained = set(exact.values())
+                if (correspondences and len(exact)+len(correspondences)==new_count and
+                        all(previous_keys[index]==current_keys[i] for i,index in exact.items())):
+                    old_faces = Counter(tuple(sorted(tri)) for tri in old_native['sim_triangles']
+                                        if all(index in retained for index in tri))
+                    new_faces = Counter(tuple(sorted(exact[i] for i in tri)) for tri in new_native['sim_triangles']
+                                        if all(i in exact for i in tri))
+                    if _same_painted_vertex_support(old_faces,new_faces):
+                        paint_correspondence = {i:(index,index,0.) for i,index in exact.items()}
+                        paint_correspondence.update(correspondences)
+            if (all(index is not None for index in mapping)
+                    and all(previous_keys[index] == current_keys[i] for i, index in enumerate(mapping))):
+                retained = set(mapping)
+                old_faces = Counter(tuple(sorted(tri)) for tri in old_native['sim_triangles']
+                                    if all(index in retained for index in tri))
+                new_faces = Counter(tuple(sorted(mapping[i] for i in tri)) for tri in new_native['sim_triangles'])
+                if _same_painted_vertex_support(old_faces,new_faces):
+                    identity_mapping = mapping
     for node in full_graph['nodes']:
         if node['type'] != 'FChaosClothAssetWeightMapNode':
             continue
@@ -436,11 +656,20 @@ def _weight_map_updates(full_graph, old, new, packet, ownership):
             weights = values
         else:
             old_kin = set(old_native['kinematic_sim_indices'])
-            if not old_kin or len(old_kin) == old_count or not all(
+            if old_kin and len(old_kin) != old_count and all(
                     value == (0.0 if i in old_kin else 1.0) for i, value in enumerate(values)):
-                raise ValueError('WeightMap needs explicit source correspondence: ' + node['name'])
-            new_kin = set(new_native['kinematic_sim_indices'])
-            weights = [0.0 if i in new_kin else 1.0 for i in range(new_count)]
+                new_kin = set(new_native['kinematic_sim_indices'])
+                weights = [0.0 if i in new_kin else 1.0 for i in range(new_count)]
+            else:
+                if identity_mapping is not None:
+                    # Parent-spline identity + imported source vertex identity +
+                    # unchanged triangle support survive positional edits.
+                    weights = [values[index] for index in identity_mapping]
+                elif paint_correspondence is not None:
+                    weights = [values[a]*(1.-t)+values[b]*t
+                               for a,b,t in (paint_correspondence[i] for i in range(new_count))]
+                else:
+                    weights = _transfer_unchanged_simulation_map(old_native, new_native, values)
         if len(weights) != new_count:
             raise ValueError('WeightMap vertex count differs from the rebuilt simulation')
         updates[node['name']] = (name, values, weights)
@@ -609,8 +838,7 @@ def build_in_editor(record, output_directory):
     ownership_path = output / "ownership.json"
     ownership_path.write_text(json.dumps(ownership), encoding="utf8")
     preview = _native(unreal.CodexClothToolsLibrary.repair_cloth_proxy_bindings(
-        source_path, binding_path, str(ownership_path), False))
-    (output / "binding_preview.json").write_text(json.dumps(preview, indent=2), encoding="utf8")
+        source_path, binding_path, str(ownership_path), False), output / "binding_preview.json")
     render_only_count = len(ownership["render_only_vertex_indices"])
     _verify_render_only_binding(preview, render_only_count)
     repaired = _native(unreal.CodexClothToolsLibrary.repair_cloth_proxy_bindings(
@@ -631,6 +859,7 @@ def build_in_editor(record, output_directory):
                "render_only_vertices": render_only_count,
                "weight_source": "simulation_source_own_g",
                "reference_skeletal_mesh_asset_path": record["body_mesh_asset_path"],
+               "authored_weight_map_transfer": packet.get('weight_map_transfer'),
                "native_binding": repaired}
     (output / "receipt.json").write_text(json.dumps(receipt, indent=2), encoding="utf8")
     return receipt
@@ -834,34 +1063,14 @@ def _apply_hair_guide_cloth(record):
     project = Path(unreal.Paths.convert_relative_path_to_full(unreal.Paths.get_project_file_path())).resolve()
     run = project.parent / "Saved" / "HairGuideCloth" / uuid.uuid4().hex
     run.mkdir(parents=True)
-    # Releasing package file handles allows the isolated native worker to write
-    # new collections while the user's current level and editor stay open.
-    unreal.EditorLoadingAndSavingUtils.fully_load_assets(assets)
-    worker_path = project.parent / "Scripts" / "HairGuideCloth" / "native_worker.py"
-    if not worker_path.is_file():
-        raise RuntimeError("Install the project's Scripts/HairGuideCloth native worker first")
-    spec = importlib.util.spec_from_file_location("send2ue_hair_native_worker", worker_path)
-    worker = importlib.util.module_from_spec(spec); sys.modules[spec.name] = worker; spec.loader.exec_module(worker)
-    script = run / "build.py"
-    script.write_text("import importlib.util,sys\n"
-                      "s=importlib.util.spec_from_file_location('send2ue_hair_builder'," + repr(str(Path(__file__).resolve())) + ")\n"
-                      "m=importlib.util.module_from_spec(s);sys.modules[s.name]=m;s.loader.exec_module(m)\n"
-                      "m.build_in_editor(" + repr(record) + "," + repr(str(run)) + ")\n", encoding="utf8")
-    engine = Path(unreal.Paths.convert_relative_path_to_full(unreal.Paths.engine_dir())).resolve().parent
-    result = worker.run_script(str(script), project_path=str(project), engine_root=str(engine),
-                               log_path=str(run / "worker.log"), timeout=900)
-    receipt_path = run / "receipt.json"
-    if not result.get("ok") or not receipt_path.is_file():
-        raise RuntimeError("Hair guide cloth build failed: " + str(result))
-    receipt = json.loads(receipt_path.read_text(encoding="utf8"))
-    unreal.AssetRegistryHelpers.get_asset_registry().scan_paths_synchronous(
-        [receipt["cloth_asset_path"].rsplit("/", 1)[0]], force_rescan=True)
+    # Build in the admitted visible editor. Never launch a second/headless
+    # editor against production packages, and never reload live package state.
+    receipt = build_in_editor(record, str(run))
+    if not receipt or not receipt.get("verified"):
+        raise RuntimeError("Hair guide cloth build did not produce a verified receipt")
     final = unreal.load_asset(receipt["cloth_asset_path"])
     if not final:
         raise RuntimeError("New cloth asset was saved but could not be loaded")
-    if not unreal.EditorLoadingAndSavingUtils.reload_packages([final.get_outer()], unreal.ReloadPackagesInteractionMode.ASSUME_NEGATIVE):
-        raise RuntimeError("New cloth was saved but the editor could not reload it")
-    final = unreal.load_asset(receipt["cloth_asset_path"])
     if (unreal.EditorAssetLibrary.get_metadata_tag(final, CONTENT) != receipt["manifest_sha256"] or
             unreal.EditorAssetLibrary.get_metadata_tag(final, "Send2UE.HairGuideCloth.BindingData") != receipt["binding_asset_path"]):
         raise RuntimeError("The editor still has an older cloth result loaded")

@@ -179,9 +179,16 @@ class NativeOperatorTests(unittest.TestCase):
         self.utilities = mock.Mock()
         self.utilities.is_unreal_connected.return_value = True
         self.export = mock.Mock()
+        fixture_package = types.ModuleType('_native_operator_fixture')
+        fixture_package.__path__ = []
+        fixture_core = types.ModuleType(fixture_package.__name__ + '.core')
+        self.export_selection = mock.Mock()
+        fixture_core.export_selection = self.export_selection
         tree = ast.parse((ADDON / "operators.py").read_text(encoding="utf-8"))
         cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Send2Ue")
-        env = dict(bpy=self.bpy, queue=queue, os=os, unreal=UNREAL, coordination=COORD,
+        env = dict(__name__=fixture_package.__name__ + '.operators',
+                   __package__=fixture_package.__name__,
+                   bpy=self.bpy, queue=queue, os=os, unreal=UNREAL, coordination=COORD,
                    utilities=self.utilities, export=self.export,
                    ToolInfo=types.SimpleNamespace(EXECUTION_QUEUE=types.SimpleNamespace(value="jobs")),
                    grouppro_export=mock.Mock(), preview_modifier_guard=mock.Mock(),
@@ -196,7 +203,12 @@ class NativeOperatorTests(unittest.TestCase):
         self.op.pre_operation = mock.Mock()
         self.op.post_operation = mock.Mock()
         self.context = mock.Mock()
-        self.patches = [mock.patch.object(COORD, "load_bridge", return_value=self.bridge), mock.patch.dict(sys.modules, {"bpy": self.bpy})]
+        self.patches = [mock.patch.object(COORD, "load_bridge", return_value=self.bridge),
+                        mock.patch.dict(sys.modules, {
+                            "bpy": self.bpy,
+                            fixture_package.__name__: fixture_package,
+                            fixture_core.__name__: fixture_core,
+                        })]
         for patch in self.patches:
             patch.start()
             self.addCleanup(patch.stop)
@@ -257,6 +269,7 @@ class NativeOperatorTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'dependency save failed'):
             self.real_post_operation()
         self.utilities.remove_unpacked_files.assert_called_once()
+        self.export_selection.cleanup.assert_called_once()
         self.utilities.set_context.assert_called_once()
 
     def test_modal_cancel_never_completes_after_clearing_queue(self):
