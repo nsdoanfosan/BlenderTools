@@ -22,6 +22,18 @@ VERSION = "send2ue.hair_guide_cloth.v1"
 RENDER_ONLY_SOURCE_STATUSES = {"no_guide_after_search", "guide_weights_all_zero"}
 
 
+class _RetainDependenciesError(RuntimeError):
+    """Recovery is uncertain; no caller may force-delete request dependencies."""
+
+
+def _is_simulation_config_node(node_type):
+    # This registered collection-only node stores artist-owned hair response.
+    # Keep the same narrow contract for templates and repeated publication.
+    return (node_type == "FCodexHairResponseConfigNode" or
+            node_type == "FCodexGarmentWindConfigNode" or
+            re.fullmatch(r"FChaosClothAssetSimulation\w*ConfigNode(?:_v\d+)?", node_type) is not None)
+
+
 def _sha(path):
     digest = hashlib.sha256()
     with open(path, "rb") as stream:
@@ -236,10 +248,215 @@ def _graph(unreal, asset):
     return graph, call, structure, nodes, infos
 
 
+def _graph_owned_by(graph, asset):
+    current = graph
+    while current is not None:
+        if current == asset:
+            return True
+        current = current.get_outer()
+    return False
+
+
+def _struct_text_fields(value):
+    """Split native ExportText fields without rewriting nested artist values."""
+    if not value.startswith("(") or not value.endswith(")"):
+        raise ValueError("Expected native struct ExportText")
+    fields, start, depth, quote, escaped = {}, 0, 0, None, False
+    body = value[1:-1]
+    parts = []
+    for index, char in enumerate(body):
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+        elif char in ("'", '"'):
+            quote = char
+        elif char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        elif char == "," and depth == 0:
+            parts.append(body[start:index]); start = index + 1
+        if depth < 0:
+            raise ValueError("Unbalanced native struct ExportText")
+    if depth or quote:
+        raise ValueError("Unbalanced native struct ExportText")
+    parts.append(body[start:])
+    for part in parts:
+        name, separator, text = part.partition("=")
+        name = name.strip()
+        if not separator or not name or name in fields:
+            raise ValueError("Invalid native struct ExportText field")
+        fields[name] = text
+    return fields
+
+
+def _property_bag_context(text):
+    fields = _struct_text_fields(text)
+    if set(fields) == {"Value"}:
+        value = fields["Value"]
+        generated = re.match(r"/Engine/Transient\.PropertyBag_[0-9a-fA-F]+(?=\()", value)
+        if generated:
+            payload = value[generated.end():]
+            _struct_text_fields(payload)  # Validate the complete payload.
+            # SyncVariables creates a new transient schema UObject on rebind.
+            # Its hash is not an artist value. Keep every payload character;
+            # graph variable names/types/values and override GUIDs are checked
+            # separately. Never replace matching paths inside artist strings.
+            return "(Value=<PropertyBag>" + payload + ")"
+    return text
+
+
+def _graph_context(asset):
+    # Owner and preview overrides are reflected but not editor-readable in
+    # UE5.8. Struct ExportText includes them without bypassing property access.
+    fields = _struct_text_fields(asset.get_editor_property("dataflow_instance").export_text())
+    context = {key: fields[name] for key, name in (
+        ("terminal", "DataflowTerminal"), ("overrides", "VariableOverrides"),
+        ("preview", "PreviewBlueprintVariableOverrides"), ("owner", "Owner"))}
+    overrides = _struct_text_fields(context["overrides"])
+    overrides["Variables"] = _property_bag_context(overrides["Variables"])
+    context["overrides"] = "(" + ",".join(k + "=" + v for k, v in overrides.items()) + ")"
+    context["preview"] = _property_bag_context(context["preview"])
+    return context
+
+
+def _graph_snapshot(unreal, asset):
+    graph, call, structure, nodes, infos = _graph(unreal, asset)
+    if set(nodes) != {n["name"] for n in structure["nodes"]}:
+        raise RuntimeError("Dataflow has unresolved editor nodes: " + graph.get_path_name())
+    native = _native(unreal.CodexClothToolsLibrary.dump_dataflow_nodes(graph.get_path_name()))
+    # Only the graph's own asset name changes during duplication. All node
+    # properties, activation flags, GUIDs, pin IDs and links must survive.
+    return {
+        "nodes": sorted(structure["nodes"], key=lambda n: n["name"]),
+        "connections": sorted(structure["connections"], key=lambda e: json.dumps(e, sort_keys=True)),
+        "infos": infos,
+        "native_nodes": sorted(native["nodes"], key=lambda n: n["name"]),
+        # Unlike the Blueprint variable-list helper, this Agent API safely
+        # returns [] for a graph with no property bag.
+        "variables": sorted(json.loads(call("ListVariables", graph)), key=lambda v: v["name"]),
+    }
+
+
+def _delete_created(unreal, paths):
+    for path in reversed(paths):
+        try:
+            if unreal.EditorAssetLibrary.does_asset_exist(path):
+                if not unreal.EditorAssetLibrary.delete_asset(path):
+                    raise RuntimeError("delete_asset returned false")
+        except Exception as error:
+            # EditorAssetLibrary uses force deletion. A surviving Cloth may
+            # reference both local graphs and the outer build's binding data.
+            raise _RetainDependenciesError("Could not remove request-created asset; remaining dependencies retained: " +
+                                           path + "; " + str(error)) from error
+
+
+def _restore_graph(unreal, asset, isolation):
+    instance = asset.get_editor_property("dataflow_instance")
+    instance.set_editor_property("dataflow_asset", isolation["old_graph"])
+    if (instance.get_editor_property("dataflow_asset") != isolation["old_graph"] or
+            _graph_context(asset) != isolation["context"]):
+        raise RuntimeError("Could not restore Cloth Dataflow reference/context: " + asset.get_path_name())
+
+
+def _independent_graph(unreal, asset):
+    """Detach externally shared Dataflow before the first graph write.
+
+    FDataflowInstance.DataflowAsset is not Instanced: duplicating a Cloth does
+    not duplicate an external graph. Embedded graphs already owned by this
+    Cloth retain their ordinary storage path.
+    """
+    graph, _, _, old_nodes, _ = _graph(unreal, asset)
+    if _graph_owned_by(graph, asset):
+        return None
+    context = _graph_context(asset)
+    before = _graph_snapshot(unreal, asset)
+    path = _path(asset.get_path_name()) + "_Dataflow_" + uuid.uuid4().hex[:8]
+    if unreal.EditorAssetLibrary.does_asset_exist(path):
+        raise RuntimeError("Dataflow isolation destination already exists: " + path)
+    clone = None
+    binding_attempted = False
+    isolation = {"old_graph": graph, "graph": None, "path": path, "context": context}
+    try:
+        clone = unreal.EditorAssetLibrary.duplicate_asset(graph.get_path_name(), path)
+        if not clone or clone == graph or _path(clone.get_path_name()) != path:
+            raise RuntimeError("Could not independently duplicate external Dataflow: " + graph.get_path_name())
+        isolation["graph"] = clone
+        # Persist the dependency before exposing it through the Cloth. A later
+        # graph mutation must be saved again by _save_cloth.
+        if not unreal.EditorAssetLibrary.save_loaded_asset(clone):
+            raise RuntimeError("Could not save independent Dataflow: " + path)
+        instance = asset.get_editor_property("dataflow_instance")
+        binding_attempted = True
+        instance.set_editor_property("dataflow_asset", clone)
+        actual, _, _, new_nodes, _ = _graph(unreal, asset)
+        copied, copied_context = _graph_snapshot(unreal, asset), _graph_context(asset)
+        shared_nodes = any(n == old for n in new_nodes.values() for old in old_nodes.values())
+        if actual != clone or copied_context != context or shared_nodes or copied != before:
+            changed = {"reference_matches": actual == clone, "shared_editor_nodes": shared_nodes,
+                       "context_fields": [k for k in context if copied_context.get(k) != context[k]],
+                       "graph_fields": [k for k in before if copied.get(k) != before[k]]}
+            for key in ("nodes", "infos", "native_nodes"):
+                old_rows, new_rows = before[key], copied[key]
+                if key != "infos":
+                    old_rows = {n["name"]: n for n in old_rows}
+                    new_rows = {n["name"]: n for n in new_rows}
+                changed[key] = {name: [k for k in old_rows.get(name, {})
+                    if old_rows[name][k] != new_rows.get(name, {}).get(k)]
+                    for name in old_rows if old_rows[name] != new_rows.get(name)}
+            raise RuntimeError("Independent Dataflow did not preserve graph/context: " + path + "; " +
+                               json.dumps(changed, sort_keys=True))
+        return isolation
+    except Exception as error:
+        try:
+            if binding_attempted:
+                _restore_graph(unreal, asset, isolation)
+            # The unique destination was absent before this request. A native
+            # duplicate can allocate it and then throw/return no UObject.
+            _delete_created(unreal, [path])
+        except Exception as rollback:
+            raise _RetainDependenciesError(str(error) + "; Dataflow isolation rollback failed: " + str(rollback)) from error
+        raise
+
+
+def _save_cloth(unreal, asset, failure="Cloth could not be saved"):
+    graph = _graph(unreal, asset)[0]
+    if not _graph_owned_by(graph, asset):
+        if not unreal.EditorAssetLibrary.save_loaded_asset(graph):
+            raise RuntimeError("Could not save Cloth Dataflow dependency: " + graph.get_path_name())
+    if not unreal.EditorAssetLibrary.save_loaded_asset(asset):
+        raise RuntimeError(failure + ": " + asset.get_path_name())
+
+
 def _build_source(unreal, record, path):
+    created = []
+    try:
+        return _build_source_impl(unreal, record, path, created)
+    except Exception as error:
+        if isinstance(error, _RetainDependenciesError):
+            raise
+        try:
+            _delete_created(unreal, created)
+        except Exception as cleanup:
+            raise _RetainDependenciesError(str(error) + "; " + str(cleanup)) from error
+        raise
+
+
+def _build_source_impl(unreal, record, path, created):
+    if unreal.EditorAssetLibrary.does_asset_exist(path):
+        raise ValueError("Cloth build destination already exists: " + path)
+    created.append(path)
     asset = unreal.EditorAssetLibrary.duplicate_asset(record["cloth_template_asset_path"], path)
-    if not asset:
+    if not asset or _path(asset.get_path_name()) != path:
         raise RuntimeError("Failed to duplicate the cloth physics template")
+    # Delete the Cloth first on failure, then its newly created dependency.
+    isolation = _independent_graph(unreal, asset)
+    if isolation:
+        created.insert(0, isolation["path"])
     graph, call, structure, nodes, infos = _graph(unreal, asset)
     terminals = [n for n, info in infos.items() if "TerminalNode" in info["type"]]
     if len(terminals) != 1:
@@ -254,8 +471,7 @@ def _build_source(unreal, record, path):
         seen.add(current); chain.append(current)
         current = incoming.get((current, "Collection"))
     chain.reverse()
-    config = [n for n in chain if infos[n]["type"].startswith("FChaosClothAssetSimulation")
-              and "Config" in infos[n]["type"]]
+    config = [n for n in chain if _is_simulation_config_node(infos[n]["type"])]
     maxima = [n for n in config if "MaxDistanceConfig" in infos[n]["type"]]
     if len(maxima) != 1:
         raise ValueError("Physics template requires one MaxDistance config on LOD0")
@@ -304,8 +520,7 @@ def _build_source(unreal, record, path):
     if baked.get("unmatched_sim_vertices", 1) or baked.get("snap_distance_max_cm", 1.) > .001:
         raise ValueError("Simulation G could not be transferred exactly")
     audit = _native(unreal.CodexClothToolsLibrary.dump_cloth_collection_colors(path))
-    if not unreal.EditorAssetLibrary.save_loaded_asset(asset):
-        raise RuntimeError("Could not save the cloth build source")
+    _save_cloth(unreal, asset, "Could not save the cloth build source")
     return asset, audit
 
 
@@ -693,9 +908,41 @@ def _weight_map_updates(full_graph, old, new, packet, ownership):
 
 
 def _publish(unreal, source_asset, binding_path, target, owner, content, packet=None, ownership=None):
+    created = []
+    try:
+        result, disposable = _publish_impl(unreal, source_asset, binding_path, target, owner, content, packet, ownership, created)
+    except Exception as error:
+        if isinstance(error, _RetainDependenciesError):
+            raise
+        try:
+            _delete_created(unreal, created)
+        except Exception as cleanup:
+            raise _RetainDependenciesError(str(error) + "; " + str(cleanup)) from error
+        raise
+    # Publication is committed. A cleanup error must never delete the saved
+    # final or dependencies that it now references.
+    try:
+        _delete_created(unreal, disposable)
+    except Exception as cleanup:
+        # Final and dependencies are already saved. Report cleanup separately
+        # so the outer build never treats a committed publication as disposable.
+        result["staging_cleanup_warning"] = str(cleanup)
+    return result
+
+
+def _publish_impl(unreal, source_asset, binding_path, target, owner, content, packet, ownership, created):
     # Verify a new two-node graph before touching a previously published asset.
     stage_path = source_asset.get_path_name().split(".", 1)[0] + "_FinalStage"
+    if unreal.EditorAssetLibrary.does_asset_exist(stage_path):
+        raise ValueError("Cloth staging destination already exists: " + stage_path)
+    created.append(stage_path)
     stage = unreal.EditorAssetLibrary.duplicate_asset(source_asset.get_path_name(), stage_path)
+    if not stage or _path(stage.get_path_name()) != stage_path:
+        raise RuntimeError("Could not duplicate cloth staging asset")
+    isolation = _independent_graph(unreal, stage)
+    if isolation:
+        created.insert(0, isolation["path"])
+    disposable = ([isolation["path"]] if isolation else []) + [stage_path]
     graph, call, _, nodes, infos = _graph(unreal, stage)
     terminal = next(n for n, i in infos.items() if "TerminalNode" in i["type"])
     for name, node in nodes.items():
@@ -715,17 +962,19 @@ def _publish(unreal, source_asset, binding_path, target, owner, content, packet=
     binding_key = "Send2UE.HairGuideCloth.BindingData"
     for key, value in ((OWNER, owner), (CONTENT, content), (binding_key, binding_path)):
         unreal.EditorAssetLibrary.set_metadata_tag(stage, key, value)
-    if not unreal.EditorAssetLibrary.save_loaded_asset(stage):
-        raise RuntimeError("Validated cloth staging asset could not be saved")
+    _save_cloth(unreal, stage, "Validated cloth staging asset could not be saved")
     if not unreal.EditorAssetLibrary.does_asset_exist(target):
+        created.append(target)
         final = unreal.EditorAssetLibrary.duplicate_asset(stage_path, target)
-        if not final:
+        if not final or _path(final.get_path_name()) != target:
             raise RuntimeError("Validated cloth could not be published")
+        isolation = _independent_graph(unreal, final)
+        if isolation:
+            created.insert(0, isolation["path"])
         # Package UMetaData is not guaranteed to follow UObject duplication.
         for key, value in ((OWNER, owner), (CONTENT, content), (binding_key, binding_path)):
             unreal.EditorAssetLibrary.set_metadata_tag(final, key, value)
-        if not unreal.EditorAssetLibrary.save_loaded_asset(final):
-            raise RuntimeError("Validated cloth could not be published")
+        _save_cloth(unreal, final, "Validated cloth could not be published")
     else:
         final = unreal.load_asset(target)
         if unreal.EditorAssetLibrary.get_metadata_tag(final, OWNER) != owner:
@@ -743,7 +992,7 @@ def _publish(unreal, source_asset, binding_path, target, owner, content, packet=
         # Geometry/weight-map/proxy nodes are not configuration overrides.
         configs = set(fn) - set(imports) - set(terminals)
         if any(fi[n]["type"] not in ("FChaosClothAssetSetPhysicsAssetNode", "FChaosClothAssetWeightMapNode") and
-               not re.fullmatch(r"FChaosClothAssetSimulation\w*ConfigNode(?:_v\d+)?", fi[n]["type"])
+               not _is_simulation_config_node(fi[n]["type"])
                for n in configs):
             raise ValueError("Existing cloth graph has user changes; it remains unchanged")
         incoming = {(e["toNode"], e["toPin"]): e["fromNode"] for e in fs["connections"]
@@ -782,7 +1031,14 @@ def _publish(unreal, source_asset, binding_path, target, owner, content, packet=
             old_collection = _native(unreal.CodexClothToolsLibrary.dump_cloth_collection_colors(target))
             maps = _weight_map_updates(full_graph, old_collection['collections'][0],
                                        before['collections'][0], packet, ownership)
+        # If isolation itself fails, its restoration result is authoritative.
+        # Never evaluate/save a possibly uncertain reference in that case.
+        isolation = _independent_graph(unreal, final)
+        writes_started = False
         try:
+            # Never keep EdNode handles into the former shared graph.
+            fg, fc, fs, fn, fi = _graph(unreal, final)
+            writes_started = True
             for name, (_, _, weights) in maps.items():
                 fc('UpdateNode', fn[name], json.dumps({'VertexWeights': weights}))
             fc("UpdateNode", fn[imports[0]], json.dumps({"ClothAsset": binding_path, "ImportLod": 0}))
@@ -811,22 +1067,47 @@ def _publish(unreal, source_asset, binding_path, target, owner, content, packet=
                                    ", ".join(changed_fields))
             unreal.EditorAssetLibrary.set_metadata_tag(final, CONTENT, content)
             unreal.EditorAssetLibrary.set_metadata_tag(final, binding_key, binding_path)
-            if not unreal.EditorAssetLibrary.save_loaded_asset(final):
-                raise RuntimeError("Updated cloth could not be saved")
-        except Exception:
-            for name, (_, values, _) in maps.items():
-                fc('UpdateNode', fn[name], json.dumps({'VertexWeights': values}))
-            fc("UpdateNode", fn[imports[0]], json.dumps({"ClothAsset": old_binding, "ImportLod": 0}))
-            unreal.DataflowBlueprintLibrary.evaluate_terminal_node_by_name(fg, terminals[0], final)
-            unreal.EditorAssetLibrary.set_metadata_tag(final, CONTENT, old_content)
-            unreal.EditorAssetLibrary.set_metadata_tag(final, binding_key, old_binding)
-            unreal.EditorAssetLibrary.save_loaded_asset(final)
+            _save_cloth(unreal, final, "Updated cloth could not be saved")
+        except Exception as error:
+            try:
+                if isolation:
+                    _restore_graph(unreal, final, isolation)
+                    fg = _graph(unreal, final)[0]
+                elif writes_started:
+                    for name, (_, values, _) in maps.items():
+                        fc('UpdateNode', fn[name], json.dumps({'VertexWeights': values}))
+                    fc("UpdateNode", fn[imports[0]], json.dumps({"ClothAsset": old_binding, "ImportLod": 0}))
+                unreal.DataflowBlueprintLibrary.evaluate_terminal_node_by_name(fg, terminals[0], final)
+                unreal.EditorAssetLibrary.set_metadata_tag(final, CONTENT, old_content)
+                unreal.EditorAssetLibrary.set_metadata_tag(final, binding_key, old_binding)
+                # An external original was never edited. Persist only the
+                # restored Cloth reference/collection, not the shared graph.
+                if not unreal.EditorAssetLibrary.save_loaded_asset(final):
+                    raise RuntimeError("Restored Cloth could not be saved: " + target)
+                if isolation:
+                    _delete_created(unreal, [isolation["path"]])
+            except Exception as rollback:
+                raise _RetainDependenciesError(str(error) + "; Cloth rollback failed: " + str(rollback)) from error
             raise
-    return after
+    return after, disposable
 
 
 def build_in_editor(record, output_directory):
-    """Run in a cold native worker, or an editor with the current helper loaded."""
+    """Run in the admitted editor; discard only uncommitted request assets."""
+    import unreal
+    created, committed = [], [False]
+    try:
+        return _build_in_editor(record, output_directory, created, committed)
+    except Exception as error:
+        if not committed[0] and not isinstance(error, _RetainDependenciesError):
+            try:
+                _delete_created(unreal, created)
+            except Exception as cleanup:
+                raise _RetainDependenciesError(str(error) + "; " + str(cleanup)) from error
+        raise
+
+
+def _build_in_editor(record, output_directory, created, committed):
     import unreal
     record, packet = validate_record(record)
     output = Path(output_directory); output.mkdir(parents=True, exist_ok=True)
@@ -856,6 +1137,10 @@ def build_in_editor(record, output_directory):
     build_folder = folder + "/HairGuideCloth/" + stem + "/" + revision
     source_path, binding_path = build_folder + "/CA_BuildSource", build_folder + "/CA_BindingData"
     source, initial = _build_source(unreal, record, source_path)
+    source_graph = _graph(unreal, source)[0]
+    if not _graph_owned_by(source_graph, source):
+        created.append(_path(source_graph.get_path_name()))
+    created.append(source_path)
     ownership = normalize_ownership(initial["collections"][0]["built_mapping"], packet)
     # Sharing a USkeleton does not guarantee identical imported reference-pose
     # scales. The native helper uses the actual leader's reference skeleton,
@@ -863,6 +1148,9 @@ def build_in_editor(record, output_directory):
     ownership["reference_skeletal_mesh_asset_path"] = record["body_mesh_asset_path"]
     ownership_path = output / "ownership.json"
     ownership_path.write_text(json.dumps(ownership), encoding="utf8")
+    if unreal.EditorAssetLibrary.does_asset_exist(binding_path):
+        raise ValueError("Cloth binding destination already exists: " + binding_path)
+    created.append(binding_path)
     preview = _native(unreal.CodexClothToolsLibrary.repair_cloth_proxy_bindings(
         source_path, binding_path, str(ownership_path), False), output / "binding_preview.json")
     render_only_count = len(ownership["render_only_vertex_indices"])
@@ -874,6 +1162,7 @@ def build_in_editor(record, output_directory):
     if not binding or not unreal.EditorAssetLibrary.save_loaded_asset(binding):
         raise RuntimeError("Validated binding collection could not be saved")
     final = _publish(unreal, source, binding_path, target, owner, content, packet, ownership)
+    committed[0] = True
     native = final["collections"][0]["built_mapping"]
     receipt = {"verified": True, "version": record["version"], "cloth_asset_path": target,
                "simulation_enabled": True, "no_guide_policy": "render_only_skinning",
@@ -887,6 +1176,8 @@ def build_in_editor(record, output_directory):
                "reference_skeletal_mesh_asset_path": record["body_mesh_asset_path"],
                "authored_weight_map_transfer": packet.get('weight_map_transfer'),
                "native_binding": repaired}
+    if final.get("staging_cleanup_warning"):
+        receipt["staging_cleanup_warning"] = final["staging_cleanup_warning"]
     (output / "receipt.json").write_text(json.dumps(receipt, indent=2), encoding="utf8")
     return receipt
 
@@ -1072,6 +1363,7 @@ def _apply_hair_guide_cloth(record):
         assets.append(asset)
     dirty = {p.get_path_name() for p in unreal.EditorLoadingAndSavingUtils.get_dirty_content_packages()}
     target = _target(record)
+    current = None
     if unreal.EditorAssetLibrary.does_asset_exist(target):
         current = unreal.load_asset(target)
         expected_owner = VERSION + ":" + record["render_asset_path"]
@@ -1083,6 +1375,12 @@ def _apply_hair_guide_cloth(record):
     for asset in assets[2:]:
         if asset.get_outer().get_path_name() in dirty:
             raise ValueError("Cloth template/body has unsaved edits; save it before Send to Unreal: " + asset.get_path_name())
+    # The graph can live in a different package from its Cloth. Do not snapshot
+    # unsaved artist edits implicitly or omit them from the existing dirty guard.
+    for asset in [assets[2]] + ([current] if current is not None else []):
+        graph = asset.get_editor_property("dataflow_instance").get_editor_property("dataflow_asset")
+        if graph and _path(graph.get_path_name()) in dirty:
+            raise ValueError("Cloth Dataflow has unsaved edits; save it before Send to Unreal: " + graph.get_path_name())
     for asset in assets[:2]:
         if not unreal.EditorAssetLibrary.save_loaded_asset(asset):
             raise RuntimeError("Imported hair mesh could not be saved")

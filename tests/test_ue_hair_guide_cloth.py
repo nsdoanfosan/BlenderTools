@@ -307,8 +307,10 @@ class ApplyHarness:
         for path in [self.record[key] for key in ('sim_asset_path', 'render_asset_path',
                      'cloth_template_asset_path', 'body_mesh_asset_path', 'physics_asset_path')] + [self.target]:
             package = SimpleNamespace(get_path_name=lambda p=path: p)
+            instance = SimpleNamespace(get_editor_property=lambda name: {'dataflow_asset': None}[name])
             self.assets[path] = SimpleNamespace(get_outer=lambda p=package: p,
-                                                get_path_name=lambda p=path: p, metadata={})
+                get_path_name=lambda p=path: p, metadata={},
+                get_editor_property=lambda name, i=instance: {'dataflow_instance': i}[name])
         self.final = self.assets[self.target]
         self.final.metadata = {M.OWNER: M.VERSION + ':' + self.record['render_asset_path'],
                                M.CONTENT: 'old-content', PublishHarness.binding_key: '/Game/Hair/BindingsOld'}
@@ -502,7 +504,7 @@ class PublishHarness:
                 does_asset_exist=lambda path: path in self.assets,
                 get_metadata_tag=lambda asset, key: asset.metadata.get(key, ''),
                 set_metadata_tag=lambda asset, key, value: asset.metadata.__setitem__(key, value),
-                save_loaded_asset=self.save),
+                save_loaded_asset=self.save, delete_asset=self.delete),
             CodexClothToolsLibrary=SimpleNamespace(dump_cloth_collection_colors=self.dump),
             DataflowBlueprintLibrary=SimpleNamespace(evaluate_terminal_node_by_name=lambda *args: None))
 
@@ -542,6 +544,14 @@ class PublishHarness:
             self.fail_next_target_save = False
             return False
         self.saved[asset.path] = self.snapshot(asset)
+        return True
+
+    def delete(self, path):
+        path = path.split('.', 1)[0]
+        if path not in self.assets:
+            return False
+        del self.assets[path]
+        self.saved.pop(path, None)
         return True
 
     def dump(self, path):
@@ -621,6 +631,42 @@ class PublishHarness:
 
 
 class PublicationTests(unittest.TestCase):
+    def test_reexport_preserves_asset_owned_hair_response_across_revisions(self):
+        h = PublishHarness(); h.add_solver()
+        final = h.assets[h.target]
+        final.node_types['ExtraSolverStability'] = 'FCodexHairResponseConfigNode'
+        final.config_properties['ExtraSolverStability'] = {
+            'bEnableHairResponse': True, 'bEnableHairParentResponse': True,
+            'HairGustTimeScale': 3., 'HairParentForceRatio': 1.4,
+            'HairTimingVarianceSeconds': .75}
+        before = h.snapshot(final)
+        for next_binding in ('/Game/Hair/BindingsNew', '/Game/Hair/BindingsNext'):
+            h.new_binding = next_binding
+            h.publish()
+            saved = h.saved[h.target]
+            self.assertEqual(saved['config_properties'], before['config_properties'])
+            self.assertEqual(saved['nodes'], before['nodes'])
+            self.assertEqual(saved['connections'], before['connections'])
+            h.old_binding = next_binding
+
+    def test_hair_response_lookalike_node_is_rejected_without_changing_final_asset(self):
+        h = PublishHarness(); h.add_solver()
+        final = h.assets[h.target]
+        final.node_types['ExtraSolverStability'] = 'FCodexHairResponseGeometryConfigNode'
+        before = h.snapshot(final)
+        with self.assertRaisesRegex(ValueError, 'user changes'):
+            h.publish()
+        self.assertEqual(h.snapshot(final), before)
+        self.assertEqual(h.updates, [])
+
+    def test_template_and_publication_accept_only_registered_hair_response_type(self):
+        self.assertTrue(M._is_simulation_config_node('FCodexHairResponseConfigNode'))
+        self.assertTrue(M._is_simulation_config_node('FChaosClothAssetSimulationSolverConfigNode'))
+        self.assertTrue(M._is_simulation_config_node('FChaosClothAssetSimulationAerodynamicsConfigNode_v2'))
+        for node_type in ('FCodexHairResponseConfigNode_v2', 'FCodexHairResponseGeometryConfigNode',
+                          'FChaosClothAssetImportNode', 'FChaosClothAssetProxyDeformerNode_v3'):
+            self.assertFalse(M._is_simulation_config_node(node_type))
+
     def test_full_collection_digest_can_differ_for_preserved_artist_configuration(self):
         h = PublishHarness(); h.add_solver(); h.add_capsule_collision()
         original = h.snapshot(h.assets[h.target]); dump = h.dump
@@ -790,6 +836,234 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(h.snapshot(h.assets[h.target]), before)
         self.assertEqual(h.saved[h.target], before)
         self.assertEqual(h.updates, [])
+
+
+# BEGIN garment wind config preservation regression
+def garment_physics_configuration():
+    # Nondefault wind8 includes the intentional disabled value. Native physics
+    # and weighted-map bindings remain separate artist-owned configuration.
+    weighted = lambda low, high: {
+        'bIsAnimatable': True, 'Low': low, 'High': high, 'WeightMap': 'MaxDistance'}
+    return {
+        'ArtistMaxDistance': ('FChaosClothAssetSimulationMaxDistanceConfigNode', {
+            'MaxDistance': weighted(8., 61.)}),
+        'ArtistAerodynamics': ('FChaosClothAssetSimulationAerodynamicsConfigNode_v2', {
+            'Drag': weighted(.113, .671), 'Lift': weighted(.037, .283),
+            'bEnableOuterDrag': False, 'bEnableOuterLift': True,
+            'WindVelocity': {'X': 17., 'Y': -31., 'Z': 7.}, 'WindVelocitySpace': 'WorldSpace'}),
+        'ArtistDamping': ('FChaosClothAssetSimulationDampingConfigNode', {
+            'DampingCoefficientWeighted': weighted(.071, .219),
+            'LocalDampingCoefficient': .123}),
+        'ArtistSolver': ('FChaosClothAssetSimulationSolverConfigNode', {
+            'NumIterations': 16, 'MaxNumIterations': 23, 'NumSubsteps': 3}),
+        'ArtistHairResponse': ('FCodexHairResponseConfigNode', {
+            'bEnableHairResponse': True, 'bEnableHairParentResponse': False,
+            'HairGustTimeScale': 2.7, 'HairParentForceRatio': 1.3}),
+        'ArtistGarmentWind': ('FCodexGarmentWindConfigNode', {
+            'bEnabled': False, 'AirSpeedAtUnitAmplitude': 405.,
+            'ResponseExponent': .77, 'MaxAirSpeed': 1370., 'Gust': .83,
+            'Flutter': .44, 'MeanSoftCap': 575., 'HighFlutter': .22}),
+    }
+
+
+class GarmentPublishHarness(PublishHarness):
+    """Exercise real publication/map-transfer code with synthetic collections."""
+    def __init__(self):
+        super().__init__()
+        final = self.assets[self.target]
+        configuration = garment_physics_configuration()
+        self.paint = [0.125, 0.625, 0.875]
+        final.node_types['ArtistPaint'] = 'FChaosClothAssetWeightMapNode'
+        final.config_properties['ArtistPaint'] = {
+            'MeshTarget': 'Simulation', 'MapOverrideType': 'ReplaceAll',
+            'Snapshots': '(ActiveSnapshot=-1)', 'bIsFrozen': 'False',
+            'OutputName': '(StringValue="MaxDistance")',
+            'VertexWeights': '(' + ','.join(map(str, self.paint)) + ')'}
+        for name, (node_type, props) in configuration.items():
+            final.node_types[name] = node_type
+            final.config_properties[name] = copy.deepcopy(props)
+        chain = ['GeneratorBindings', 'ArtistPaint'] + list(configuration) + ['ClothAssetTerminal']
+        final.connections = [dict(fromNode=a, fromPin='Collection', toNode=b,
+            toPin='CollectionLods[0]' if b == 'ClothAssetTerminal' else 'Collection')
+            for a, b in zip(chain, chain[1:])]
+        final.connections.append(dict(fromNode='ArtistPaint', fromPin='OutputName.StringValue',
+            toNode='ArtistAerodynamics', toPin='Drag.WeightMap'))
+        self.saved[self.target] = self.snapshot(final)
+        self.map_updates = []
+        self.unreal.CodexClothToolsLibrary.dump_dataflow_nodes = self.dump_nodes
+
+    def graph(self, unreal, asset):
+        graph, base_call, structure, nodes, infos = super().graph(unreal, asset)
+
+        def call(operation, *args):
+            if operation == 'UpdateNode' and args[0].name == 'ArtistPaint':
+                weights = json.loads(args[1])['VertexWeights']
+                asset.config_properties['ArtistPaint']['VertexWeights'] = '(' + ','.join(map(str, weights)) + ')'
+                self.map_updates.append((asset.path, list(weights)))
+                return True
+            return base_call(operation, *args)
+        return graph, call, structure, nodes, infos
+
+    def dump_nodes(self, path):
+        asset = self.assets[path.split('.', 1)[0]]
+        return json.dumps({'nodes': [{'name': name, 'type': node_type,
+            'props': copy.deepcopy(asset.config_properties.get(name, {}))}
+            for name, node_type in asset.node_types.items()]})
+
+    def dump(self, path):
+        result = json.loads(super().dump(path))
+        collection = result['collections'][0]
+        collection['built_mapping'] = {
+            'sim_positions': [[0., 0., 0.], [1., 0., 0.], [0., 1., 0.]],
+            'sim_triangles': [[0, 1, 2]], 'kinematic_sim_indices': [0]}
+        collection['weight_maps'] = []
+        if path == self.target:
+            props = self.assets[path].config_properties.get('ArtistPaint')
+            if props:
+                values = [float(v) for v in props['VertexWeights'].strip('()').split(',')]
+                collection['weight_maps'] = [{'name': 'MaxDistance', 'values': values}]
+        return json.dumps(result)
+
+
+class GarmentWindConfigurationTests(unittest.TestCase):
+    def test_only_exact_registered_garment_type_is_configuration(self):
+        self.assertTrue(M._is_simulation_config_node('FCodexGarmentWindConfigNode'))
+        self.assertTrue(M._is_simulation_config_node('FCodexHairResponseConfigNode'))
+        self.assertTrue(M._is_simulation_config_node('FChaosClothAssetSimulationSolverConfigNode'))
+        for node_type in ('FCodexGarmentWindConfigNode_v2', 'FCodexGarmentWindGeometryConfigNode',
+                          'FCodexGarmentWindConfigNodeExtra', 'FCodexGarmentWindConfigNode ',
+                          'fcodexgarmentwindconfignode'):
+            with self.subTest(node_type=node_type):
+                self.assertFalse(M._is_simulation_config_node(node_type))
+
+    def test_template_lod0_retains_disabled_wind8_native_physics_and_hair(self):
+        configuration = garment_physics_configuration()
+        node_types = {'OldImport': 'FChaosClothAssetSkeletalMeshImportNode_v2',
+                      'ClothAssetTerminal': 'FChaosClothAssetTerminalNode'}
+        node_types.update({name: row[0] for name, row in configuration.items()})
+        chain = ['OldImport'] + list(configuration) + ['ClothAssetTerminal']
+        template = SimpleNamespace(node_types=node_types,
+            properties={name: copy.deepcopy(row[1]) for name, row in configuration.items()},
+            connections=[dict(fromNode=a, fromPin='Collection', toNode=b,
+                toPin='CollectionLods[0]' if b == 'ClothAssetTerminal' else 'Collection')
+                for a, b in zip(chain, chain[1:])])
+        before = copy.deepcopy(vars(template))
+        built = []
+        operations = []
+        saved = []
+        record = {'cloth_template_asset_path': '/Game/Fixtures/Template',
+                  'sim_asset_path': '/Game/Fixtures/Sim', 'render_asset_path': '/Game/Fixtures/Render',
+                  'physics_asset_path': '/Game/Fixtures/BodyPhysics'}
+        build_path = '/Game/Fixtures/BuildSource'
+
+        def duplicate(source, destination):
+            self.assertEqual((source, destination), (record['cloth_template_asset_path'], build_path))
+            asset = copy.deepcopy(template)
+            asset.get_path_name = lambda: destination
+            built.append(asset)
+            return asset
+
+        def graph(unreal, asset):
+            nodes = {name: SimpleNamespace(name=name) for name in asset.node_types}
+            infos = {name: {'type': node_type,
+                'inputPins': [{'name': 'CollectionLods[0]'}] if name == 'ClothAssetTerminal' else []}
+                for name, node_type in asset.node_types.items()}
+
+            def call(operation, *args):
+                operations.append((operation, args))
+                if operation == 'RemoveNode':
+                    name = args[1].name
+                    del asset.node_types[name]
+                    asset.properties.pop(name, None)
+                    asset.connections = [e for e in asset.connections
+                        if name not in (e['fromNode'], e['toNode'])]
+                elif operation == 'AddNode':
+                    _, node_type, name, props, _, _ = args
+                    asset.node_types[name] = node_type
+                    asset.properties[name] = json.loads(props)
+                    return SimpleNamespace(name=name)
+                elif operation == 'ConnectNodePins':
+                    a, output, b, input_pin = args
+                    asset.connections = [e for e in asset.connections
+                        if (e['toNode'], e['toPin']) != (b.name, input_pin)]
+                    asset.connections.append(dict(fromNode=a.name, fromPin=output,
+                        toNode=b.name, toPin=input_pin))
+                    return True
+                else:
+                    raise AssertionError('Template configuration must not be rewritten: ' + operation)
+                return True
+            return asset, call, {'connections': asset.connections}, nodes, infos
+
+        bake = Mock(return_value=json.dumps({'success': True, 'unmatched_sim_vertices': 0,
+                                             'snap_distance_max_cm': 0.}))
+        audit = {'success': True, 'collections': [{'fixture': 'LOD0'}]}
+        unreal = SimpleNamespace(
+            EditorAssetLibrary=SimpleNamespace(duplicate_asset=duplicate,
+                does_asset_exist=lambda path: False,
+                save_loaded_asset=lambda asset: saved.append(asset) or True),
+            CodexClothToolsLibrary=SimpleNamespace(bake_vertex_color_weight_map=bake,
+                dump_cloth_collection_colors=lambda path: json.dumps(audit)))
+        with patch.object(M, '_graph', side_effect=graph):
+            asset, actual_audit = M._build_source(unreal, record, build_path)
+        self.assertEqual(vars(template), before, 'The template itself must remain untouched')
+        self.assertIs(asset, built[0])
+        self.assertEqual(actual_audit, audit)
+        self.assertEqual(saved, [asset])
+        self.assertNotIn('OldImport', asset.node_types)
+        self.assertEqual([args[1].name for op, args in operations if op == 'RemoveNode'], ['OldImport'])
+        for name, (node_type, props) in configuration.items():
+            self.assertEqual(asset.node_types[name], node_type)
+            self.assertEqual(asset.properties[name], props)
+        self.assertIs(asset.properties['ArtistGarmentWind']['bEnabled'], False)
+        for a, b in zip(list(configuration), list(configuration)[1:]):
+            self.assertIn(dict(fromNode=a, fromPin='Collection', toNode=b, toPin='Collection'),
+                          asset.connections)
+        self.assertIn(dict(fromNode='BodyPhysics', fromPin='Collection',
+            toNode='ArtistMaxDistance', toPin='Collection'), asset.connections)
+        self.assertIn(dict(fromNode='ArtistGarmentWind', fromPin='Collection',
+            toNode='EmbeddingInput', toPin='Collection'), asset.connections)
+        self.assertIn(dict(fromNode='GuideOwnG', fromPin='OutputName.StringValue',
+            toNode='ArtistMaxDistance', toPin='MaxDistance.WeightMap'), asset.connections)
+        self.assertIn(dict(fromNode='SimulationKinematicBlend', fromPin='Collection',
+            toNode='ClothAssetTerminal', toPin='CollectionLods[0]'), asset.connections)
+        bake.assert_called_once_with(build_path, record['sim_asset_path'], 'GuideOwnG', 'G', 1., False, True)
+
+    def test_two_reexports_preserve_disabled_wind8_native_physics_paint_and_connections(self):
+        h = GarmentPublishHarness()
+        final = h.assets[h.target]
+        before = h.snapshot(final)
+        revisions = ('/Game/Hair/BindingsNew', '/Game/Hair/BindingsNext')
+        for next_binding in revisions:
+            h.new_binding = next_binding
+            h.publish()
+            self.assertIs(h.assets[h.target], final)
+            saved = h.saved[h.target]
+            for key in ('config_properties', 'nodes', 'connections'):
+                self.assertEqual(saved[key], before[key])
+                self.assertEqual(h.snapshot(final)[key], before[key])
+            self.assertEqual(saved['binding'], next_binding)
+            self.assertEqual(saved['metadata'][h.binding_key], next_binding)
+            self.assertIs(saved['config_properties']['ArtistGarmentWind']['bEnabled'], False)
+            h.old_binding = next_binding
+        self.assertEqual(h.updates, [(h.target, binding) for binding in revisions])
+        self.assertEqual(h.map_updates, [(h.target, h.paint), (h.target, h.paint)])
+
+    def test_garment_lookalikes_are_rejected_without_mutating_published_configuration(self):
+        for node_type in ('FCodexGarmentWindConfigNode_v2', 'FCodexGarmentWindGeometryConfigNode',
+                          'FCodexGarmentWindConfigNodeExtra', 'fcodexgarmentwindconfignode'):
+            with self.subTest(node_type=node_type):
+                h = GarmentPublishHarness()
+                final = h.assets[h.target]
+                final.node_types['ArtistGarmentWind'] = node_type
+                before = h.snapshot(final)
+                h.saved[h.target] = copy.deepcopy(before)
+                with self.assertRaisesRegex(ValueError, 'user changes'):
+                    h.publish()
+                self.assertEqual(h.snapshot(final), before)
+                self.assertEqual(h.saved[h.target], before)
+                self.assertEqual(h.updates, [])
+                self.assertEqual(h.map_updates, [])
+# END garment wind config preservation regression
 
 
 if __name__ == '__main__':
