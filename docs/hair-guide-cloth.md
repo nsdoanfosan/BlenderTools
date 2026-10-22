@@ -170,3 +170,31 @@ Blender that will export. A previously loaded extension can retain its former
 absolute pipeline path even when the junction and Git checkout have changed.
 Preserve scene settings across Reload Extensions and verify the live material
 and cloth pipeline paths before sending.
+
+## Native G and authored Dataflow dependencies
+
+The source graph reads simulation-mesh G through
+`FCodexClothVertexColorWeightMapNode` and connects its map-name output to the
+original MaxDistance config. Standard GetVariable/Selection inputs, their native
+types, variable bag and instance context remain graph dependencies. Existing
+final physics is preserved; a fresh stage retains the source G/MaxDistance and
+kinematic-map path without applying the entire physics chain twice.
+
+WeightMap nodes may use a registered String GetVariable output on
+`InputName.StringValue` with an empty OutputName. The pipeline validates the
+native getter, graph variable and available instance overrides without baking
+that String into a field. Ambiguous, unsupported or conflicting identities stop
+the update. Existing literal map names remain supported.
+
+`ue_hair_weight_routes.py` plans and verifies native G, kinematic masks and
+skinning blend dependencies. `ue_hair_collection_proof.py` compares complete
+native managed-attribute values, including UVs. Complete equal semantic proofs
+may normalize serialization/name-enumeration order; unsupported attributes fail
+closed, and older native output keeps its strict comparison. Publication retains
+the existing explicit physics-config/new-map allowances and checks all other
+attribute schemas and values.
+
+These paths require the project's native CodexClothTools nodes and audit APIs.
+The app-free tests cover graph contracts, preservation and failure paths; they do
+not establish successful native migration or an FBX reimport of a production
+asset. Existing assets must have their native G migration before that reimport.
