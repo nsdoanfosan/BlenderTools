@@ -894,6 +894,11 @@ class GarmentPublishHarness(PublishHarness):
 
     def graph(self, unreal, asset):
         graph, base_call, structure, nodes, infos = super().graph(unreal, asset)
+        # Native GetNodeInfo exports authored properties for every node, not
+        # just the owned import. Map identity validation uses that real API.
+        for name, props in asset.config_properties.items():
+            if name in infos:
+                infos[name]['properties'] = copy.deepcopy(props)
 
         def call(operation, *args):
             if operation == 'UpdateNode' and args[0].name == 'ArtistPaint':
@@ -1002,13 +1007,17 @@ class GarmentWindConfigurationTests(unittest.TestCase):
                 does_asset_exist=lambda path: False,
                 save_loaded_asset=lambda asset: saved.append(asset) or True),
             CodexClothToolsLibrary=SimpleNamespace(bake_vertex_color_weight_map=bake,
-                dump_cloth_collection_colors=lambda path: json.dumps(audit)))
+                dump_cloth_collection_colors=lambda path: json.dumps(audit)),
+            DataflowBlueprintLibrary=SimpleNamespace(evaluate_terminal_node_by_name=Mock()))
         with patch.object(M, '_graph', side_effect=graph):
             asset, actual_audit = M._build_source(unreal, record, build_path)
         self.assertEqual(vars(template), before, 'The template itself must remain untouched')
         self.assertIs(asset, built[0])
         self.assertEqual(actual_audit, audit)
         self.assertEqual(saved, [asset])
+        bake.assert_not_called()
+        self.assertEqual(asset.node_types['GuideOwnG'], 'FCodexClothVertexColorWeightMapNode')
+        self.assertEqual(asset.properties['GuideOwnG']['SourceMesh'], record['sim_asset_path'])
         self.assertNotIn('OldImport', asset.node_types)
         self.assertEqual([args[1].name for op, args in operations if op == 'RemoveNode'], ['OldImport'])
         for name, (node_type, props) in configuration.items():
@@ -1022,11 +1031,12 @@ class GarmentWindConfigurationTests(unittest.TestCase):
             toNode='ArtistMaxDistance', toPin='Collection'), asset.connections)
         self.assertIn(dict(fromNode='ArtistGarmentWind', fromPin='Collection',
             toNode='EmbeddingInput', toPin='Collection'), asset.connections)
-        self.assertIn(dict(fromNode='GuideOwnG', fromPin='OutputName.StringValue',
+        self.assertIn(dict(fromNode='GuideOwnG', fromPin='WeightMapName',
             toNode='ArtistMaxDistance', toPin='MaxDistance.WeightMap'), asset.connections)
         self.assertIn(dict(fromNode='SimulationKinematicBlend', fromPin='Collection',
             toNode='ClothAssetTerminal', toPin='CollectionLods[0]'), asset.connections)
-        bake.assert_called_once_with(build_path, record['sim_asset_path'], 'GuideOwnG', 'G', 1., False, True)
+        unreal.DataflowBlueprintLibrary.evaluate_terminal_node_by_name.assert_called_once_with(
+            asset, 'ClothAssetTerminal', asset)
 
     def test_two_reexports_preserve_disabled_wind8_native_physics_paint_and_connections(self):
         h = GarmentPublishHarness()

@@ -49,6 +49,41 @@ class WeightRefreshTests(unittest.TestCase):
         result = M._weight_map_updates(graph, old, new, None, None)
         self.assertEqual(result['ArtistMask'], ('Travel', [0,1,1], [0,1,1,0]))
 
+    def test_g_only_pin_changes_refresh_derived_mask_without_geometry_changes(self):
+        graph, old, _ = fixture()
+        for pins, expected in (([1], [1,0,1]), ([], [1,1,1]),
+                               ([0,1,2], [0,0,0]), ([0], [0,1,1])):
+            with self.subTest(pins=pins):
+                new = copy.deepcopy(old)
+                new['built_mapping']['kinematic_sim_indices'] = pins
+                previous = copy.deepcopy((graph, old, new))
+                result = M._weight_map_updates(graph, old, new, None, None)
+                self.assertEqual(result['ArtistMask'], ('Travel', [0,1,1], expected))
+                self.assertEqual((graph, old, new), previous)
+
+    def test_g_only_pin_changes_preserve_paint_that_is_not_the_derived_mask(self):
+        graph, old, _ = fixture()
+        new = copy.deepcopy(old)
+        new['built_mapping']['kinematic_sim_indices'] = [1]
+        for values in ('(0,0.4,1)', '(1,0,1)', '(0,0,1)'):
+            with self.subTest(values=values):
+                graph['nodes'][0]['props']['VertexWeights'] = values
+                expected = [float(value) for value in values.strip('()').split(',')]
+                result = M._weight_map_updates(graph, old, new, None, None)
+                self.assertEqual(result['ArtistMask'], ('Travel', expected, expected))
+
+    def test_constant_paint_is_not_inferred_as_a_derived_mask(self):
+        graph, old, _ = fixture()
+        for pins, values in (([], '(1,1,1)'), ([0,1,2], '(0,0,0)')):
+            with self.subTest(pins=pins):
+                old['built_mapping']['kinematic_sim_indices'] = pins
+                new = copy.deepcopy(old)
+                new['built_mapping']['kinematic_sim_indices'] = [1]
+                graph['nodes'][0]['props']['VertexWeights'] = values
+                expected = [float(value) for value in values.strip('()').split(',')]
+                result = M._weight_map_updates(graph, old, new, None, None)
+                self.assertEqual(result['ArtistMask'], ('Travel', expected, expected))
+
     def test_arbitrary_paint_requires_correspondence_after_topology_change(self):
         graph, old, new = fixture()
         graph['nodes'][0]['props']['VertexWeights'] = '(0,0.4,1)'
