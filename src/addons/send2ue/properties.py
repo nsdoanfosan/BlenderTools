@@ -267,6 +267,14 @@ def get_scene_property_class():
                 "right-clicking on the physics asset in Unreal and selecting ‘Copy Reference’"
             )
         ) # type: ignore
+        auto_create_physics_asset: bpy.props.BoolProperty(
+            name="Automatic Physics Asset",
+            default=True,
+            description=(
+                "When no explicit Physics Asset is set, reuse or create <mesh>_PhysicsAsset. "
+                "Disable to import without an implicit Physics Asset. Explicit paths are still reused"
+            )
+        ) # type: ignore
         disk_mesh_folder_path: bpy.props.StringProperty(
             name="Mesh Folder (Disk)",
             default=os.path.expanduser('~'),

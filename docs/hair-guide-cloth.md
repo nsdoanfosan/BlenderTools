@@ -1,9 +1,17 @@
 # Hair Tool guides to Chaos Cloth
 
 Enable **Hair guides to Chaos Cloth** in Send to Unreal's Export settings. Choose
-an existing cloth physics template, body skeletal mesh and physics asset. The
+an existing cloth physics template and body skeletal mesh. A physics asset is
+optional: leave it blank when external body collision is unnecessary. The import
+then clears inherited external collision. A nonempty path keeps the chosen asset. The
 normal Export collection, naming, material handoff and FBX importer remain in use.
 The hair meshes must use the body's existing Skeleton import setting.
+
+The ordinary skeletal importer has a separate **Automatic Physics Asset** switch
+under Paths. Its default preserves legacy reuse/creation of `<mesh>_PhysicsAsset`.
+Disable it to skip both implicit assignment and creation. An explicit asset path
+is still used when supplied, and a missing explicit asset is reported rather than
+silently creating a different physics asset.
 
 Each final Hair Tool output is paired with its actual immediate **Source Surface**
 generator input. A two-stage system uses its first source; a three-stage system

@@ -41,6 +41,52 @@ REMOTE_EXECUTION = _load_dependency_module("remote_execution")
 UNREAL = _load_dependency_module("unreal")
 
 
+class PhysicsAssetImportTests(unittest.TestCase):
+    def configure(self, *, automatic=None, explicit='', loaded=None):
+        importer = UNREAL.UnrealImportAsset.__new__(UNREAL.UnrealImportAsset)
+        importer._asset_data = {'asset_path': '/Game/Tail/tail_collider'}
+        importer._property_data = {'unreal_physics_asset_path': {'value': explicit}}
+        if automatic is not None:
+            importer._property_data['auto_create_physics_asset'] = {'value': automatic}
+        importer._options = types.SimpleNamespace(create_physics_asset=True, physics_asset='stale')
+        loader = mock.Mock(return_value=loaded)
+        return importer, loader
+
+    def test_disabled_automatic_mode_neither_looks_up_nor_creates_an_implicit_asset(self):
+        importer, loader = self.configure(automatic=False)
+        with mock.patch.object(UNREAL, 'unreal', types.SimpleNamespace(load_asset=loader), create=True):
+            importer.set_physics_asset()
+        loader.assert_not_called()
+        self.assertFalse(importer._options.create_physics_asset)
+        self.assertIsNone(importer._options.physics_asset)
+
+    def test_explicit_asset_is_used_with_automatic_creation_disabled(self):
+        asset = object()
+        importer, loader = self.configure(automatic=False, explicit='/Game/Tail/PA_Tail', loaded=asset)
+        with mock.patch.object(UNREAL, 'unreal', types.SimpleNamespace(load_asset=loader), create=True):
+            importer.set_physics_asset()
+        loader.assert_called_once_with('/Game/Tail/PA_Tail')
+        self.assertFalse(importer._options.create_physics_asset)
+        self.assertIs(importer._options.physics_asset, asset)
+
+    def test_legacy_settings_keep_existing_reuse_or_creation_behavior(self):
+        for asset in (None, object()):
+            importer, loader = self.configure(loaded=asset)
+            with self.subTest(asset=asset), mock.patch.object(UNREAL, 'unreal', types.SimpleNamespace(load_asset=loader), create=True):
+                importer.set_physics_asset()
+            loader.assert_called_once_with('/Game/Tail/tail_collider_PhysicsAsset')
+            self.assertEqual(importer._options.create_physics_asset, asset is None)
+            self.assertIs(importer._options.physics_asset, asset)
+
+    def test_missing_explicit_asset_does_not_fall_back_to_automatic_creation(self):
+        importer, loader = self.configure(automatic=True, explicit='/Game/Tail/Missing')
+        with mock.patch.object(UNREAL, 'unreal', types.SimpleNamespace(load_asset=loader), create=True):
+            with self.assertRaisesRegex(ValueError, 'Explicit Physics Asset is missing'):
+                importer.set_physics_asset()
+        loader.assert_called_once_with('/Game/Tail/Missing')
+        self.assertFalse(importer._options.create_physics_asset)
+
+
 class MorphThresholdTests(unittest.TestCase):
     def test_no_existing_morph_keeps_requested_threshold(self):
         self.assertEqual(
@@ -174,6 +220,7 @@ class FakeRemoteExecution:
 
 
 class TestRemoteExecutionConfig(unittest.TestCase):
+
     def test_multicast_bind_address_is_independent_from_command_endpoint(self):
         preferences = types.SimpleNamespace(
             multicast_ttl=1,
@@ -454,7 +501,8 @@ class TestFailedOperatorCleanup(unittest.TestCase):
                              if isinstance(node, ast.ClassDef) and node.name == 'Send2Ue')
         bpy = types.SimpleNamespace(types=types.SimpleNamespace(
             Operator=object, STATUSBAR_HT_header=mock.Mock()), context=mock.Mock(),
-            props=types.SimpleNamespace(StringProperty=lambda **kwargs: None))
+            props=types.SimpleNamespace(StringProperty=lambda **kwargs: None,
+                                        BoolProperty=lambda **kwargs: None))
         namespace = {'bpy': bpy, 'os': os, 'unreal': UNREAL, 'utilities': mock.Mock()}
         exec(compile(ast.Module(body=[operator_node], type_ignores=[]), str(path), 'exec'), namespace)
         operator = object.__new__(namespace['Send2Ue'])

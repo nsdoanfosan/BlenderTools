@@ -49,7 +49,7 @@ class HairGuideClothExtension(ExtensionBase):
     body_mesh_asset_path: bpy.props.StringProperty(
         name='Body skeletal mesh', description='Existing body mesh using the exported hair armature skeleton')
     physics_asset_path: bpy.props.StringProperty(
-        name='Physics asset', description='Existing collision physics asset for the hair cloth')
+        name='Physics asset (optional)', description='Existing collision physics asset for the hair cloth; leave empty to disable body collision')
 
     def draw_export(self, dialog, layout, properties):
         box = layout.box()
@@ -58,6 +58,7 @@ class HairGuideClothExtension(ExtensionBase):
             dialog.draw_property(self, box, 'simulation_mesh_mode')
             for key in ('cloth_template_asset_path', 'body_mesh_asset_path', 'physics_asset_path'):
                 dialog.draw_property(self, box, key)
+            box.label(text='Leave Physics asset empty to disable body collision.')
             box.label(text='Unpainted guides remain static. Artist geometry is preserved.')
 
     def post_mesh_export(self, asset_data, properties):

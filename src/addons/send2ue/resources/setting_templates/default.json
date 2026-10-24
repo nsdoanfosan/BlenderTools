@@ -308,6 +308,7 @@
   "unreal_groom_folder_path": "/Game/untitled_category/untitled_asset/groom/",
   "unreal_mesh_folder_path": "/Game/untitled_category/untitled_asset/",
   "unreal_physics_asset_path": "",
+  "auto_create_physics_asset": true,
   "unreal_skeletal_mesh_lod_settings_path": "",
   "unreal_skeleton_asset_path": "",
   "use_object_origin": false,
