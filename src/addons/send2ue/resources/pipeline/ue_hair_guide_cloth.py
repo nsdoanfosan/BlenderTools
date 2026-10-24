@@ -242,7 +242,9 @@ def validate_record(record):
     out["simulation_enabled"] = simulation_enabled
     keys = ["render_asset_path"]
     if simulation_enabled:
-        keys += ["sim_asset_path", "cloth_template_asset_path", "body_mesh_asset_path", "physics_asset_path"]
+        keys += ["sim_asset_path", "cloth_template_asset_path", "body_mesh_asset_path"]
+        physics_path = record.get("physics_asset_path")
+        out["physics_asset_path"] = "" if physics_path in (None, "") else _path(physics_path)
     for key in keys:
         out[key] = _path(record.get(key))
     for role in ("sim", "render"):
@@ -799,7 +801,8 @@ def _build_source_impl(unreal, record, path, created, packet=None):
     add('FCodexClothVertexColorWeightMapNode', 'GuideOwnG', {
         'SourceMesh': record['sim_asset_path'], 'LODIndex': 0, 'ScalingFactor': 1.,
         'bInvert': False, 'WeightMapName': 'MaxDistance', 'PositionTolerance': .001})
-    add("FChaosClothAssetSetPhysicsAssetNode", "BodyPhysics", {"PhysicsAsset": record["physics_asset_path"]})
+    # A blank artist setting explicitly clears inherited external collision.
+    add("FChaosClothAssetSetPhysicsAssetNode", "BodyPhysics", {"PhysicsAsset": record.get("physics_asset_path") or "None"})
     add("FChaosClothAssetProxyDeformerNode_v3", "EmbeddingInput", {
         "bUseMultipleInfluences": False, "bPreserveRenderTangents": True})
     add("FChaosClothAssetSkinningBlendNode", "SimulationKinematicBlend", {
@@ -1870,6 +1873,8 @@ def _apply_hair_guide_cloth(record):
     assets = []
     for key in ("sim_asset_path", "render_asset_path", "cloth_template_asset_path",
                 "body_mesh_asset_path", "physics_asset_path"):
+        if key == "physics_asset_path" and not record[key]:
+            continue
         asset = unreal.load_asset(record[key])
         if not asset:
             raise ValueError("Required imported asset is missing: " + record[key])

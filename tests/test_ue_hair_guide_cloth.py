@@ -135,6 +135,30 @@ class NativeReceiptTests(unittest.TestCase):
                 M._native(result)
 
 
+class OptionalPhysicsContractTests(unittest.TestCase):
+    def test_simulation_without_external_collision_keeps_its_real_guide(self):
+        for value in ('', None, 'omitted'):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+                _, packet = fixture()
+                record = file_record(directory, packet, physics_asset_path=value)
+                if value == 'omitted':
+                    del record['physics_asset_path']
+                result, validated = M.validate_record(record)
+                self.assertTrue(result['simulation_enabled'])
+                self.assertEqual(result['physics_asset_path'], '')
+                self.assertEqual(validated['meshes']['sim'], packet['meshes']['sim'])
+
+    def test_collision_path_is_preserved_and_bad_path_is_not_silently_disabled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, packet = fixture()
+            record = file_record(directory, packet)
+            result, _ = M.validate_record(record)
+            self.assertEqual(result['physics_asset_path'], '/Game/Body/PA_Body')
+            record['physics_asset_path'] = 'PA_Body'
+            with self.assertRaisesRegex(ValueError, 'Expected an Unreal asset package path'):
+                M.validate_record(record)
+
+
 class NoGuideContractTests(unittest.TestCase):
     def test_zero_weight_guides_are_render_only_in_pure_and_mixed_exports(self):
         for mixed in (False, True):
@@ -347,6 +371,14 @@ class ApplyHarness:
 
 
 class EditorHandoffTests(unittest.TestCase):
+    def test_no_external_collision_does_not_load_an_empty_asset_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            h = ApplyHarness(directory)
+            h.record['physics_asset_path'] = ''
+            result = h.apply()
+            self.assertTrue(result['verified'])
+            self.assertEqual(result['cloth_asset_path'], h.target)
+
     def test_dirty_existing_cloth_skips_worker_and_preserves_all_editor_assets(self):
         with tempfile.TemporaryDirectory() as directory:
             h = ApplyHarness(directory)

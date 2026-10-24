@@ -287,6 +287,12 @@ def run_commands(commands, strict=False):
                 raise RuntimeError('Unreal command returned no matching native execution receipt')
             if receipt.get('success') is not True:
                 raise RuntimeError('Unreal native command failed: ' + str(receipt.get('error_type') or '') + ': ' + str(receipt.get('message') or ''))
+            # Preserve the stdout contract: bootstrap callers treat any output
+            # as an error. A validated transport receipt is not command output.
+            output = ''.join(
+                line for line in output.splitlines(keepends=True)
+                if not line.startswith(marker)
+            )
         return output
     finally:
         remote_exec.stop()
@@ -976,17 +982,24 @@ class UnrealImportAsset(Unreal):
         """
         asset_path = self._asset_data.get('asset_path')
         physics_asset_path = self._property_data.get('unreal_physics_asset_path', {}).get('value', '')
+        automatic = self._property_data.get('auto_create_physics_asset', {}).get('value', True)
         default_physics_asset = f'{asset_path}_PhysicsAsset'
-        # try to load the provided physics asset
+        self._options.create_physics_asset = False
+        self._options.physics_asset = None
+        # Explicit assignment is independent of implicit lookup/creation.
         if physics_asset_path:
             physics_asset = unreal.load_asset(physics_asset_path)
-        else:
+            if not physics_asset:
+                raise ValueError(f'Explicit Physics Asset is missing: {physics_asset_path}')
+        elif automatic:
             physics_asset = unreal.load_asset(default_physics_asset)
+        else:
+            physics_asset = None
 
         if physics_asset:
             self._options.create_physics_asset = False
             self._options.physics_asset = physics_asset
-        else:
+        elif automatic and not physics_asset_path:
             self._options.create_physics_asset = True
 
     def set_static_mesh_import_options(self):
