@@ -449,6 +449,10 @@ def export_file(properties, lod=0, file_type=FileTypes.FBX):
     # Hair Tool export meshes are generated temporarily and must always carry
     # FBX smoothing groups so Unreal can preserve their evaluated normals.
     mesh_object = bpy.data.objects.get(asset_data.get('_mesh_object_name', ''))
+    if file_type == FileTypes.FBX and mesh_object and mesh_object.get('send2ue_vertex_colors_are_data', False):
+        # Simulation weights are numerical data, so their imported bytes must
+        # not be changed by sRGB encoding (0.5 would become about 0.735).
+        export_settings['colors_type'] = 'LINEAR'
     if file_type == FileTypes.FBX and mesh_object and mesh_object.get(hair_tool_export.TEMP_PROPERTY):
         export_settings['mesh_smooth_type'] = 'FACE'
 

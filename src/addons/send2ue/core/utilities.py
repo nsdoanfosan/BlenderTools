@@ -646,15 +646,15 @@ def get_related_mesh_asset_data_from_groom_asset_data(groom_asset_data):
 
 
 def get_combined_export_parent(mesh_object):
-    """Keep an in-scope control Empty inside its directly exported owner."""
+    """Resolve control Empty/Curve parents to their directly exported Empty."""
     parent = mesh_object.parent
     export_collection = bpy.data.collections.get(ToolInfo.EXPORT_COLLECTION.value)
-    if not parent or parent.type != 'EMPTY' or export_collection is None:
+    if not parent or parent.type not in {'EMPTY', 'CURVE'} or export_collection is None:
         return parent
     scope = set(export_collection.all_objects)
     ancestor = parent
-    while ancestor is not None and ancestor in scope and ancestor.type == 'EMPTY':
-        if export_collection in ancestor.users_collection:
+    while ancestor is not None and ancestor in scope and ancestor.type in {'EMPTY', 'CURVE'}:
+        if ancestor.type == 'EMPTY' and export_collection in ancestor.users_collection:
             return ancestor
         ancestor = ancestor.parent
     return parent
