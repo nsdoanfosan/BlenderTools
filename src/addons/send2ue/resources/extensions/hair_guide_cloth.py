@@ -38,8 +38,8 @@ class HairGuideClothExtension(ExtensionBase):
     simulation_mesh_mode: bpy.props.EnumProperty(
         name='Simulation guide shape',
         items=(
-            ('RIBBON', 'Ribbon for circular guides',
-             'Export supported circular Hair Tool guides as open ribbons, preserving their splines and paint; keep other guides unchanged'),
+            ('RIBBON', 'Optimized ribbon guides',
+             'Optimize supported circular and flat Hair Tool guides as open ribbons, preserving their splines and paint; keep other guides unchanged'),
             ('ORIGINAL', 'Original guide',
              'Export the evaluated guide with its original profile')),
         default='RIBBON',

@@ -1,4 +1,4 @@
-"""Export-only open ribbons from the verified Hair Tool circle profile schema.
+"""Export-only open ribbons from verified Hair Tool circle and flat profiles.
 
 The render generator keeps its original guide. Curve/sample identity is carried
 through copied node groups; native mesh-island identity is never approximated by
@@ -45,6 +45,10 @@ def _point_attribute(mesh, name, data_type):
     if data_type == 'FLOAT_VECTOR':
         return [tuple(float(v) for v in item.vector) for item in attr.data]
     values = [item.value for item in attr.data]
+    if data_type == 'FLOAT':
+        if any(not math.isfinite(value) or value < 0 for value in values):
+            raise ValueError('Invalid ribbon sample parameter: ' + name)
+        return values
     if any(type(value) is not int or value < 0 for value in values):
         raise ValueError('Invalid ribbon curve/sample ID: ' + name)
     return values
@@ -95,8 +99,15 @@ def validate_pair(original, ribbon, native_islands, own_weights, profile_points=
     original_weights, _ = own_weights(original)
     ribbon_weights, _ = own_weights(ribbon)
     samples, centers = [], []
+    sample_type = None
     for mesh, ids in ((original, source_ids), (ribbon, ribbon_ids)):
-        sample_ids = _point_attribute(mesh, SAMPLE_ATTRIBUTE, 'INT')
+        attr = mesh.attributes.get(SAMPLE_ATTRIBUTE)
+        if attr is None or attr.data_type not in {'INT', 'FLOAT'}:
+            raise ValueError('Missing or unsupported ribbon sample identity')
+        if sample_type is not None and attr.data_type != sample_type:
+            raise ValueError('Ribbon changed sample identity type')
+        sample_type = attr.data_type
+        sample_ids = _point_attribute(mesh, SAMPLE_ATTRIBUTE, sample_type)
         values = _point_attribute(mesh, CENTER_ATTRIBUTE, 'FLOAT_VECTOR')
         if any(any(not math.isfinite(v) for v in point) for point in values):
             raise ValueError('Ribbon sample centers contain non-finite values')
@@ -173,25 +184,35 @@ def _stamp(group, target, name, data_type, domain, field=None):
 
 
 def _schema(inner):
-    required = {'Capture Attribute.003': 'GeometryNodeCaptureAttribute',
+    flat = _base_name(inner.name) == 'Flat_Profile_UV'
+    sample_node = 'Capture Attribute.002' if flat else 'Capture Attribute.003'
+    position_node = 'Set Position' if flat else 'Set Position.002'
+    required = {sample_node: 'GeometryNodeCaptureAttribute',
                 'Capture Attribute.001': 'GeometryNodeCaptureAttribute',
                 'Curve to Mesh': 'GeometryNodeCurveToMesh',
-                'Set Position.002': 'GeometryNodeSetPosition', 'Group Output': 'NodeGroupOutput'}
+                position_node: 'GeometryNodeSetPosition', 'Group Output': 'NodeGroupOutput'}
     nodes = {}
     for name, kind in required.items():
         node = inner.nodes.get(name)
         if node is None or node.bl_idname != kind or getattr(node, 'mute', False):
-            raise ValueError('Unsupported Circle_Profile_UV schema at ' + name)
+            raise ValueError('Unsupported Hair Tool profile schema at ' + name)
         nodes[name] = node
-    for name, socket in (('Capture Attribute.003', 'Geometry'), ('Capture Attribute.001', 'Geometry'),
+    for name, socket in ((sample_node, 'Geometry'), ('Capture Attribute.001', 'Geometry'),
                          ('Curve to Mesh', 'Curve'), ('Curve to Mesh', 'Profile Curve'),
-                         ('Set Position.002', 'Geometry')):
+                         (position_node, 'Geometry')):
         if len(nodes[name].inputs[socket].links) != 1:
-            raise ValueError('Unsupported circle profile geometry link at ' + name + '/' + socket)
+            raise ValueError('Unsupported profile geometry link at ' + name + '/' + socket)
     if nodes['Group Output'].inputs.get('Output_1') is None:
-        raise ValueError('Unsupported circle profile output socket')
-    if not any(node.bl_idname == 'GeometryNodeCurvePrimitiveCircle' for node in inner.nodes):
+        raise ValueError('Unsupported profile output socket')
+    if flat:
+        shape = inner.nodes.get('Group.003')
+        if (shape is None or not getattr(shape, 'node_tree', None)
+                or not {'Resolution', 'Width', 'Roundness', 'Uplift'}.issubset(shape.inputs.keys())):
+            raise ValueError('Unsupported Flat_Profile_UV shape generator')
+    elif not any(node.bl_idname == 'GeometryNodeCurvePrimitiveCircle' for node in inner.nodes):
         raise ValueError('Circle profile does not contain a circle primitive')
+    nodes['samples'] = nodes[sample_node]
+    nodes['position'] = nodes[position_node]
     return nodes
 
 
@@ -296,27 +317,38 @@ class RibbonPlan:
             groups.append(inner)
             profile.node_tree = inner
             nodes = _schema(inner)
-            line = inner.nodes.new('GeometryNodeCurvePrimitiveLine')
-            line.inputs['Start'].default_value = (-1.0, 0.0, 0.0)
-            line.inputs['End'].default_value = (1.0, 0.0, 0.0)
-            profile_curve = line.outputs['Curve']
-            if self.profile_points == 3:
-                # A native midpoint gives the physical strip a center support
-                # without moving either rail, the curve, or the rendered hair.
-                resample = inner.nodes.new('GeometryNodeResampleCurve')
-                if resample.inputs.get('Mode') is not None:
-                    resample.inputs['Mode'].default_value = 'Count'
-                else:
-                    resample.mode = 'COUNT'
-                resample.inputs['Count'].default_value = 3
-                inner.links.new(profile_curve, resample.inputs['Curve'])
-                profile_curve = resample.outputs['Curve']
-            _connect(inner, profile_curve, nodes['Capture Attribute.001'].inputs['Geometry'])
+            if self.receipt['profile'] == 'FLAT':
+                # Use the native flat profile at one segment (two rails), just
+                # as circular guides use two rails in this same conversion.
+                # Keep its width/UV-width, radius, tilt and endpoint shaping;
+                # a unit line here would silently change the ribbon's width.
+                for name, value in (('Profile Res', self.profile_points - 1), ('Bevel Center Axis', 0)):
+                    socket = profile.inputs[name]
+                    for link in list(socket.links):
+                        top.links.remove(link)
+                    socket.default_value = value
+            else:
+                line = inner.nodes.new('GeometryNodeCurvePrimitiveLine')
+                line.inputs['Start'].default_value = (-1.0, 0.0, 0.0)
+                line.inputs['End'].default_value = (1.0, 0.0, 0.0)
+                profile_curve = line.outputs['Curve']
+                if self.profile_points == 3:
+                    # A native midpoint gives the physical strip a center support
+                    # without moving either rail, the curve, or the rendered hair.
+                    resample = inner.nodes.new('GeometryNodeResampleCurve')
+                    if resample.inputs.get('Mode') is not None:
+                        resample.inputs['Mode'].default_value = 'Count'
+                    else:
+                        resample.mode = 'COUNT'
+                    resample.inputs['Count'].default_value = 3
+                    inner.links.new(profile_curve, resample.inputs['Curve'])
+                    profile_curve = resample.outputs['Curve']
+                _connect(inner, profile_curve, nodes['Capture Attribute.001'].inputs['Geometry'])
             sweep = nodes['Curve to Mesh']
             for link in list(sweep.inputs['Fill Caps'].links):
                 inner.links.remove(link)
             sweep.inputs['Fill Caps'].default_value = False
-            position = nodes['Set Position.002']
+            position = nodes['position']
             _connect(inner, sweep.outputs['Mesh'], position.inputs['Geometry'])
             _connect(inner, position.outputs['Geometry'], nodes['Group Output'].inputs['Output_1'])
             bpy.context.view_layer.update()
@@ -350,7 +382,7 @@ def prepare(guide_copy, requested_mode='RIBBON'):
     try:
         if type(plan.profile_points) is not int or plan.profile_points not in (2, 3):
             raise ValueError('Physical ribbon profile points must be explicitly 2 or 3')
-        candidates, flats = [], []
+        candidates = []
         modifiers = list(guide_copy.modifiers)
         for index, modifier in enumerate(modifiers):
             top = getattr(modifier, 'node_group', None)
@@ -360,17 +392,13 @@ def prepare(guide_copy, requested_mode='RIBBON'):
                 inner = getattr(node, 'node_tree', None)
                 if inner is None or getattr(node, 'mute', False) or not _output_linked(top, node):
                     continue
-                if _base_name(inner.name) == 'Circle_Profile_UV':
-                    candidates.append((index, modifier, node))
-                elif _base_name(inner.name) == 'Flat_Profile_UV':
-                    flats.append(node)
-        if not candidates and flats:
-            plan.receipt.update(profile='FLAT', status='flat_preserved')
-            return plan
-        if len(candidates) != 1 or flats:
-            raise ValueError('No unique supported circle profile on the active guide output')
-        index, modifier, profile = candidates[0]
-        plan.receipt.update(profile='CIRCLE', profile_group=profile.node_tree.name, profile_modifier=modifier.name)
+                kind = {'Circle_Profile_UV': 'CIRCLE', 'Flat_Profile_UV': 'FLAT'}.get(_base_name(inner.name))
+                if kind:
+                    candidates.append((index, modifier, node, kind))
+        if len(candidates) != 1:
+            raise ValueError('No unique supported Hair Tool profile on the active guide output')
+        index, modifier, profile, kind = candidates[0]
+        plan.receipt.update(profile=kind, profile_group=profile.node_tree.name, profile_modifier=modifier.name)
         for later in modifiers[index + 1:]:
             if not later.show_viewport:
                 continue
@@ -378,7 +406,7 @@ def prepare(guide_copy, requested_mode='RIBBON'):
                 raise ValueError('Unsupported active post-profile modifier: ' + later.name + ' (' + later.type + ')')
         _schema(profile.node_tree)
         if len(profile.inputs['Curves'].links) != 1:
-            raise ValueError('Circle profile has no unique source curves')
+            raise ValueError('Hair Tool profile has no unique source curves')
         plan.modifier, plan.original_group, plan.profile_name = modifier, modifier.node_group, profile.name
         top = modifier.node_group.copy()
         plan.groups.append(top)
@@ -388,8 +416,17 @@ def prepare(guide_copy, requested_mode='RIBBON'):
         plan.groups.append(inner)
         copied_profile.node_tree = inner
         _stamp(top, copied_profile.inputs['Curves'], SPLINE_ATTRIBUTE, 'INT', 'CURVE')
-        capture = _schema(inner)['Capture Attribute.003']
-        _stamp(inner, capture.inputs['Geometry'], SAMPLE_ATTRIBUTE, 'INT', 'POINT')
+        capture = _schema(inner)['samples']
+        if kind == 'FLAT':
+            # Curve to Mesh evaluates flat Catmull/Bezier samples implicitly.
+            # Integer control-point IDs interpolate to duplicates. Carry the
+            # continuous native spline parameter instead: each evaluated row
+            # has one exact key on both profiles, without resampling the artist
+            # curve (which would change its normals and rendered geometry).
+            parameter = inner.nodes.new('GeometryNodeSplineParameter')
+            _stamp(inner, capture.inputs['Geometry'], SAMPLE_ATTRIBUTE, 'FLOAT', 'POINT', parameter.outputs['Factor'])
+        else:
+            _stamp(inner, capture.inputs['Geometry'], SAMPLE_ATTRIBUTE, 'INT', 'POINT')
         position = inner.nodes.new('GeometryNodeInputPosition')
         _stamp(inner, capture.inputs['Geometry'], CENTER_ATTRIBUTE, 'FLOAT_VECTOR', 'POINT', position.outputs['Position'])
         plan.prepared = True
