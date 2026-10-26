@@ -68,6 +68,41 @@ class NativeCoordinationTests(unittest.TestCase):
         self.bridge.complete_handoff.assert_called_once_with(op.metadata, op.metadata["request_id"], "C:/asset.blend")
         self.assertEqual(self.namespace, {})
 
+    def test_character_postprocess_keeps_exact_binding_and_does_not_complete_phase(self):
+        op = self.begin()
+        with self.assertRaisesRegex(RuntimeError, "No native Unreal import"):
+            op.finish_import({'mesh': {'asset_path': '/Game/Accessory'}})
+        self.assertIs(self.namespace[COORD.NAMESPACE_KEY], op)
+        op.imported_count = 1
+        receipt = op.finish_import({'mesh': {'asset_path': '/Game/Accessory'}})
+        self.assertEqual(receipt['metadata'], op.metadata)
+        self.assertEqual(receipt['asset_paths'], ['/Game/Accessory'])
+        self.assertFalse(receipt['phase_completed'])
+        self.assertEqual(self.namespace, {COORD.POSTPROCESS_RECEIPT_KEY: receipt})
+        self.bridge.complete_handoff.assert_not_called()
+
+    def test_postprocess_retry_retains_exact_active_request(self):
+        op = self.begin()
+        # The real bridge stores canonical lower-case Windows targets.
+        op.metadata['target'] = 'c:/asset.blend'
+        op.imported_count = 1
+        receipt = op.finish_import({'mesh': {'asset_path': '/Game/Accessory'}})
+        COORD.prepare_import_postprocess_retry(receipt, self.namespace)
+        retried = self.begin()
+        self.assertEqual(retried.metadata['request_id'], op.metadata['request_id'])
+        self.bridge.complete_handoff.assert_not_called()
+
+    def test_postprocess_retry_rejects_lost_or_completed_receipt(self):
+        op = self.begin(); op.imported_count = 1
+        receipt = op.finish_import({'mesh': {'asset_path': '/Game/Accessory'}})
+        self.bridge.can_execute_handoff.return_value = False
+        with self.assertRaisesRegex(RuntimeError, 'exact active request'):
+            COORD.prepare_import_postprocess_retry(receipt, self.namespace)
+        self.bridge.can_execute_handoff.return_value = True
+        receipt['phase_completed'] = True
+        with self.assertRaisesRegex(RuntimeError, 'exact active request'):
+            COORD.prepare_import_postprocess_retry(receipt, self.namespace)
+
     def test_inactive_phase_stops_before_binding(self):
         self.bridge.require_active_phase.side_effect = RuntimeError("waiting")
         with self.assertRaisesRegex(RuntimeError, "waiting"):
@@ -203,7 +238,7 @@ class NativeRemoteReceiptTests(unittest.TestCase):
 
     def test_success_requires_exact_marker_and_manual_output_is_preserved(self):
         with mock.patch.object(REMOTE, "RemoteExecution"), mock.patch.object(UNREAL, "run_unreal_python_commands", side_effect=self.execute_commands):
-            self.assertIn('"success": true', UNREAL.run_commands(["print('saved')"], strict=True))
+            self.assertEqual("saved\n", UNREAL.run_commands(["print('saved')"], strict=True))
             self.assertEqual(UNREAL.run_commands(["print('manual')"]), "manual\n")
         with mock.patch.object(REMOTE, "RemoteExecution"), mock.patch.object(UNREAL, "run_unreal_python_commands", return_value='__WQ_NATIVE_RESULT__{"request_id":"old","success":true}'):
             with self.assertRaisesRegex(RuntimeError, "no matching"):
@@ -223,7 +258,7 @@ class NativeOperatorTests(unittest.TestCase):
         self.bridge = bridge_fixture()
         self.bpy = types.SimpleNamespace(
             types=types.SimpleNamespace(Operator=object, STATUSBAR_HT_header=mock.Mock()),
-            props=types.SimpleNamespace(StringProperty=lambda **kwargs: None),
+            props=types.SimpleNamespace(StringProperty=lambda **kwargs: None, BoolProperty=lambda **kwargs: None),
             app=types.SimpleNamespace(driver_namespace=self.namespace), data=types.SimpleNamespace(filepath="C:/asset.blend"),
             context=mock.Mock(),
         )
@@ -279,6 +314,16 @@ class NativeOperatorTests(unittest.TestCase):
         self.bridge.complete_handoff.side_effect = lambda *args: events.append("complete") or True
         self.assertEqual(self.op.execute(self.context), {"FINISHED"})
         self.assertEqual(events, ["import", "saved dependencies", "complete"])
+
+    def test_synchronous_character_import_retains_phase_for_postprocess(self):
+        self.enqueue(self.verified_import)
+        self.op.workstation_postprocess_pending = True
+        self.bpy.context.window_manager.send2ue.asset_data = {'asset': {'asset_path': '/Game/Accessory'}}
+        self.assertEqual(self.op.execute(self.context), {'FINISHED'})
+        receipt = self.namespace[COORD.POSTPROCESS_RECEIPT_KEY]
+        self.assertFalse(receipt['phase_completed'])
+        self.assertEqual(receipt['metadata']['phase_id'], 'phase')
+        self.bridge.complete_handoff.assert_not_called()
 
     def test_validation_no_jobs_never_completes(self):
         with self.assertRaisesRegex(RuntimeError, "no native"):

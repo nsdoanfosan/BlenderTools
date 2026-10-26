@@ -15,6 +15,8 @@ import uuid
 
 NAMESPACE_KEY = "send2ue_workstation_operation"
 DEFERRED_RECEIPT_KEY = "send2ue_workstation_deferred_export_receipt"
+POSTPROCESS_RECEIPT_KEY = "send2ue_workstation_import_receipt"
+RETRY_HANDOFF_KEY = "send2ue_workstation_reconciled_retry"
 RESOURCE = "unreal:MyProject2"
 BATCH_PIPELINE = "speedtree_batch_send2ue"
 BATCH_ACTION = "send2ue_manifest_export_rpc_ingest"
@@ -100,6 +102,22 @@ class NativeOperation:
         finally:
             self.detach()
 
+    def finish_import(self, asset_data):
+        """Keep the exact phase binding for caller-owned character postprocessing."""
+        self.check()
+        if self.deferred or not self.imported_count:
+            raise RuntimeError("No native Unreal import is ready for postprocessing")
+        paths = sorted({str(data['asset_path']) for data in asset_data.values()
+                        if not data.get('skip') and data.get('asset_path')})
+        if not paths:
+            raise RuntimeError("Native import postprocessing requires exact asset paths")
+        receipt = dict(metadata=dict(self.metadata), asset_paths=paths,
+                       native_import_jobs=self.imported_count,
+                       stage="imported_pending_postprocess", phase_completed=False)
+        self.namespace[POSTPROCESS_RECEIPT_KEY] = receipt
+        self.detach()
+        return receipt
+
     def finish_export(self, asset_data):
         """Attest this native disk export while retaining its exact phase binding."""
         self.check()
@@ -134,6 +152,40 @@ class NativeOperation:
         self.namespace[DEFERRED_RECEIPT_KEY] = receipt
         self.detach()
         return receipt
+
+
+def prepare_failed_operation_retry(metadata, stopped_receipt, namespace):
+    """Retain an explicitly stopped request after its owner recovered the phase."""
+    if namespace.get(NAMESPACE_KEY) is not None:
+        raise RuntimeError("A coordinated Unreal operation is still running")
+    bridge = load_bridge()
+    sys.path.insert(0, str(Path(bridge.__file__).parent))
+    try:
+        current = bridge.reconcile_failed_handoff(metadata, stopped_receipt)
+    finally:
+        sys.path.pop(0)
+    if current.get("pipeline") != "send2ue" or current.get("resource", "").casefold() != RESOURCE.casefold():
+        raise RuntimeError("This retry is not the same native Send2UE request")
+    namespace[RETRY_HANDOFF_KEY] = current
+    return dict(current)
+
+
+def prepare_import_postprocess_retry(receipt, namespace):
+    """Retry a finished import while keeping its still-active exact request."""
+    if namespace.get(NAMESPACE_KEY) is not None:
+        raise RuntimeError("A coordinated Unreal operation is still running")
+    if not isinstance(receipt, dict):
+        raise RuntimeError("Import postprocessing requires its exact import receipt")
+    metadata = receipt.get("metadata", {})
+    bridge = load_bridge()
+    if (receipt.get("stage") != "imported_pending_postprocess"
+            or receipt.get("phase_completed") is not False
+            or metadata.get("pipeline") != "send2ue"
+            or metadata.get("resource", "").casefold() != RESOURCE.casefold()
+            or not bridge.can_execute_handoff(metadata)):
+        raise RuntimeError("Import postprocessing no longer owns its exact active request")
+    namespace[RETRY_HANDOFF_KEY] = dict(metadata)
+    return dict(metadata)
 
 
 def begin_operation(phase_id, namespace, target, pipeline="send2ue", deferred_handoff=""):
@@ -173,7 +225,16 @@ def begin_operation(phase_id, namespace, target, pipeline="send2ue", deferred_ha
         namespace[NAMESPACE_KEY] = operation
         return operation
     bridge.require_active_phase(phase_id, RESOURCE)
-    metadata = bridge.bind_handoff(phase_id, pipeline, str(uuid.uuid4()), target)
+    retry = namespace.pop(RETRY_HANDOFF_KEY, None)
+    if retry is not None:
+        normalized_target = ntpath.normpath(str(target)).replace("\\", "/").casefold()
+        if (retry.get("phase_id") != phase_id or retry.get("pipeline") != pipeline
+                or retry.get("target") != normalized_target
+                or not bridge.can_execute_handoff(retry)):
+            raise RuntimeError("Reconciled retry does not match this native Send2UE operation")
+        metadata = bridge.bind_handoff(phase_id, pipeline, retry["request_id"], target)
+    else:
+        metadata = bridge.bind_handoff(phase_id, pipeline, str(uuid.uuid4()), target)
     operation = NativeOperation(bridge, metadata, namespace)
     namespace[NAMESPACE_KEY] = operation
     try:

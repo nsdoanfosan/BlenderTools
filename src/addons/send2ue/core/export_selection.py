@@ -2,7 +2,8 @@
 
 An Export Empty may carry JSON ``send2ue_export_source_names``. The same
 original objects are temporarily activated; copies and parallel meshes are not
-created. ``wm['send2ue_export_unit_names']`` optionally scopes a native send.
+created. ``scene['send2ue_export_unit_names']`` persists the default native-send
+scope with the file. The same WindowManager key overrides it for one operation.
 """
 import json
 import bpy
@@ -10,6 +11,56 @@ import bpy
 _state = None
 _rules = None
 _collection_state = None
+
+
+def keep_prepared_hair_in_mesh_export(selected, anchor, combined_parent=None):
+    """An explicit combined Empty owns its cards; a common rig alone does not."""
+    if not selected.get('_send2ue_hair_tool_temp'):
+        return True
+    source_key = '_send2ue_hair_tool_source_name'
+    if selected.get(source_key, selected.name) == anchor.get(source_key, anchor.name):
+        return True
+    return (combined_parent is not None and combined_parent.type == 'EMPTY'
+            and selected.parent == combined_parent)
+
+
+def resolve_hair_outputs(sources, candidates, owner, is_hair, input_of, owner_of):
+    """Resolve declared Hair Tool pipeline roots to their native final outputs.
+
+    Surface -> profiled guide -> generated hair exports the generated hair;
+    capture_source then takes its immediate profiled guide as simulation input.
+    Follow actual Hair System Setup links, never names or hierarchy depth.
+    Ordinary meshes and unrelated/other-unit children keep their exact scope.
+    """
+    pool = [obj for obj in candidates if owner_of(obj) == owner and is_hair(obj)]
+    downstream = {}
+    for obj in pool:
+        upstream = input_of(obj)
+        if upstream is not None:
+            downstream.setdefault(upstream, []).append(obj)
+
+    def terminals(obj, visiting):
+        if obj in visiting:
+            raise ValueError('Cyclic Hair Tool source pipeline: ' + obj.name)
+        children = downstream.get(obj, []) if is_hair(obj) else []
+        if not children:
+            return {obj}
+        result = set()
+        for child in children:
+            result.update(terminals(child, visiting | {obj}))
+        return result
+
+    result = set()
+    for source in sources:
+        result.update(terminals(source, set()))
+    return result
+
+
+def _requested_unit_names(units):
+    key = 'send2ue_export_unit_names'
+    wm = bpy.context.window_manager
+    raw = wm[key] if key in wm else bpy.context.scene.get(key, '')
+    return set(json.loads(raw)) if raw else set(units)
 
 
 def _activate_export_collection(collection):
@@ -63,10 +114,17 @@ def prepare():
     if collection is None:
         return
     units = {o.name: o for o in collection.objects if o.type == 'EMPTY'}
-    raw = bpy.context.window_manager.get('send2ue_export_unit_names', '')
-    selected = set(json.loads(raw)) if raw else set(units)
+    selected = _requested_unit_names(units)
     if selected - set(units):
         raise ValueError('Requested Export unit is missing: ' + str(sorted(selected - set(units))))
+    def owner(obj):
+        current = obj
+        while current:
+            if current.name in units and units[current.name] == current:
+                return current.name
+            current = current.parent
+        return None
+
     declared = {}
     for name in selected:
         unit = units[name]
@@ -75,14 +133,16 @@ def prepare():
             objects = [bpy.data.objects.get(name) for name in names]
             if len(set(names)) != len(names) or any(o is None for o in objects):
                 raise ValueError('Explicit export source list is incomplete: ' + name)
-            declared[name] = set(objects)
-    def owner(obj):
-        current = obj
-        while current:
-            if current.name in units and units[current.name] == current:
-                return current.name
-            current = current.parent
-        return None
+            # Only native Hair Tool systems have an implicit downstream pipeline.
+            # Do not widen ordinary explicit mesh selections (legacy children).
+            native = any(any(getattr(getattr(mod, 'node_group', None), 'name', '').startswith(
+                'Hair_System_Setup') for mod in getattr(obj, 'modifiers', ())) for obj in objects)
+            if native:
+                from . import hair_tool_export as hair
+                declared[name] = resolve_hair_outputs(objects, bpy.data.objects, name,
+                    hair.is_hair_tool_object, hair._get_hair_tool_input_object, owner)
+            else:
+                declared[name] = set(objects)
     for name, objects in declared.items():
         if any(owner(o) != name for o in objects):
             raise ValueError('Explicit export source has a different Empty owner: ' + name)

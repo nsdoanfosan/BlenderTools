@@ -377,7 +377,7 @@ def _pack_rfaos(mesh):
     if system_color_attribute is None:
         _warn(
             f'Hair Tool mesh "{mesh.name}" has no "SystemColor" attribute. '
-            'Using neutral black RGB; the System Color stage will add no color.'
+            'Encoding absence separately from valid black RGB.'
         )
     if chaos_weight_attribute is None:
         _warn(
@@ -571,8 +571,8 @@ def _pack_rfaos_nanite_uvs(mesh, packed_values):
 
     UV1 stores linear SystemColor RG.
     UV2 stores tagged packed Random+Depth in U and Factor in V.
-    UV3 stores tagged AO in U and linear SystemColor B in V. Absent colors
-    use raw B=-1 (Blender V=2); valid black with alpha=0 stays present.
+    UV3 stores tagged AO in U and linear SystemColor B in V; absent colors
+    use raw B=-1 (Blender V=2). Valid black, including alpha=0, stays present.
     The FBX skeletal importer applies ``V = 1 - V``, so Unreal receives the
     original G, Factor, and B values in the V components.
     """
@@ -951,6 +951,7 @@ def get_rfaos_payload_contract(mesh_object=None):
         'system_color_encoding': 'LINEAR_RGB_UV1_RG_UV3_V',
         'system_color_alpha_used': False,
         'system_color_absent_raw_b': -1.0,
+        'system_color_presence_threshold': -0.5,
         'requires_full_precision_uvs': True,
         'depth_attribute': 'Depth',
         'depth_fallback': 0.0,
@@ -1014,12 +1015,32 @@ def _evaluated_mesh_objects(
         depsgraph.update()
 
     try:
+        # Blender 5.2 can expose a CURVES object's mesh component only through
+        # GeometrySet. Its depsgraph MESH proxy may produce an empty to_mesh,
+        # which used to silently omit complete Hair Tool card systems.
+        evaluated = source_object.evaluated_get(depsgraph)
+        geometry_fn = getattr(evaluated, 'evaluated_geometry', None) if evaluated.type == 'CURVES' else None
+        geometry = geometry_fn() if callable(geometry_fn) else geometry_fn
+        direct_mesh = getattr(geometry, 'mesh', None)
+        has_direct_mesh = bool(direct_mesh and direct_mesh.vertices and direct_mesh.polygons)
+        if has_direct_mesh:
+            mesh = direct_mesh.copy()
+            if include_system_ao and mesh.attributes.get('AO') is None:
+                _set_neutral_ao(mesh)
+            mesh_object = bpy.data.objects.new(f'__S2U_HAIR_PART_{source_object.name}', mesh)
+            bpy.context.scene.collection.objects.link(mesh_object)
+            mesh_object.matrix_world = evaluated.matrix_world.copy()
+            created_objects.append(mesh_object)
+            state['temporary_object_names'].add(mesh_object.name)
+
         for instance in depsgraph.object_instances:
             parent = instance.parent
             original_object = instance.object.original
             original_parent = parent.original if parent else None
             if instance.object.type != 'MESH':
                 continue
+            if has_direct_mesh and original_object == source_object:
+                continue  # GeometrySet already supplied this evaluated component.
             # A direct evaluated result or an actual GN instance is valid. A
             # plain child mesh is construction data, not an AO occluder.
             if original_object != source_object and not (
@@ -1377,8 +1398,8 @@ def prepare():
 
             shapes_baked = _bake_group_shape_keys(shape_source_parts)
 
-            # Stamp disposable parts before joining, which zero-fills missing
-            # SystemColor and otherwise loses the distinction from authored black.
+            # Stamp each disposable part before joining: Blender fills missing
+            # SystemColor with black when only some joined parts have it.
             for part in parts:
                 _stamp_system_color_presence(part.data)
 
