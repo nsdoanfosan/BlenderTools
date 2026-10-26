@@ -13,6 +13,7 @@ import math
 from pathlib import Path
 import re
 import sys
+import traceback
 import uuid
 from collections import defaultdict, Counter
 
@@ -1925,16 +1926,18 @@ def _apply_hair_guide_cloth(record):
 
 
 def apply_hair_guide_cloth(record):
-    """Keep the ordinary export successful when optional cloth cannot be built.
+    """Transport an explicit failure receipt back to the requesting extension.
 
-    No extra fallback or paint rule is inferred from a failed validation. The
-    already imported render mesh and the previous cloth remain available.
+    Preserving the imported mesh/previous Cloth is not operation success. The
+    Blender extension must reject verified=False and report the original error.
+    Keep its type and traceback visible even after native recovery/cleanup.
     """
     try:
         return _apply_hair_guide_cloth(record)
     except Exception as error:
         receipt = {"version": 1, "verified": False, "status": "cloth_not_updated",
                    "render_asset_path": record.get("render_asset_path") if isinstance(record, dict) else None,
-                   "detail": str(error)}
-        print("SEND2UE_HAIR_GUIDE_CLOTH_INFO:" + json.dumps(receipt, ensure_ascii=False))
+                   "detail": str(error), "error_type": type(error).__name__,
+                   "traceback": traceback.format_exc()}
+        print("SEND2UE_HAIR_GUIDE_CLOTH_ERROR:" + json.dumps(receipt, ensure_ascii=False))
         return receipt

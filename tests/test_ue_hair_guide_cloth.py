@@ -291,7 +291,7 @@ class NonblockingApplyTests(unittest.TestCase):
         self.assertEqual(unreal.EditorAssetLibrary.mock_calls, [])
         unreal.load_asset.assert_not_called()
 
-    def test_optional_worker_failure_preserves_record_and_allows_export_to_continue(self):
+    def test_native_failure_receipt_preserves_imported_mesh_without_claiming_success(self):
         record = {'version': 1, 'render_asset_path': '/Game/Hair/SK_Render',
                   'sim_asset_path': '/Game/Hair/SK_Sim', 'extras': {'artist': [1, 2]}}
         original = copy.deepcopy(record)

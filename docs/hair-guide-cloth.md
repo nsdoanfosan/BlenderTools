@@ -132,7 +132,13 @@ armature state changes the packet hash and requires a new binding bake.
 
 Only the cloth command receives a scoped 900-second response timeout. Existing
 global RPC preferences and all normal import settings are preserved. Cloth
-failures do not abort the original FBX import or publish an invalid replacement.
+failures preserve already imported meshes and the previous Cloth, but fail the
+requested Send2UE operation. Recovery never converts a failure into success.
+The native failure receipt includes the original exception type, message and
+traceback under `SEND2UE_HAIR_GUIDE_CLOTH_ERROR`; the Blender extension rejects
+that receipt, reports an error and prevents coordinated completion. A failed
+Cloth update can leave a newer imported mesh paired with the previous Cloth;
+it must remain incomplete until the reported problem is resolved.
 
 Cloth duplication does not deep-copy an externally referenced Dataflow in UE5.8.
 Before editing a build source, publication stage, new final, or existing final,
