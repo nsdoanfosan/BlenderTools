@@ -1512,9 +1512,13 @@ def _publish_impl(unreal, source_asset, binding_path, target, owner, content, pa
             old_collection = _native(unreal.CodexClothToolsLibrary.dump_cloth_collection_colors(target))
             maps = _weight_map_updates(full_graph, old_collection['collections'][0],
                                        before['collections'][0], packet, ownership, effective_map_names=map_names)
-        if sim_mesh_path is not None:
-            if not any(info['type'] == 'FCodexClothVertexColorWeightMapNode' for info in fi.values()):
-                raise ValueError('Existing cloth needs its explicit native G migration before reimport')
+        # Older published graphs inherit their verified G/MaxDistance data from
+        # GeneratorBindings. They do not need a second G node in this graph.
+        # Only an already-authored native route needs source rebinding here;
+        # both layouts still pass the same source/stage and final collection
+        # proofs, and artist configuration/paint remain unchanged.
+        if sim_mesh_path is not None and any(
+                info['type'] == 'FCodexClothVertexColorWeightMapNode' for info in fi.values()):
             route_api = _weight_routes_module()
             source_maximum = _raw_g_maximum(fi, fs['connections'])
             full_graph = full_graph or _native(unreal.CodexClothToolsLibrary.dump_dataflow_nodes(fg.get_path_name()))

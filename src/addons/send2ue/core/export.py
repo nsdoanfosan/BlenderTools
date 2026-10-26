@@ -173,13 +173,29 @@ def realize_selected_geometry_node_instances():
     """
     depsgraph = bpy.context.evaluated_depsgraph_get()
     depsgraph.update()
+    selected_meshes = [
+        obj for obj in bpy.context.selected_objects
+        if obj.type == BlenderTypes.MESH
+    ]
+    # GroupPro's FFD realizes its input internally. By the end of the stack
+    # there is no INSTANCE domain left to detect, even though GP_Mirror
+    # created negative-handed instances earlier. Correct that boundary before
+    # any downstream deformation consumes it, using temporary export modifiers.
+    boundaries = [
+        (obj, modifier)
+        for obj in selected_meshes
+        for modifier in obj.modifiers
+        if modifier.type == 'NODES' and modifier.node_group
+        and modifier.node_group.name.split('.')[0] == 'GP_Mirror'
+        and modifier.show_viewport
+    ]
     instance_objects = [
         scene_object
-        for scene_object in bpy.context.selected_objects
-        if scene_object.type == BlenderTypes.MESH
-        and utilities.has_evaluated_mesh_instances(scene_object, depsgraph)
+        for scene_object in selected_meshes
+        if utilities.has_evaluated_mesh_instances(scene_object, depsgraph)
     ]
-    if not instance_objects:
+    boundaries.extend((obj, None) for obj in instance_objects)
+    if not boundaries:
         yield
         return
 
@@ -258,13 +274,18 @@ def realize_selected_geometry_node_instances():
             group_output.inputs['Geometry'],
         )
 
-        for scene_object in instance_objects:
+        for scene_object, boundary in boundaries:
             modifier = scene_object.modifiers.new(
                 name='__Send2UE_RealizeSelectedInstances__',
                 type='NODES',
             )
             modifier.node_group = node_group
             modifiers.append((scene_object, modifier))
+            if boundary is not None:
+                names = list(scene_object.modifiers.keys())
+                scene_object.modifiers.move(
+                    names.index(modifier.name), names.index(boundary.name) + 1,
+                )
         depsgraph.update()
         yield
     finally:
@@ -459,10 +480,8 @@ def export_file(properties, lod=0, file_type=FileTypes.FBX):
                 'Export these meshes in separate asset groups.'
             )
         if numerical_flags == {True}:
-            # FBX encoding is file-wide: only homogeneous data groups can
-            # opt into LINEAR without changing an unmarked sibling's colors.
             export_settings['colors_type'] = 'LINEAR'
-    if file_type == FileTypes.FBX and mesh_object and mesh_object.get(hair_tool_export.TEMP_PROPERTY):
+    if file_type == FileTypes.FBX and any(o.get(hair_tool_export.TEMP_PROPERTY) for o in bpy.context.selected_objects):
         export_settings['mesh_smooth_type'] = 'FACE'
 
     if file_type == FileTypes.FBX:
@@ -541,9 +560,20 @@ def export_mesh(asset_id, mesh_object, properties, lod=0):
     # Extensions may re-link legacy children while preparing an assembly.
     # Enforce the explicit source contract on the final FBX selection too.
     from . import export_selection
+    combined_parent = bpy.data.objects.get(asset_data.get('empty_object_name', ''))
     for selected in list(bpy.context.selected_objects):
         if not export_selection.includes(selected):
             selected.select_set(False)
+        elif not export_selection.keep_prepared_hair_in_mesh_export(selected, mesh_object, combined_parent):
+            # Combine Assets can select every child of a shared armature when
+            # exporting an ordinary anchor. Each prepared Hair Tool output is
+            # already a complete asset; a common rig does not merge its peers.
+            selected.select_set(False)
+
+    prepared_hair = next((o for o in bpy.context.selected_objects
+                          if o.get(hair_tool_export.TEMP_PROPERTY)), None)
+    if prepared_hair is not None:
+        asset_data['_hair_tool_payload'] = hair_tool_export.get_rfaos_payload_contract(prepared_hair)
 
     # Note: this is a weird work around for morph targets not exporting when
     # particle systems are on the mesh. Making them not visible fixes this bug

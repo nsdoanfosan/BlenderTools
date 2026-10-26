@@ -615,7 +615,19 @@ def export(**keywords):
                                 rot = (0, 0, 0)
                                 scale = (conversion_factor, conversion_factor, conversion_factor)
                 else:
-                    loc = Vector((0, 0, 0))
+                    # The armature already supplies the skeletal origin. Each
+                    # mesh can have a meaningful offset within that rig (for
+                    # example after centering an accessory anchor). Clearing
+                    # its node translation disagrees with the skin bind pose:
+                    # Blender's importer compensates, but Unreal imports raw
+                    # vertices using this node transform and separates them
+                    # from their bones. Keep the authored mesh-relative offset.
+                    if ob_obj.parented_to_armature or not ob_obj.has_valid_parent(scene_data.objects):
+                        armatures = [obj for obj in bpy.context.selected_objects
+                                     if obj.type == 'ARMATURE']
+                        if len(armatures) == 1:
+                            origin = scene_data.settings.global_matrix @ armatures[0].matrix_world.translation
+                            loc = loc - origin
 
         tmpl = elem_props_template_init(scene_data.templates, b"Model")
         # For now add only loc/rot/scale...

@@ -2,6 +2,7 @@
 import copy
 import json
 import unittest
+from unittest.mock import patch
 
 from test_ue_hair_guide_cloth_external import ExternalGraphHarness, Node, M
 from test_ue_hair_guide_cloth import fixture
@@ -295,6 +296,54 @@ class NativeGPublicationTests(unittest.TestCase):
         for i in range(3):
             self.assertIn(edge('SimulationKinematicBlend', 'Collection', 'ClothAssetTerminal', f'CollectionLods[{i}]'),
                           graph.connections)
+
+    def test_reimport_accepts_g_in_binding_without_rewriting_legacy_final_graph(self):
+        for external in (False, True):
+            with self.subTest(external=external):
+                h = ExternalGraphHarness(external_final=external)
+                source = self.source(h)
+                before = h.graph(h.final).snapshot()
+                context = M._graph_context(h.final)
+                with patch.object(M, '_weight_routes_module', side_effect=AssertionError(
+                        'Binding-only graphs must not be implicitly migrated')):
+                    M._publish(h.unreal, source, h.new_binding, h.target, h.owner,
+                               'new-content', sim_mesh_path=self.sim)
+                after = h.graph(h.final).snapshot()
+                expected = copy.deepcopy(before)
+                expected['nodes']['GeneratorBindings']['properties']['ClothAsset'] = h.new_binding
+                self.assertEqual(after, expected)
+                self.assertEqual(M._graph_context(h.final), context)
+                self.assertEqual(h.final.metadata[h.binding_key], h.new_binding)
+
+    def test_binding_only_reimport_restores_graph_and_metadata_after_failed_save(self):
+        h = ExternalGraphHarness(external_final=False)
+        source = self.source(h)
+        before = h.graph(h.final).snapshot()
+        metadata = copy.deepcopy(h.final.metadata)
+        h.fail_target_save_once = True
+        with self.assertRaisesRegex(RuntimeError, 'Updated cloth could not be saved'):
+            M._publish(h.unreal, source, h.new_binding, h.target, h.owner,
+                       'new-content', sim_mesh_path=self.sim)
+        self.assertEqual(h.graph(h.final).snapshot(), before)
+        self.assertEqual(h.final.metadata, metadata)
+
+    def test_binding_only_reimport_still_rejects_changed_native_simulation_data(self):
+        h = ExternalGraphHarness(external_final=False)
+        source = self.source(h)
+        before = h.graph(h.final).snapshot()
+        metadata = copy.deepcopy(h.final.metadata)
+        original_dump = h.unreal.CodexClothToolsLibrary.dump_cloth_collection_colors
+        def corrupt_final(path):
+            result = json.loads(original_dump(path))
+            if path == h.target and h.final.collection['binding_revision'] == h.new_binding:
+                result['collections'][0]['built_mapping']['sim_weights'] = [1., 1., 1.]
+            return json.dumps(result)
+        h.unreal.CodexClothToolsLibrary.dump_cloth_collection_colors = corrupt_final
+        with self.assertRaisesRegex(RuntimeError, 'differs from its verified collection: built_mapping'):
+            M._publish(h.unreal, source, h.new_binding, h.target, h.owner,
+                       'new-content', sim_mesh_path=self.sim)
+        self.assertEqual(h.graph(h.final).snapshot(), before)
+        self.assertEqual(h.final.metadata, metadata)
 
     def test_native_g_source_rejects_wrong_g_before_saving_and_cleans_its_request_assets(self):
         h = ExternalGraphHarness(existing=False)

@@ -73,7 +73,7 @@ def _validate_connected(mesh, owners):
     return len(component_owners)
 
 
-def validate_pair(original, ribbon, native_islands, own_weights):
+def validate_pair(original, ribbon, native_islands, own_weights, profile_points=2):
     """Prove source lineage, sample/G preservation and valid open-strip topology."""
     source_ids = _point_attribute(original, SPLINE_ATTRIBUTE, 'INT')
     ribbon_ids = _point_attribute(ribbon, SPLINE_ATTRIBUTE, 'INT')
@@ -107,8 +107,8 @@ def validate_pair(original, ribbon, native_islands, own_weights):
         centers.append(values)
     if set(samples[0]) != set(samples[1]):
         raise ValueError('Ribbon generation changed curve sample identities')
-    if any(len(indices) != 2 for indices in samples[1].values()):
-        raise ValueError('Ribbon must contain exactly two vertices at every curve sample')
+    if profile_points not in (2, 3) or any(len(indices) != profile_points for indices in samples[1].values()):
+        raise ValueError('Ribbon cross sections must retain the requested two or three profile points')
     max_center_error = max_weight_error = 0.0
     for key, source_indices in samples[0].items():
         anchor = source_indices[0]
@@ -141,11 +141,12 @@ def validate_pair(original, ribbon, native_islands, own_weights):
             edge_use[tuple(sorted((a, b)))] += 1
     if not areas or any(count > 2 for count in edge_use.values()):
         raise ValueError('Ribbon has missing faces or non-manifold edges')
-    if len(ribbon.loop_triangles) != 2 * (len(samples[1]) - ribbon_components):
+    if len(ribbon.loop_triangles) != 2 * (profile_points - 1) * (len(samples[1]) - ribbon_components):
         raise ValueError('Ribbon does not have the expected open-strip connectivity')
     return local_owners, {'guide_count': ribbon_components, 'source_component_count': original_components,
         'sample_count': len(samples[1]), 'max_center_error_m': max_center_error,
         'max_weight_error': max_weight_error, 'min_triangle_area_m2': min(areas),
+        'profile_points': profile_points,
         'native_island_to_spline': {str(native): next(iter(values)) for native, values in native_to_spline.items()},
         'identity_basis': 'native_mesh_island_to_stamped_curve_and_sample',
         'source_counts': _counts(original), 'simulation_counts': _counts(ribbon)}
@@ -252,6 +253,7 @@ class RibbonPlan:
         self.modifier = self.original_group = self.profile_name = None
         self.groups = []
         self.prepared = False
+        self.profile_points = guide.get('send2ue_cloth_ribbon_profile_points', 2)
         self.receipt = {'version': VERSION, 'requested_mode': requested_mode, 'effective_mode': 'ORIGINAL',
                         'profile': 'UNKNOWN', 'status': 'original', 'fallback_reason': None}
 
@@ -297,7 +299,19 @@ class RibbonPlan:
             line = inner.nodes.new('GeometryNodeCurvePrimitiveLine')
             line.inputs['Start'].default_value = (-1.0, 0.0, 0.0)
             line.inputs['End'].default_value = (1.0, 0.0, 0.0)
-            _connect(inner, line.outputs['Curve'], nodes['Capture Attribute.001'].inputs['Geometry'])
+            profile_curve = line.outputs['Curve']
+            if self.profile_points == 3:
+                # A native midpoint gives the physical strip a center support
+                # without moving either rail, the curve, or the rendered hair.
+                resample = inner.nodes.new('GeometryNodeResampleCurve')
+                if resample.inputs.get('Mode') is not None:
+                    resample.inputs['Mode'].default_value = 'Count'
+                else:
+                    resample.mode = 'COUNT'
+                resample.inputs['Count'].default_value = 3
+                inner.links.new(profile_curve, resample.inputs['Curve'])
+                profile_curve = resample.outputs['Curve']
+            _connect(inner, profile_curve, nodes['Capture Attribute.001'].inputs['Geometry'])
             sweep = nodes['Curve to Mesh']
             for link in list(sweep.inputs['Fill Caps'].links):
                 inner.links.remove(link)
@@ -307,7 +321,7 @@ class RibbonPlan:
             _connect(inner, position.outputs['Geometry'], nodes['Group Output'].inputs['Output_1'])
             bpy.context.view_layer.update()
             mesh = copy_mesh(obj)
-            owners, validation = validate_pair(original_mesh, mesh, native_islands, own_weights)
+            owners, validation = validate_pair(original_mesh, mesh, native_islands, own_weights, self.profile_points)
             self.receipt.update(validation, effective_mode='RIBBON', status='converted', fallback_reason=None)
             result, mesh = mesh, None
             return result, owners, self.receipt
@@ -334,6 +348,8 @@ def prepare(guide_copy, requested_mode='RIBBON'):
         plan.fallback('Unsupported simulation mesh mode: ' + str(requested_mode))
         return plan
     try:
+        if type(plan.profile_points) is not int or plan.profile_points not in (2, 3):
+            raise ValueError('Physical ribbon profile points must be explicitly 2 or 3')
         candidates, flats = [], []
         modifiers = list(guide_copy.modifiers)
         for index, modifier in enumerate(modifiers):

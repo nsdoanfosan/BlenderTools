@@ -220,6 +220,13 @@ class FakeRemoteExecution:
 
 
 class TestRemoteExecutionConfig(unittest.TestCase):
+    def test_strict_transport_receipt_does_not_become_bootstrap_error(self):
+        remote = FakeRemoteExecution()
+        marker = '__WQ_NATIVE_RESULT__{"request_id": "test-id", "success": true}\r\n'
+        with mock.patch.object(REMOTE_EXECUTION, 'RemoteExecution', return_value=remote), mock.patch.object(UNREAL.uuid, 'uuid4', return_value='test-id'):
+            for command_output in ('', 'ordinary output\r\n'):
+                with mock.patch.object(UNREAL, 'run_unreal_python_commands', return_value=command_output + marker):
+                    self.assertEqual(UNREAL.run_commands(['pass'], strict=True), command_output)
 
     def test_multicast_bind_address_is_independent_from_command_endpoint(self):
         preferences = types.SimpleNamespace(

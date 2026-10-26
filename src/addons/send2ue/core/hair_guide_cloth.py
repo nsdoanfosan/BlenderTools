@@ -18,6 +18,19 @@ PACKAGE_PROPERTY = '_send2ue_guide_cloth_package'
 GUID_ATTRIBUTE = 'send2ue_parent_guide_id'
 STAMP_ATTRIBUTE = 'send2ue_source_guide_island'
 RENDER_ONLY_GUID = -1
+GUIDE_IDENTITY_PROPERTY = 'send2ue_guide_identity'
+
+
+def guide_identity(guide):
+    """Read the author-owned persistent key without changing source data.
+
+    Existing packets keep their historical name-based keys. A source may pin
+    that original token before a rename so artist maps retain their identity.
+    """
+    identity = guide.get(GUIDE_IDENTITY_PROPERTY, guide.name)
+    if not isinstance(identity, str) or not identity.strip() or '\0' in identity:
+        raise ValueError('Source guide identity must be a nonempty string')
+    return identity
 
 
 def settings(properties=None):
@@ -248,6 +261,14 @@ def capture_source(source, export_state, include_system_ao=False, ao_settings=No
             return None
         if search['status'] == 'no_guide_after_search':
             return _capture_render_only(source, export_state, search, include_system_ao, ao_settings)
+        # In a native surface -> profiled guide -> generated hair pipeline the
+        # profiled middle stage is always the ribbon source. Old saved fixture
+        # helpers may still request ORIGINAL; they must not undo this contract.
+        profiled_guide = hair.is_hair_tool_object(guide)
+        simulation_mode = ('RIBBON' if profiled_guide else
+                           getattr(settings(), 'simulation_mesh_mode', 'RIBBON'))
+        search['simulation_mode_basis'] = ('native_profiled_guide_requires_ribbon'
+            if profiled_guide else 'source_settings')
         # Whole-source static policy precedes optional ribbon preparation and
         # ownership work. Missing/zero own G never creates a simulation source.
         guide_copy = guide.copy()
@@ -265,7 +286,7 @@ def capture_source(source, export_state, include_system_ao=False, ao_settings=No
                 'status': 'guide_weights_all_zero', 'guide_search_status': search['status'],
                 'excluded_sim_vertices': len(original_guide_mesh.vertices),
                 'simulation_mesh': {'version': 'send2ue.guide_ribbon.v1',
-                    'requested_mode': getattr(settings(), 'simulation_mesh_mode', 'RIBBON'),
+                    'requested_mode': simulation_mode,
                     'effective_mode': 'ORIGINAL', 'status': 'source_all_zero',
                     'fallback_reason': None, 'simulation_counts': {'vertices': 0, 'triangles': 0}}}
             return _capture_render_only(source, export_state, static_source, include_system_ao, ao_settings)
@@ -277,8 +298,7 @@ def capture_source(source, export_state, include_system_ao=False, ao_settings=No
         copies.append(render_copy)
         if guide:
             from . import hair_guide_ribbon as ribbon
-            ribbon_plan = ribbon.prepare(guide_copy,
-                getattr(settings(), 'simulation_mesh_mode', 'RIBBON'))
+            ribbon_plan = ribbon.prepare(guide_copy, simulation_mode)
             group = _stamp_group()
             stamp = guide_copy.modifiers.new('Send2UE Export Ownership', 'NODES')
             stamp.node_group = group
@@ -309,6 +329,7 @@ def capture_source(source, export_state, include_system_ao=False, ao_settings=No
                 'simulation_mesh': dict(ribbon_plan.receipt)}
             return _capture_render_only(source, export_state, static_source,
                                         include_system_ao, ao_settings)
+        identity = guide_identity(guide)
         rm = _copy_mesh(render_copy)
         meshes.append(rm)
         if ribbon_plan.prepared:
@@ -329,6 +350,13 @@ def capture_source(source, export_state, include_system_ao=False, ao_settings=No
                 weights, weight_receipt = own_weights(gm)
         if include_system_ao and rm.attributes.get('AO') is None:
             hair._set_neutral_ao(rm)
+        cleanup = source.get('send2ue_cloth_clean_degenerate_render', False)
+        if type(cleanup) is not bool:
+            raise ValueError('Render cleanup option must be a boolean')
+        if cleanup:
+            from . import hair_render_cleanup
+            search['render_cleanup'] = hair_render_cleanup.clean(rm,
+                position_scale=source.get('send2ue_cloth_cleanup_position_scale'))
         guide_islands = components(gm)
         if guide:
             stamped = gm.attributes.get(STAMP_ATTRIBUTE)
@@ -415,6 +443,7 @@ def capture_source(source, export_state, include_system_ao=False, ao_settings=No
         for local, gid in ids.items():
             vertices = [i for i, g in enumerate(gids) if g == gid]
             packet['parts'].append({'gid': gid, 'source_guide': guide.name,
+                'source_identity': identity,
                 'source_render': source.name, 'source_vertex_indices': vertices,
                 'local_sim_vertex_indices': vertices, 'provenance': provenance,
                 'render_vertices': render_gids.count(gid),
@@ -534,9 +563,11 @@ def _finish_asset(render, captures, asset_name, armature, export_collection, exp
         obj[hair.SOURCE_NAME_PROPERTY] = asset_name + '_GuideSim'
         obj[hair.TEMP_PROPERTY] = True
         # No Empty/armature parent: Combine Assets must keep this as its own FBX.
-        group = obj.vertex_groups.new(name=hair._get_head_bone_name(armature))
-        group.add(range(len(mesh.vertices)), 1., 'REPLACE')
-        obj.modifiers.new('Armature', 'ARMATURE').object = armature
+        # The render has already resolved its ordinary Transfer Weights settings.
+        # Use that same native binding path for the simulation export instead of
+        # imposing the head-only hair rule on explicitly skinned assets such as tails.
+        hair._copy_transfer_settings(obj, [render])
+        hair._bind_export_skin(obj, armature)
         _int_attribute(mesh, GUID_ATTRIBUTE, gids)
         colors = mesh.color_attributes.new(name='RFAOS', type='BYTE_COLOR', domain='CORNER')
         for loop, color in zip(mesh.loops, colors.data):
@@ -569,8 +600,12 @@ def _finish_asset(render, captures, asset_name, armature, export_collection, exp
                      'matrix_world': [list(r) for r in armature.matrix_world],
                      'rest_bones': [{'name': b.name, 'parent': b.parent.name if b.parent else None,
                                      'matrix_local': [list(r) for r in b.matrix_local]} for b in armature.data.bones],
-                     'export_skin_rule': {'head_bone': hair._get_head_bone_name(armature), 'weight': 1.0,
-                                          'basis': 'existing_send2ue_hair_tool_export_rule'}} if armature else None,
+                     'export_skin_rule': ({'mode': 'TRANSFER_WEIGHTS',
+                         'transfer_source': render.vdt_object_props.transfer_source.name,
+                         'basis': 'existing_send2ue_hair_tool_export_rule'}
+                         if getattr(render, 'ue_unique_transfer_weights', False) else
+                         {'head_bone': hair._get_head_bone_name(armature), 'weight': 1.0,
+                          'basis': 'existing_send2ue_hair_tool_export_rule'})} if armature else None,
         'weight_policy': 'Own simulation ChaosWeight; whole all-zero or absent-weight sources render-only; retain all vertices of any positive-weight source; never child render G.',
         'missing_guide_policy': 'Render-only after complete guide search; no simulation geometry or proxy binding.'}
     unit = bpy.data.objects.get(asset_name)

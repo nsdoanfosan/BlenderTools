@@ -212,9 +212,11 @@ def dispose_mesh(mesh):
         bpy.data.meshes.remove(mesh)
 
 
-def run_plan(source, mode):
+def run_plan(source, mode, profile_points=None):
     copy = source.copy()
     bpy.context.scene.collection.objects.link(copy)
+    if profile_points is not None:
+        copy['send2ue_cloth_ribbon_profile_points'] = profile_points
     plan = ribbon.prepare(copy, mode)
     original = cloth._copy_mesh(copy)
     owners = cloth.components(original)
@@ -280,6 +282,28 @@ for iteration in range(3):
     assert set(bpy.data.node_groups) == baseline_groups
     assert set(bpy.data.objects) == baseline_objects
     receipts.append(receipt)
+
+# Optional center support keeps the sample centers, weights and source graph.
+before_meshes = set(bpy.data.meshes)
+original, converted, owners, converted_owners, center_receipt = run_plan(guide, 'RIBBON', 3)
+assert converted is not original and center_receipt['status'] == 'converted', center_receipt
+assert center_receipt['profile_points'] == 3
+assert len(converted.vertices) == 45 and len(converted.loop_triangles) == 48
+assert set(converted_owners) == set(owners)
+assert geometry(original) == baseline_geometry
+assert graph_signature(guide.modifiers['Profile'].node_group) == baseline_group_signature
+dispose_mesh(converted)
+dispose_mesh(original)
+assert set(bpy.data.meshes) == before_meshes
+assert set(bpy.data.objects) == baseline_objects
+assert set(bpy.data.node_groups) == baseline_groups
+
+# Unsupported profile counts fail closed with the source retained.
+for count in (1, 4, True):
+    original, converted, owners, converted_owners, invalid_receipt = run_plan(guide, 'RIBBON', count)
+    assert converted is original and invalid_receipt['status'] == 'fallback'
+    assert geometry(original) == baseline_geometry
+    dispose_mesh(original)
 
 # Explicit Original is byte-for-byte geometry/weight passthrough.
 original, converted, owners, converted_owners, original_receipt = run_plan(guide, 'ORIGINAL')
@@ -427,6 +451,8 @@ assert graph_signature(guide.modifiers['Profile'].node_group) == baseline_group_
 assert hashlib.sha256(args.hair_library.read_bytes()).hexdigest() == library_hash
 print('HAIR_GUIDE_RIBBON_SMOKE ' + json.dumps({
     'default_ribbon_and_original_option': True,
+    'optional_three_point_center_support': center_receipt,
+    'invalid_profile_count_retains_original': True,
     'shared_artist_nodegroups_unchanged': True,
     'repeated_conversion_cleanup': True,
     'same_spline_samples_and_own_G': True,

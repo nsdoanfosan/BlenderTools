@@ -30,6 +30,7 @@ class Send2Ue(bpy.types.Operator):
     bl_label = "Push Assets"
     workstation_phase_id: bpy.props.StringProperty(default='', options={'HIDDEN', 'SKIP_SAVE'})
     workstation_deferred_handoff: bpy.props.StringProperty(default='', options={'HIDDEN', 'SKIP_SAVE'})
+    workstation_postprocess_pending: bpy.props.BoolProperty(default=False, options={'HIDDEN', 'SKIP_SAVE'})
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -240,6 +241,10 @@ class Send2Ue(bpy.types.Operator):
                 return
             if not getattr(operation, 'imported_count', 0):
                 raise RuntimeError('No native Unreal import result was verified for this coordinated request')
+            if getattr(self, 'workstation_postprocess_pending', False):
+                operation.finish_import(bpy.context.window_manager.send2ue.asset_data)
+                self._wq_operation = None
+                return
             operation.complete()
             self._wq_operation = None
 
