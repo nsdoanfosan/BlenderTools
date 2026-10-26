@@ -35,12 +35,17 @@ zero-weight islands within that active source are preserved. No authoring profil
 edits or paint generation occur. The simulation FBX G channel
 comes from that guide's own `ChaosWeight`, never the render mesh's colors.
 
-**Simulation guide shape** defaults to **Ribbon for circular guides**. Supported
-Hair Tool `Circle_Profile_UV` generators export an open two-point profile while
+**Simulation guide shape** defaults to **Optimized ribbon guides**. Supported
+Hair Tool `Circle_Profile_UV` and `Flat_Profile_UV` generators use the same
+optimization and validation path, exporting an open two-point profile while
 retaining their existing spline evaluation, longitudinal samples, width fields,
 and own paint. Only disposable simulation copies use this profile. The render
 generator still evaluates the original guide shape. **Original guide** restores
-the original simulation topology; flat guides remain unchanged in either mode.
+the original simulation topology. Flat guides (including the intermediate
+simulation ribbon feeding **Strands from Grid Surface**) use their native flat
+profile at **Profile Res = 1** on the disposable simulation copy. An already
+one-segment flat guide retains its rail positions. Higher transverse resolution
+is reduced while the render generator keeps the authored profile resolution.
 Unsupported node layouts or failed conversion checks retain the original guide
 and record a fallback reason in `sources[].simulation_mesh` and each part.
 

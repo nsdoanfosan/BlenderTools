@@ -11,6 +11,7 @@ import hashlib
 import json
 from pathlib import Path
 import sys
+import tempfile
 
 import addon_utils
 import bpy
@@ -20,6 +21,10 @@ from mathutils.kdtree import KDTree
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / 'src/addons'))
 assert bpy.app.background, 'This test must run in an isolated background worker'
+# Send2UE unregister cleans its data folder. Keep factory QA out of the shared
+# GUI export directory, including during Blender shutdown after this script.
+_qa_temp = tempfile.TemporaryDirectory(prefix='send2ue-ribbon-smoke-')
+tempfile.tempdir = _qa_temp.name
 assert addon_utils.enable('send2ue', default_set=False)
 from send2ue.core import hair_guide_cloth as cloth, hair_guide_ribbon as ribbon
 from send2ue.core import hair_tool_export as hair
@@ -27,6 +32,7 @@ from send2ue.core import hair_tool_export as hair
 parser = argparse.ArgumentParser()
 parser.add_argument('--hair-library', type=Path, default=Path(bpy.utils.user_resource('SCRIPTS')) /
                     'addons/hair_tool/hair_baking/hsystem_nodes_lib_5.2.blend')
+parser.add_argument('--report', type=Path, help='Optional persistent JSON verification receipt')
 args = parser.parse_args(sys.argv[sys.argv.index('--') + 1:] if '--' in sys.argv else [])
 assert args.hair_library.is_file(), 'A Hair Tool 5.2 node library is required: ' + str(args.hair_library)
 library_hash = hashlib.sha256(args.hair_library.read_bytes()).hexdigest()
@@ -35,6 +41,9 @@ with bpy.data.libraries.load(str(args.hair_library), link=False) as (source, tar
     assert set(required).issubset(source.node_groups)
     target.node_groups = list(required)
 CIRCLE, FLAT = [bpy.data.node_groups[name] for name in required]
+with bpy.data.libraries.load(str(args.hair_library), link=False) as (source, target):
+    target.node_groups = ['HS_Grid_Guide']
+GRID = bpy.data.node_groups['HS_Grid_Guide']
 
 
 def socket_value(socket):
@@ -92,7 +101,7 @@ def store(group, geometry, name, data_type, domain, value):
     return node.outputs['Geometry']
 
 
-def fixture(name, profile_group=CIRCLE):
+def fixture(name, profile_group=CIRCLE, profile_res=None):
     curve = bpy.data.curves.new(name + '_Curves', 'CURVE')
     curve.dimensions = '3D'
     for strand in range(3):
@@ -116,6 +125,7 @@ def fixture(name, profile_group=CIRCLE):
     factor = group.nodes.new('GeometryNodeSplineParameter')
     geo = store(group, source.outputs['Geometry'], 'fixture_spline_id', 'INT', 'CURVE', index.outputs['Index'])
     geo = store(group, geo, 'fixture_sample_id', 'INT', 'POINT', index.outputs['Index'])
+    geo = store(group, geo, 'fixture_sample_parameter', 'FLOAT', 'POINT', factor.outputs['Factor'])
     geo = store(group, geo, 'roundness', 'FLOAT', 'POINT', 1.)
     owner = group.nodes.new('GeometryNodeInputNamedAttribute')
     owner.data_type = 'INT'
@@ -142,7 +152,9 @@ def fixture(name, profile_group=CIRCLE):
     group.links.new(geo, profile.inputs['Curves'])
     if profile.inputs.get('Spline Type'):
         profile.inputs['Spline Type'].default_value = 'Poly'
-    for key, value in [('Resolution', 1), ('Profile Res', 2 if profile_group == CIRCLE else 1),
+    if profile_res is None:
+        profile_res = 2 if profile_group == CIRCLE else 1
+    for key, value in [('Resolution', 1), ('Profile Res', profile_res),
                        ('Width', .018), ('Roundness', 1. if profile_group == CIRCLE else 0.),
                        ('Radius from UV', False), ('Width from UV', False),
                        ('Add Root Caps', False), ('Add Tip Caps', False),
@@ -196,6 +208,46 @@ def renderer(guide, filter_first=False):
     return obj
 
 
+def grid_renderer(guide):
+    """Real Strands from Grid Surface, using the native installed node group."""
+    obj = bpy.data.objects.new(guide.name + '_GridRender', bpy.data.meshes.new('GridRenderData'))
+    bpy.context.scene.collection.objects.link(obj)
+    group = bpy.data.node_groups.new('Hair_System_Setup_' + obj.name, 'GeometryNodeTree')
+    source_socket = group.interface.new_socket(name='Source Surface', in_out='INPUT', socket_type='NodeSocketObject')
+    group.interface.new_socket(name='Geometry', in_out='OUTPUT', socket_type='NodeSocketGeometry')
+    source, output = group.nodes.new('NodeGroupInput'), group.nodes.new('NodeGroupOutput')
+    info = group.nodes.new('GeometryNodeObjectInfo')
+    group.links.new(source.outputs['Source Surface'], info.inputs['Object'])
+    parameter = group.nodes.new('GeometryNodeInputNamedAttribute')
+    parameter.data_type = 'FLOAT'
+    parameter.inputs['Name'].default_value = 'fixture_sample_parameter'
+    root = group.nodes.new('ShaderNodeMath')
+    root.operation = 'LESS_THAN'
+    group.links.new(parameter.outputs['Attribute'], root.inputs[0])
+    root.inputs[1].default_value = 1e-7
+    geo = store(group, info.outputs['Geometry'], 'sharp_edge', 'BOOLEAN', 'EDGE', root.outputs[0])
+    grid = group.nodes.new('GeometryNodeGroup')
+    grid.node_tree = GRID
+    group.links.new(geo, grid.inputs['Mesh'])
+    grid.inputs['Resolution'].default_value = 5
+    grid.inputs['Strands Count'].default_value = 3
+    grid.inputs['Placement Mask'].default_value = 1.
+    grid.inputs['Use Strand Count as Density'].default_value = False
+    grid.inputs['Normalize Strand Count'].default_value = False
+    profile = group.nodes.new('GeometryNodeGroup')
+    profile.node_tree = FLAT
+    group.links.new(grid.outputs['Curve'], profile.inputs['Curves'])
+    profile.inputs['Profile Res'].default_value = 1
+    profile.inputs['Width'].default_value = .001
+    profile.inputs['Spline Type'].default_value = 'Poly'
+    profile.inputs['Resolution'].default_value = 1
+    group.links.new(profile.outputs[0], output.inputs['Geometry'])
+    modifier = obj.modifiers.new('Setup', 'NODES')
+    modifier.node_group = group
+    hair._modifier_input_set(modifier, source_socket.identifier, guide)
+    return obj
+
+
 def geometry(mesh):
     mesh.calc_loop_triangles()
     return ([tuple(v.co) for v in mesh.vertices], [tuple(t.vertices) for t in mesh.loop_triangles])
@@ -232,6 +284,7 @@ cfg = cloth.settings()
 assert cfg is not None and cfg.simulation_mesh_mode == 'RIBBON', 'Ribbon must be the default export mode'
 enum = cfg.bl_rna.properties['simulation_mesh_mode']
 assert {'RIBBON', 'ORIGINAL'}.issubset({item.identifier for item in enum.enum_items})
+assert next(item.name for item in enum.enum_items if item.identifier == 'RIBBON') == 'Optimized ribbon guides'
 guide = fixture('RibbonRegression')
 render = renderer(guide)
 baseline_group_signature = graph_signature(guide.modifiers['Profile'].node_group)
@@ -312,13 +365,121 @@ assert original_receipt['effective_mode'] == 'ORIGINAL'
 assert geometry(original) == baseline_geometry
 dispose_mesh(original)
 
-# Already planar Hair Tool input stays planar and is not regenerated.
-planar = fixture('PlanarRegression', FLAT)
-planar_signature = graph_signature(planar.modifiers['Profile'].node_group)
-original, converted, owners, converted_owners, planar_receipt = run_plan(planar, 'RIBBON')
+# Flat guides enter the same conversion/identity/weight checks as circular ones.
+# High transverse resolution reduces to one segment; an existing one-segment
+# guide stays at the same positions. Source/render graphs remain untouched.
+planar_receipts = []
+for resolution in (1, 4):
+    planar = fixture('PlanarRegression' + str(resolution), FLAT, resolution)
+    planar_render = renderer(planar)
+    planar_signature = graph_signature(planar.modifiers['Profile'].node_group)
+    planar_baseline = cloth._copy_mesh(planar)
+    planar_render_baseline = cloth._copy_mesh(planar_render)
+    baseline_state = (set(bpy.data.objects), set(bpy.data.meshes), set(bpy.data.node_groups))
+    for points in (2, 3):
+        original, converted, owners, converted_owners, planar_receipt = run_plan(planar, 'RIBBON', points)
+        assert converted is not original and planar_receipt['status'] == 'converted', planar_receipt
+        assert planar_receipt['profile'] == 'FLAT' and planar_receipt['profile_points'] == points
+        assert len(converted.vertices) == 15 * points
+        assert len(converted.loop_triangles) == 24 * (points - 1)
+        assert set(converted_owners) == set(owners) and len(set(owners)) == 3
+        assert geometry(original) == geometry(planar_baseline)
+        if resolution == 1 and points == 2:
+            assert geometry(converted) == geometry(planar_baseline)
+        if resolution == 4 and points == 2:
+            assert len(converted.vertices) < len(original.vertices)
+            # Reduced rails retain native width, curve radius, tilt and position.
+            for vertex in converted.vertices:
+                assert min((vertex.co - source.co).length for source in original.vertices) < 2e-6
+        dispose_mesh(converted)
+        dispose_mesh(original)
+        assert baseline_state == (set(bpy.data.objects), set(bpy.data.meshes), set(bpy.data.node_groups))
+        planar_receipts.append(dict(planar_receipt, source_profile_res=resolution))
+    # Verify the public capture boundary as well as the plan in isolation.
+    cloth.begin()
+    planar_capture = cloth.capture_source(planar_render, {'temporary_object_names': set(), 'temporary_mesh_names': set()})
+    assert planar_capture is not None and planar_capture[1]['simulation_enabled']
+    assert len(planar_capture[1]['vertices']) == 30
+    assert len(planar_capture[1]['triangles']) == 24
+    assert planar_capture[1]['source']['simulation_mesh']['status'] == 'converted'
+    assert planar_capture[1]['source']['render_ownership']['spline_mismatches'] == 0
+    assert len(planar_capture[1]['parts']) == 3
+    assert geometry(planar_capture[0][0].data) == geometry(planar_render_baseline)
+    for obj in planar_capture[0]:
+        mesh = obj.data
+        bpy.data.objects.remove(obj, do_unlink=True)
+        dispose_mesh(mesh)
+    assert graph_signature(planar.modifiers['Profile'].node_group) == planar_signature
+    assert baseline_state == (set(bpy.data.objects), set(bpy.data.meshes), set(bpy.data.node_groups))
+    original, converted, owners, converted_owners, passthrough = run_plan(planar, 'ORIGINAL')
+    assert converted is original and converted_owners == owners
+    assert geometry(original) == geometry(planar_baseline)
+    dispose_mesh(original)
+    dispose_mesh(planar_baseline)
+    dispose_mesh(planar_render_baseline)
+
+# The native grid generator must preserve exact spline ownership through the
+# same public capture boundary, rather than only passing a surrogate renderer.
+grid_guide = fixture('NativeGridRegression', FLAT, 4)
+grid_render = grid_renderer(grid_guide)
+grid_baseline = cloth._copy_mesh(grid_render)
+assert len(grid_baseline.vertices) > 0, 'Native grid fixture generated no strands'
+cloth.begin()
+grid_capture = cloth.capture_source(grid_render, {'temporary_object_names': set(), 'temporary_mesh_names': set()})
+assert grid_capture is not None and grid_capture[1]['simulation_enabled'], cloth.state()['diagnostics']
+assert len(grid_capture[1]['vertices']) == 30
+assert len(grid_capture[1]['triangles']) == 24
+assert grid_capture[1]['source']['simulation_mesh']['status'] == 'converted'
+assert geometry(grid_capture[0][0].data) == geometry(grid_baseline)
+grid_receipt = grid_capture[1]['source']
+for obj in grid_capture[0]:
+    mesh = obj.data
+    bpy.data.objects.remove(obj, do_unlink=True)
+    dispose_mesh(mesh)
+dispose_mesh(grid_baseline)
+
+# Curved/high-resolution flat profiles keep their longitudinal evaluation and
+# native rail width even with transverse bow and center bevel enabled upstream.
+shaped = fixture('ShapedFlatRegression', FLAT, 6)
+shaped_profile = next(n for n in shaped.modifiers['Profile'].node_group.nodes if getattr(n, 'node_tree', None) == FLAT)
+for name, value in [('Spline Type', 'Catmull Rom'), ('Resolution', 3), ('Roundness', .4),
+                    ('Uplift', .7), ('Bevel Center Axis', 2)]:
+    shaped_profile.inputs[name].default_value = value
+shaped_signature = graph_signature(shaped.modifiers['Profile'].node_group)
+shaped_baseline = cloth._copy_mesh(shaped)
+original, converted, owners, converted_owners, shaped_receipt = run_plan(shaped, 'RIBBON')
+assert converted is not original and shaped_receipt['status'] == 'converted', shaped_receipt
+assert geometry(original) == geometry(shaped_baseline), 'Flat sample stamps changed authored geometry'
+assert shaped_receipt['sample_count'] > 15
+for vertex in converted.vertices:
+    assert min((vertex.co - source.co).length for source in original.vertices) < 2e-6
+assert graph_signature(shaped.modifiers['Profile'].node_group) == shaped_signature
+dispose_mesh(converted)
+dispose_mesh(original)
+shaped_render = grid_renderer(shaped)
+shaped_render_baseline = cloth._copy_mesh(shaped_render)
+cloth.begin()
+shaped_capture = cloth.capture_source(shaped_render, {'temporary_object_names': set(), 'temporary_mesh_names': set()})
+assert shaped_capture is not None and shaped_capture[1]['simulation_enabled'], cloth.state()['diagnostics']
+shaped_capture_receipt = shaped_capture[1]['source']['simulation_mesh']
+assert shaped_capture_receipt['status'] == 'converted', shaped_capture_receipt
+assert shaped_capture_receipt['original_guide_geometry_unchanged'] and shaped_capture_receipt['render_geometry_unchanged']
+assert geometry(shaped_capture[0][0].data) == geometry(shaped_render_baseline)
+for obj in shaped_capture[0]:
+    mesh = obj.data
+    bpy.data.objects.remove(obj, do_unlink=True)
+    dispose_mesh(mesh)
+dispose_mesh(shaped_render_baseline)
+dispose_mesh(shaped_baseline)
+
+# An unknown flat layout uses the same safe fallback as an unknown circle.
+unsupported_flat = fixture('UnsupportedFlatRegression', FLAT, 4)
+flat_profile = next(n for n in unsupported_flat.modifiers['Profile'].node_group.nodes if getattr(n, 'node_tree', None) == FLAT)
+flat_profile.node_tree = FLAT.copy()
+flat_profile.node_tree.nodes['Set Position'].name = 'UnknownFlatShaping'
+original, converted, owners, converted_owners, flat_fallback = run_plan(unsupported_flat, 'RIBBON')
 assert converted is original and converted_owners == owners
-assert planar_receipt['effective_mode'] == 'ORIGINAL'
-assert graph_signature(planar.modifiers['Profile'].node_group) == planar_signature
+assert flat_fallback['status'] == 'fallback' and flat_fallback['fallback_reason']
 dispose_mesh(original)
 
 # A Circle-shaped graph with an unsupported contract must retain original sim
@@ -449,7 +610,9 @@ assert graph_signature(static_group) == static_signature
 assert not cloth.state()['diagnostics'], 'A static source must not be reported as a failed conversion'
 assert graph_signature(guide.modifiers['Profile'].node_group) == baseline_group_signature
 assert hashlib.sha256(args.hair_library.read_bytes()).hexdigest() == library_hash
-print('HAIR_GUIDE_RIBBON_SMOKE ' + json.dumps({
+report = {
+    'blender_version': bpy.app.version_string,
+    'hair_library_sha256': library_hash,
     'default_ribbon_and_original_option': True,
     'optional_three_point_center_support': center_receipt,
     'invalid_profile_count_retains_original': True,
@@ -463,11 +626,20 @@ print('HAIR_GUIDE_RIBBON_SMOKE ' + json.dumps({
     'conflicting_compact_id_stamp_is_rejected_and_cleaned_up': True,
     'renderer_unchanged': True,
     'original_passthrough': True,
-    'planar_passthrough': True,
+    'planar_same_optimization_path': True,
+    'planar_original_passthrough': True,
+    'native_grid_surface_capture': grid_receipt,
+    'shaped_flat_longitudinal_samples_and_rails_preserved': shaped_receipt,
+    'shaped_flat_native_grid_capture': shaped_capture_receipt,
+    'unsupported_flat_original_fallback': flat_fallback,
     'unsupported_original_fallback_with_reason': True,
     'unsupported_capture_retains_geometry_and_emits_diagnostic': True,
     'whole_zero_source_render_only': True,
     'receipts': receipts,
-    'planar_receipt': planar_receipt,
+    'planar_receipts': planar_receipts,
     'fallback_receipt': fallback_receipt,
-}), flush=True)
+}
+if args.report:
+    args.report.parent.mkdir(parents=True, exist_ok=True)
+    args.report.write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+print('HAIR_GUIDE_RIBBON_SMOKE ' + json.dumps(report), flush=True)
