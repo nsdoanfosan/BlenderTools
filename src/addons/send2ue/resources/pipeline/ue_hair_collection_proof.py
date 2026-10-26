@@ -115,7 +115,7 @@ def publication_view(row,baseline,added_names=()):
             for attr in entry['attributes']:
                 key=(name,attr['name'])
                 if name=='SimVertices3D' and attr['name'] in added_names and key not in old_attrs:
-                    if (attr['type_name']!='float' or attr['dependency'] or not attr['persistent'] or
+                    if (attr['type_name']!='float' or attr['dependency'] not in (None,'','None') or not attr['persistent'] or
                             tuple(attr[key] for key in float_fields) not in float_schemas):
                         raise ValueError('Published generated map is not a persistent native scalar float')
                     continue

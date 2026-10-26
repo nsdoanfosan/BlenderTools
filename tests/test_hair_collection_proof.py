@@ -273,6 +273,24 @@ class PublicationProofTests(unittest.TestCase):
         self.assert_rejected(before, after)
         self.assert_rejected(before, after, {'generatedtravel'})
 
+    def test_generated_float_map_accepts_native_fname_none_without_weakening_its_schema(self):
+        for empty_dependency in ('', 'None'):
+            with self.subTest(empty_dependency=empty_dependency):
+                before, after = collection(), collection()
+                for row in (before, after):
+                    for group in row[C.KEY]['groups']:
+                        for attr in group['attributes']:
+                            attr['dependency'] = empty_dependency
+                add_attribute(after, 'SimVertices3D', 'GeneratedTravel')
+                added = find_attribute(after, 'SimVertices3D', 'GeneratedTravel')
+                added['dependency'] = empty_dependency
+                self.assert_allowed(before, after, {'GeneratedTravel'})
+                for invalid in ('SimVertices2D', 'OtherGroup', 'none', 'NONE', None, False, 0):
+                    with self.subTest(invalid=invalid):
+                        changed = copy.deepcopy(after)
+                        find_attribute(changed, 'SimVertices3D', 'GeneratedTravel')['dependency'] = invalid
+                        self.assert_rejected(before, changed, {'GeneratedTravel'})
+
     def test_added_name_does_not_hide_an_existing_artist_map(self):
         before, after = collection(), collection()
         change_hash(after, 'SimVertices3D', 'ArtistPaint')
