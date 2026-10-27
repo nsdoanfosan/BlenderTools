@@ -472,8 +472,17 @@ def export_file(properties, lod=0, file_type=FileTypes.FBX):
     mesh_object = bpy.data.objects.get(asset_data.get('_mesh_object_name', ''))
     if file_type == FileTypes.FBX:
         exported_meshes = [obj for obj in bpy.context.selected_objects if obj.type == 'MESH']
-        numerical_flags = {bool(obj.get('send2ue_vertex_colors_are_data', False))
-                           for obj in exported_meshes}
+        def numerical_colors(obj):
+            # Linked library overrides can discard added custom properties on
+            # reload. A local export root supplies the same contract durably
+            # for its whole group, while explicit child choices still win.
+            while obj is not None:
+                if 'send2ue_vertex_colors_are_data' in obj:
+                    return bool(obj['send2ue_vertex_colors_are_data'])
+                obj = getattr(obj, 'parent', None)
+            return False
+
+        numerical_flags = {numerical_colors(obj) for obj in exported_meshes}
         if len(numerical_flags) > 1:
             raise RuntimeError(
                 'One FBX cannot combine numerical weight colors with render colors. '
