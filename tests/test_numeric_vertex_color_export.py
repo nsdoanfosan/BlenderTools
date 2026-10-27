@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 class NumericColorExportTests(unittest.TestCase):
-    def export(self, data_flag, file_type='fbx', sibling_flags=()):
+    def export(self, data_flag, file_type='fbx', sibling_flags=(), parent_flag=None):
         source=Path(__file__).parents[1]/'src/addons/send2ue/core/export.py'
         tree=ast.parse(source.read_text(encoding='utf8'))
         fn=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='export_file')
@@ -17,7 +17,11 @@ class NumericColorExportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             class Mesh(dict):
                 type='MESH'
-            mesh=Mesh(send2ue_vertex_colors_are_data=data_flag, present=True)
+            mesh=Mesh(present=True)
+            if data_flag is not None:
+                mesh['send2ue_vertex_colors_are_data']=data_flag
+            if parent_flag is not None:
+                mesh.parent=Mesh(send2ue_vertex_colors_are_data=parent_flag)
             selected=[mesh]+[Mesh(send2ue_vertex_colors_are_data=flag) for flag in sibling_flags]
             asset={'file_path':str(Path(folder)/'mesh.fbx'),'_mesh_object_name':'mesh'}
             settings=types.SimpleNamespace(
@@ -41,6 +45,12 @@ class NumericColorExportTests(unittest.TestCase):
 
     def test_ordinary_render_colors_keep_the_authored_preset(self):
         self.assertEqual(self.export(False)[0][1]['colors_type'],'SRGB')
+
+    def test_linked_child_inherits_numeric_contract_from_export_root(self):
+        self.assertEqual(self.export(None,parent_flag=True)[0][1]['colors_type'],'LINEAR')
+
+    def test_explicit_child_render_color_choice_overrides_numeric_root(self):
+        self.assertEqual(self.export(False,parent_flag=True)[0][1]['colors_type'],'SRGB')
 
     def test_alembic_does_not_inherit_the_fbx_override(self):
         kind,settings=self.export(True,'abc')[0]
