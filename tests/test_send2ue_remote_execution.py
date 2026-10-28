@@ -399,6 +399,38 @@ class TestRunUnrealPythonCommands(unittest.TestCase):
         self.assertAlmostEqual(clock.value, 5.0)
         self.assertEqual(remote_exec.command_calls, 0)
 
+    def test_followup_waits_for_known_native_import_to_settle_without_replaying_it(self):
+        bpy = types.ModuleType('bpy')
+        bpy.app = types.SimpleNamespace(driver_namespace={
+            'send2ue_workstation_operation': types.SimpleNamespace(imported_count=1)})
+        bpy.context = types.SimpleNamespace(preferences=types.SimpleNamespace(
+            addons={'send2ue': types.SimpleNamespace(
+                preferences=types.SimpleNamespace(rpc_response_timeout=20))}))
+        remote_exec = FakeRemoteExecution(nodes_after_polls=80)
+        clock = FakeClock()
+        monotonic_patch, sleep_patch = self._clock_patches(clock)
+        with mock.patch.dict(sys.modules, {'bpy': bpy}), monotonic_patch, sleep_patch:
+            UNREAL.run_unreal_python_commands(remote_exec, ['pass'])
+        self.assertGreater(clock.value, 5.0)
+        self.assertLess(clock.value, 20.0)
+        self.assertEqual(remote_exec.command_calls, 1)
+
+    def test_nonfinite_settle_timeout_keeps_initial_discovery_bound(self):
+        bpy = types.ModuleType('bpy')
+        bpy.app = types.SimpleNamespace(driver_namespace={
+            'send2ue_workstation_operation': types.SimpleNamespace(imported_count=1)})
+        bpy.context = types.SimpleNamespace(preferences=types.SimpleNamespace(
+            addons={'send2ue': types.SimpleNamespace(
+                preferences=types.SimpleNamespace(rpc_response_timeout=float('inf')))}))
+        remote_exec = FakeRemoteExecution(nodes_after_polls=None)
+        clock = FakeClock()
+        monotonic_patch, sleep_patch = self._clock_patches(clock)
+        with mock.patch.dict(sys.modules, {'bpy': bpy}), monotonic_patch, sleep_patch:
+            with self.assertRaisesRegex(ConnectionError, 'No Unreal Editor responded'):
+                UNREAL.run_unreal_python_commands(remote_exec, ['pass'])
+        self.assertAlmostEqual(clock.value, 5.0)
+        self.assertEqual(remote_exec.command_calls, 0)
+
     def test_multiple_unresponsive_nodes_share_one_deadline(self):
         remote_exec = FakeRemoteExecution()
         clock = FakeClock()
