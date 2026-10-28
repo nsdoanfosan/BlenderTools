@@ -260,9 +260,22 @@ Duplicate tokens on different guides and empty or malformed tokens are rejected.
 Initialize a token in the source authoring workflow before later renames. When
 migrating existing painted cloth, use the verified historical rename record and
 check its old parent keys; do not guess a token from spatial proximity. A token
-does not authorize geometry resampling. Changed longitudinal sampling still
-requires the explicit `rooted_ribbon_arclength` policy for the exact parent keys,
-with the existing root, rail, topology and authored-paint checks intact.
+does not alone authorize geometry resampling. New exports declare the
+`source_ribbon_paint_transfer` v1 `stable_parent_arclength` contract. Only proven
+two-rail FLAT/CIRCLE ribbon conversions may use it: the receiver matches stable
+parent-spline keys, checks complete strip topology and source vertex identities,
+requires unchanged root and tip centers and consistent rail orientation, then
+interpolates each rail's paint along normalized centerline distance. There is no
+nearest-guide search or averaging between rails. Unsupported or ambiguous
+correspondence still fails before publishing the cloth. This also avoids stale
+manual allow-lists after a verified generator's sample count changes. Legacy
+explicit `rooted_ribbon_arclength` policies remain supported.
+
+Temporary project exports use `blender/send2ue-session-data/<process-id>` under
+the system temporary directory. Unregistering one Blender cleans only its own
+process folder. The new folder is outside the legacy shared `send2ue/data`
+directory so an older running Blender's cleanup cannot erase an active FBX or
+paint manifest. Explicit user-selected disk export folders are unchanged.
 
 ## Native three-stage Hair Tool chains
 
@@ -319,3 +332,29 @@ These paths require the project's native CodexClothTools nodes and audit APIs.
 The app-free tests cover graph contracts, preservation and failure paths; they do
 not establish successful native migration or an FBX reimport of a production
 asset. Existing binding-only assets inherit G from their validated BindingData through `GeneratorBindings`; they do not need a duplicate G node in the final graph. Reimport preserves that graph and applies the same complete collection proof. An existing explicit native G route still receives its guarded source rebinding; reimport never implicitly migrates artist graphs.
+
+## Coordinated import settling
+
+Initial Unreal discovery keeps its short timeout. After a coordinated request has
+successfully imported an asset, follow-up discovery can wait up to the configured
+RPC response timeout while Unreal rebuilds dependent Cloth assets. Only discovery
+and a harmless readiness probe are retried; dispatched import commands are never
+replayed automatically.
+
+For an existing binding-only graph, the temporary publication check now imports
+the verified BindingData directly, matching the final graph. It does not apply G,
+MaxDistance and kinematic selection a second time. This removes redundant
+MaxDistance property warnings without disabling warnings or relaxing the complete
+collection proof. Existing explicit native G routes and first publication keep
+their native route validation.
+
+A parked native simulation config is preserved when it has exactly one Collection
+input from the live chain and no connected outputs. It does not contribute to any
+terminal. Disconnected subgraphs, paint/geometry branches and parameter consumers
+continue to fail validation. Artists can keep such a config for later use without
+temporarily deleting it for reimport.
+
+Unchanged authored weight arrays are not rewritten from reflected text. This
+preserves native float32 paint precision when the editor's text dump exposes
+fewer decimal places than the stored values. Only arrays whose correspondence
+actually changes are written and included in rollback edits.

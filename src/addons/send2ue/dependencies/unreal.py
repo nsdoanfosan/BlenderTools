@@ -110,8 +110,19 @@ def print_python(commands):
 
 
 def _get_remote_execution_connection_timeout():
-    """Discovery must not inherit the long-running asset import timeout."""
-    return REMOTE_EXECUTION_CONNECTION_TIMEOUT
+    """Keep initial discovery short; allow known native imports to settle."""
+    timeout = REMOTE_EXECUTION_CONNECTION_TIMEOUT
+    try:
+        import bpy
+        operation = getattr(bpy.app, 'driver_namespace', {}).get('send2ue_workstation_operation')
+        if operation is not None and getattr(operation, 'imported_count', 0) > 0:
+            preferences = bpy.context.preferences.addons['send2ue'].preferences
+            settle_timeout = float(preferences.rpc_response_timeout)
+            if math.isfinite(settle_timeout):
+                timeout = max(timeout, settle_timeout)
+    except (ImportError, AttributeError, KeyError, TypeError, ValueError):
+        pass
+    return timeout
 
 
 def _remote_execution_endpoint_summary(remote_exec):

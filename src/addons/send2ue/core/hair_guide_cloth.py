@@ -608,6 +608,12 @@ def _finish_asset(render, captures, asset_name, armature, export_collection, exp
                           'basis': 'existing_send2ue_hair_tool_export_rule'})} if armature else None,
         'weight_policy': 'Own simulation ChaosWeight; whole all-zero or absent-weight sources render-only; retain all vertices of any positive-weight source; never child render G.',
         'missing_guide_policy': 'Render-only after complete guide search; no simulation geometry or proxy binding.'}
+    # Verified ribbon exports can change their longitudinal sampling without
+    # changing parent-spline identity. Ask the receiver to transfer artist paint
+    # in each rooted strip's source coordinates, with independent topology,
+    # endpoint and rail checks. Legacy manual allow-lists remain supported.
+    packet['source_ribbon_paint_transfer'] = {
+        'version': 1, 'policy': 'stable_parent_arclength'}
     unit = bpy.data.objects.get(asset_name)
     raw_transfer = unit.get('send2ue_cloth_weight_map_transfer', '') if unit else ''
     if raw_transfer:

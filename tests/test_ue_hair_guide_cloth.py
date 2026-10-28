@@ -750,6 +750,32 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(h.snapshot(final), before)
         self.assertEqual(h.updates, [])
 
+    def test_parked_native_config_leaf_is_preserved_across_reimports(self):
+        h = PublishHarness(); h.add_capsule_collision()
+        final = h.assets[h.target]
+        final.node_types['ParkedSelf'] = 'FChaosClothAssetSimulationSelfCollisionSpheresConfigNode'
+        final.config_properties['ParkedSelf'] = {'Radius':.5,'Stiffness':2.}
+        final.connections.append(dict(fromNode='HairBodyCapsules',fromPin='Collection',
+                                      toNode='ParkedSelf',toPin='Collection'))
+        before = h.snapshot(final)
+        h.publish()
+        self.assertEqual(final.config_properties,before['config_properties'])
+        self.assertEqual(final.connections,before['connections'])
+
+    def test_unconnected_config_subgraph_is_not_treated_as_a_parked_leaf(self):
+        h = PublishHarness(); h.add_solver()
+        final = h.assets[h.target]
+        for name in ('ParkedA','ParkedB'):
+            final.node_types[name] = 'FChaosClothAssetSimulationSolverConfigNode'
+            final.config_properties[name] = {'NumSubsteps':8}
+        final.connections.extend([
+            dict(fromNode='GeneratorBindings',fromPin='Collection',toNode='ParkedA',toPin='Collection'),
+            dict(fromNode='ParkedA',fromPin='Collection',toNode='ParkedB',toPin='Collection')])
+        before = h.snapshot(final)
+        with self.assertRaisesRegex(ValueError,'disconnected configuration branch'):
+            h.publish()
+        self.assertEqual(h.snapshot(final),before)
+
     def test_reexports_preserve_downstream_solver_configuration_and_connections(self):
         h = PublishHarness(); h.add_solver()
         final = h.assets[h.target]
@@ -1088,7 +1114,7 @@ class GarmentWindConfigurationTests(unittest.TestCase):
             self.assertIs(saved['config_properties']['ArtistGarmentWind']['bEnabled'], False)
             h.old_binding = next_binding
         self.assertEqual(h.updates, [(h.target, binding) for binding in revisions])
-        self.assertEqual(h.map_updates, [(h.target, h.paint), (h.target, h.paint)])
+        self.assertEqual(h.map_updates, [], 'Unchanged paint must retain native precision without rewrites')
 
     def test_garment_lookalikes_are_rejected_without_mutating_published_configuration(self):
         for node_type in ('FCodexGarmentWindConfigNode_v2', 'FCodexGarmentWindGeometryConfigNode',

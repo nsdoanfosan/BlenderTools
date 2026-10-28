@@ -1047,7 +1047,7 @@ def _rooted_ribbon_parameters(native, indices, source_ids):
 
 
 def _ribbon_paint_correspondence(old, new, previous, indices, old_ids, new_ids,
-                                 preserve_source_rails=False):
+                                 preserve_source_rails=False, require_same_tip=False):
     """Explicit same-parent resampling; each rail retains its own painted values."""
     previous, old_t, old_center, old_length = _rooted_ribbon_parameters(old, previous, old_ids)
     indices, new_t, new_center, new_length = _rooted_ribbon_parameters(new, indices, new_ids)
@@ -1055,7 +1055,7 @@ def _ribbon_paint_correspondence(old, new, previous, indices, old_ids, new_ids,
     # Root is the shared attachment; require the same ribbon rail orientation.
     if math.dist(old_center[0],new_center[0]) > .0001:
         raise ValueError('Authored paint ribbon attachment changed')
-    if preserve_source_rails and math.dist(old_center[-1],new_center[-1]) > .0001:
+    if (preserve_source_rails or require_same_tip) and math.dist(old_center[-1],new_center[-1]) > .0001:
         raise ValueError('Authored paint source-rail endpoint changed')
     for native, group in ((old,previous),(new,indices)):
         if any(math.dist(native['sim_positions'][a],native['sim_positions'][b]) <= 1e-7
@@ -1082,6 +1082,32 @@ def _ribbon_paint_correspondence(old, new, previous, indices, old_ids, new_ids,
     return correspondence
 
 
+def _automatic_ribbon_paint_keys(packet, rows):
+    """Recognize the exporter's verified, two-rail source-coordinate contract."""
+    contract = packet.get('source_ribbon_paint_transfer')
+    if contract is None:
+        return set()
+    if contract != {'version': 1, 'policy': 'stable_parent_arclength'}:
+        raise ValueError('Unsupported source ribbon paint transfer contract')
+    eligible = set()
+    for part in packet.get('parts', []):
+        row = rows.get(int(part['gid']))
+        receipt = part.get('simulation_mesh', {})
+        if (row is None or part.get('source_guide') != row.get('source') or
+                part.get('source_identity', part.get('source_guide')) != row.get('source_identity', row.get('source'))):
+            raise ValueError('Ribbon paint transfer has inconsistent source identity')
+        if (receipt.get('version') == 'send2ue.guide_ribbon.v1' and
+                receipt.get('effective_mode') == 'RIBBON' and receipt.get('status') == 'converted' and
+                receipt.get('profile') in {'FLAT', 'CIRCLE'} and receipt.get('profile_points') == 2 and
+                receipt.get('identity_basis') == 'native_mesh_island_to_stamped_curve_and_sample' and
+                isinstance(receipt.get('max_center_error_m'), (int, float)) and
+                0 <= receipt['max_center_error_m'] <= 1e-7 and
+                isinstance(receipt.get('max_weight_error'), (int, float)) and
+                0 <= receipt['max_weight_error'] <= 1e-6):
+            eligible.add(row['key'])
+    return eligible
+
+
 def _weight_map_updates(full_graph, old, new, packet, ownership, *, effective_map_names=None):
     """Rebuild known generated maps; reject unexplained authored paint changes."""
     updates = {}
@@ -1103,6 +1129,7 @@ def _weight_map_updates(full_graph, old, new, packet, ownership, *, effective_ma
     if packet and ownership and len(key_nodes) == 1 and authored_nodes:
         previous_keys = [float(v) for v in key_nodes[0]['props']['VertexWeights'].strip('()').split(',') if v]
         current_keys, rows = _guide_identity_rows(packet, ownership)
+        automatic_keys = _automatic_ribbon_paint_keys(packet, rows)
         # UE ExportText serializes float properties with six decimal places.
         # Recover a hash only when exactly one current parent key falls in that
         # rounding interval; never merge near hashes or infer nearest guides.
@@ -1152,11 +1179,12 @@ def _weight_map_updates(full_graph, old, new, packet, ownership, *, effective_ma
                         part = next((p for p in packet.get('parts',[]) if
                                      p.get('source_guide') == row.get('source') and
                                      p['simulation_mesh'].get('effective_mode') == 'RIBBON'), None)
-                        if not previous or row.get('key') not in allowed or part is None:
+                        if not previous or row.get('key') not in allowed | automatic_keys or part is None:
                             break
                         correspondences.update(_ribbon_paint_correspondence(
                             old_native,new_native,previous,indices,old_ids,new_ids,
-                            preserve_source_rails=row.get('key') in source_rails))
+                            preserve_source_rails=row.get('key') in source_rails,
+                            require_same_tip=row.get('key') in automatic_keys - allowed))
                         continue
                     previous.sort(key=lambda index: old_ids[index])
                     indices.sort(key=lambda index: new_ids[index])
@@ -1389,7 +1417,16 @@ def _publish_impl(unreal, source_asset, binding_path, target, owner, content, pa
     graph, call, structure, nodes, infos = _graph(unreal, stage)
     terminal = next(n for n, i in infos.items() if "TerminalNode" in i["type"])
     order, retained, dependencies, derived_names = [], {terminal}, set(), set()
-    if sim_mesh_path is not None:
+    native_stage = sim_mesh_path is not None
+    if native_stage and unreal.EditorAssetLibrary.does_asset_exist(target):
+        existing_infos = _graph(unreal, unreal.load_asset(target))[4]
+        # A binding-only target already inherits verified G, MaxDistance and
+        # kinematic selection. Validate that same layout in its temporary stage
+        # instead of writing MaxDistance/selection a second time. Keep explicit
+        # native routes and first-publication behavior intact.
+        native_stage = any(info['type'] == 'FCodexClothVertexColorWeightMapNode'
+                           for info in existing_infos.values())
+    if native_stage:
         order, retained, dependencies, derived_names = _native_stage_nodes(infos, structure, terminal, sim_mesh_path)
     for name, node in nodes.items():
         if name not in retained:
@@ -1483,11 +1520,23 @@ def _publish_impl(unreal, source_asset, binding_path, target, owner, content, pa
                 raise ValueError("Existing cloth graph has user changes; it remains unchanged")
             visited.update(chain)
         dependencies = _configuration_dependencies(fi, fs['connections'], visited, imports)
-        if any(n not in visited | dependencies and fi[n]['type'] not in _VARIABLE_NODES for n in configs):
+        # A parked native config may read the live collection but has no output
+        # consumer. It cannot affect any terminal. Preserve its authored values
+        # and its single input instead of requiring artists to delete it.
+        parked = set()
+        for name in configs - visited - dependencies:
+            incoming_edges = [e for e in fs['connections'] if e['toNode'] == name]
+            if (re.fullmatch(r'FChaosClothAssetSimulation\w*ConfigNode(?:_v\d+)?',fi[name]['type'])
+                    and not any(e['fromNode'] == name for e in fs['connections'])
+                    and len(incoming_edges) == 1
+                    and incoming_edges[0]['fromNode'] in visited | set(imports)
+                    and incoming_edges[0]['fromPin'] == incoming_edges[0]['toPin'] == 'Collection'):
+                parked.add(name)
+        if any(n not in visited | dependencies | parked and fi[n]['type'] not in _VARIABLE_NODES for n in configs):
             raise ValueError('Existing cloth graph has user changes: disconnected configuration branch')
         map_names = _asset_weight_map_names(final, fg, fc, fi, fs['connections'],
             read_native=lambda: _native(unreal.CodexClothToolsLibrary.dump_dataflow_nodes(fg.get_path_name())))
-        response_attributes = _native_response_attributes(fi, fs['connections'], configs, visited,
+        response_attributes = _native_response_attributes(fi, fs['connections'], configs - parked, visited,
                                                           effective_map_names=map_names)
         protected_maps = set(response_attributes) | set(map_names.values())
         response_attributes |= _selection_weight_map_attributes(fi, fs['connections'], visited | dependencies,
@@ -1545,7 +1594,10 @@ def _publish_impl(unreal, source_asset, binding_path, target, owner, content, pa
             # Never keep EdNode handles into the former shared graph.
             fg, fc, fs, fn, fi = _graph(unreal, final)
             writes_started = True
-            for name, (_, _, weights) in maps.items():
+            # Reflected array text may have less precision than the stored
+            # float32 paint. Avoid round-tripping unchanged authored weights.
+            map_writes = {name:entry for name,entry in maps.items() if entry[1] != entry[2]}
+            for name, (_, _, weights) in map_writes.items():
                 fc('UpdateNode', fn[name], json.dumps({'VertexWeights': weights}))
             fc("UpdateNode", fn[imports[0]], json.dumps({"ClothAsset": binding_path, "ImportLod": 0}))
             added_names = {row[0] for row in maps.values()} | response_attributes
@@ -1589,7 +1641,7 @@ def _publish_impl(unreal, source_asset, binding_path, target, owner, content, pa
                     if route_changed:
                         _restore_native_routes(unreal, final, route_plan)
                         fg, fc, fs, fn, fi = _graph(unreal, final)
-                    for name, (_, values, _) in maps.items():
+                    for name, (_, values, _) in map_writes.items():
                         fc('UpdateNode', fn[name], json.dumps({'VertexWeights': values}))
                     fc("UpdateNode", fn[imports[0]], json.dumps({"ClothAsset": old_binding, "ImportLod": 0}))
                 unreal.DataflowBlueprintLibrary.evaluate_terminal_node_by_name(fg, terminals[0], final)
@@ -1696,6 +1748,7 @@ def _build_in_editor(record, output_directory, created, committed):
                "weight_source": "simulation_source_own_g",
                "reference_skeletal_mesh_asset_path": record["body_mesh_asset_path"],
                "authored_weight_map_transfer": packet.get('weight_map_transfer'),
+               "source_ribbon_paint_transfer": packet.get('source_ribbon_paint_transfer'),
                "native_binding": repaired}
     if final.get("staging_cleanup_warning"):
         receipt["staging_cleanup_warning"] = final["staging_cleanup_warning"]

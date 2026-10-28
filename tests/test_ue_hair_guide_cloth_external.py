@@ -582,6 +582,58 @@ class ExternalGraphHarness:
 
 
 class ExternalGraphTests(unittest.TestCase):
+    def test_unchanged_paint_does_not_roundtrip_low_precision_native_text(self):
+        h = ExternalGraphHarness(external_source=False,external_final=False)
+        precise = '(0.123456789,0.625000019,0.875000023)'
+        paint = h.graph(h.final).nodes['ArtistPaint']
+        paint.properties['VertexWeights'] = precise
+        original_dump = h.dump_graph
+        def low_precision_dump(path):
+            payload = json.loads(original_dump(path))
+            for node in payload['nodes']:
+                if node['name']=='ArtistPaint':
+                    node['props']['VertexWeights']='(0.123457,0.625000,0.875000)'
+            return json.dumps(payload)
+        h.unreal.CodexClothToolsLibrary.dump_dataflow_nodes = low_precision_dump
+        h.publish()
+        self.assertEqual(h.graph(h.final).nodes['ArtistPaint'].properties['VertexWeights'],precise)
+
+    def test_binding_only_reimport_stage_does_not_reapply_max_distance(self):
+        h = ExternalGraphHarness(external_source=False)
+        before_connections = copy.deepcopy(h.graph(h.final).connections)
+        M._publish(h.unreal,h.source,h.new_binding,h.target,h.owner,'new-content',
+                   sim_mesh_path='/Game/Fixtures/Sim')
+        stage = h.created[h.source_path + '_FinalStage']
+        self.assertEqual(set(h.graph(stage).nodes), {'GeneratorBindings','ClothAssetTerminal'})
+        self.assertEqual(h.graph(h.final).connections,before_connections)
+
+    def test_binding_only_stage_still_rejects_a_changed_collection(self):
+        h = ExternalGraphHarness(external_source=False)
+        h.bad_stage = True
+        before = h.snapshot_cloth(h.final)
+        with self.assertRaisesRegex(RuntimeError,'Final import changed'):
+            M._publish(h.unreal,h.source,h.new_binding,h.target,h.owner,'new-content',
+                       sim_mesh_path='/Game/Fixtures/Sim')
+        self.assertEqual(h.snapshot_cloth(h.final),before)
+
+    def test_first_publication_still_requires_its_explicit_native_route(self):
+        h = ExternalGraphHarness(existing=False,external_source=False)
+        # This fixture deliberately has no source native G/MaxDistance route.
+        with self.assertRaisesRegex(ValueError,'Native G publication needs one'):
+            M._publish(h.unreal,h.source,h.new_binding,h.target,h.owner,'new-content',
+                       sim_mesh_path='/Game/Fixtures/Sim')
+
+    def test_existing_explicit_g_route_keeps_source_route_validation(self):
+        h = ExternalGraphHarness(external_source=False)
+        graph = h.graph(h.final)
+        graph.nodes['OwnedG'] = Node(graph,'OwnedG','FCodexClothVertexColorWeightMapNode',
+                                     {'SourceMesh':'/Game/Fixtures/Sim'},'e'*32)
+        before = h.snapshot_cloth(h.final)
+        with self.assertRaisesRegex(ValueError,'Native G publication needs one'):
+            M._publish(h.unreal,h.source,h.new_binding,h.target,h.owner,'new-content',
+                       sim_mesh_path='/Game/Fixtures/Sim')
+        self.assertEqual(h.snapshot_cloth(h.final),before)
+
     def assert_original_untouched(self, h, graph, before, peer):
         self.assertEqual(graph.snapshot(), before)
         self.assertIs(h.graph(peer), graph)
