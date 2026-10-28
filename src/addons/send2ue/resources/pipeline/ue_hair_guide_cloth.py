@@ -1047,7 +1047,7 @@ def _rooted_ribbon_parameters(native, indices, source_ids):
 
 
 def _ribbon_paint_correspondence(old, new, previous, indices, old_ids, new_ids,
-                                 preserve_source_rails=False):
+                                 preserve_source_rails=False, require_same_tip=False):
     """Explicit same-parent resampling; each rail retains its own painted values."""
     previous, old_t, old_center, old_length = _rooted_ribbon_parameters(old, previous, old_ids)
     indices, new_t, new_center, new_length = _rooted_ribbon_parameters(new, indices, new_ids)
@@ -1055,7 +1055,7 @@ def _ribbon_paint_correspondence(old, new, previous, indices, old_ids, new_ids,
     # Root is the shared attachment; require the same ribbon rail orientation.
     if math.dist(old_center[0],new_center[0]) > .0001:
         raise ValueError('Authored paint ribbon attachment changed')
-    if preserve_source_rails and math.dist(old_center[-1],new_center[-1]) > .0001:
+    if (preserve_source_rails or require_same_tip) and math.dist(old_center[-1],new_center[-1]) > .0001:
         raise ValueError('Authored paint source-rail endpoint changed')
     for native, group in ((old,previous),(new,indices)):
         if any(math.dist(native['sim_positions'][a],native['sim_positions'][b]) <= 1e-7
@@ -1082,6 +1082,32 @@ def _ribbon_paint_correspondence(old, new, previous, indices, old_ids, new_ids,
     return correspondence
 
 
+def _automatic_ribbon_paint_keys(packet, rows):
+    """Recognize the exporter's verified, two-rail source-coordinate contract."""
+    contract = packet.get('source_ribbon_paint_transfer')
+    if contract is None:
+        return set()
+    if contract != {'version': 1, 'policy': 'stable_parent_arclength'}:
+        raise ValueError('Unsupported source ribbon paint transfer contract')
+    eligible = set()
+    for part in packet.get('parts', []):
+        row = rows.get(int(part['gid']))
+        receipt = part.get('simulation_mesh', {})
+        if (row is None or part.get('source_guide') != row.get('source') or
+                part.get('source_identity', part.get('source_guide')) != row.get('source_identity', row.get('source'))):
+            raise ValueError('Ribbon paint transfer has inconsistent source identity')
+        if (receipt.get('version') == 'send2ue.guide_ribbon.v1' and
+                receipt.get('effective_mode') == 'RIBBON' and receipt.get('status') == 'converted' and
+                receipt.get('profile') in {'FLAT', 'CIRCLE'} and receipt.get('profile_points') == 2 and
+                receipt.get('identity_basis') == 'native_mesh_island_to_stamped_curve_and_sample' and
+                isinstance(receipt.get('max_center_error_m'), (int, float)) and
+                0 <= receipt['max_center_error_m'] <= 1e-7 and
+                isinstance(receipt.get('max_weight_error'), (int, float)) and
+                0 <= receipt['max_weight_error'] <= 1e-6):
+            eligible.add(row['key'])
+    return eligible
+
+
 def _weight_map_updates(full_graph, old, new, packet, ownership, *, effective_map_names=None):
     """Rebuild known generated maps; reject unexplained authored paint changes."""
     updates = {}
@@ -1103,6 +1129,7 @@ def _weight_map_updates(full_graph, old, new, packet, ownership, *, effective_ma
     if packet and ownership and len(key_nodes) == 1 and authored_nodes:
         previous_keys = [float(v) for v in key_nodes[0]['props']['VertexWeights'].strip('()').split(',') if v]
         current_keys, rows = _guide_identity_rows(packet, ownership)
+        automatic_keys = _automatic_ribbon_paint_keys(packet, rows)
         # UE ExportText serializes float properties with six decimal places.
         # Recover a hash only when exactly one current parent key falls in that
         # rounding interval; never merge near hashes or infer nearest guides.
@@ -1152,11 +1179,12 @@ def _weight_map_updates(full_graph, old, new, packet, ownership, *, effective_ma
                         part = next((p for p in packet.get('parts',[]) if
                                      p.get('source_guide') == row.get('source') and
                                      p['simulation_mesh'].get('effective_mode') == 'RIBBON'), None)
-                        if not previous or row.get('key') not in allowed or part is None:
+                        if not previous or row.get('key') not in allowed | automatic_keys or part is None:
                             break
                         correspondences.update(_ribbon_paint_correspondence(
                             old_native,new_native,previous,indices,old_ids,new_ids,
-                            preserve_source_rails=row.get('key') in source_rails))
+                            preserve_source_rails=row.get('key') in source_rails,
+                            require_same_tip=row.get('key') in automatic_keys - allowed))
                         continue
                     previous.sort(key=lambda index: old_ids[index])
                     indices.sort(key=lambda index: new_ids[index])
@@ -1696,6 +1724,7 @@ def _build_in_editor(record, output_directory, created, committed):
                "weight_source": "simulation_source_own_g",
                "reference_skeletal_mesh_asset_path": record["body_mesh_asset_path"],
                "authored_weight_map_transfer": packet.get('weight_map_transfer'),
+               "source_ribbon_paint_transfer": packet.get('source_ribbon_paint_transfer'),
                "native_binding": repaired}
     if final.get("staging_cleanup_warning"):
         receipt["staging_cleanup_warning"] = final["staging_cleanup_warning"]

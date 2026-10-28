@@ -69,6 +69,52 @@ class BackRibbonIndependentReviewTests(unittest.TestCase):
         return {'version': 1, 'policy': 'rooted_ribbon_arclength',
                 'guide_keys': [['Guide', 0]] if keys is None else keys}
 
+    def automatic_case(self):
+        fixture = self.weight_case()
+        packet = fixture[3]
+        packet['source_ribbon_paint_transfer'] = {'version': 1, 'policy': 'stable_parent_arclength'}
+        packet['parts'][0]['simulation_mesh'].update(
+            version='send2ue.guide_ribbon.v1', status='converted', profile='FLAT',
+            profile_points=2, identity_basis='native_mesh_island_to_stamped_curve_and_sample',
+            max_center_error_m=0., max_weight_error=0.)
+        return fixture
+
+    def test_verified_flat_export_resamples_paint_without_stale_manual_allow_list(self):
+        fixture = self.automatic_case()
+        fixture[3]['weight_map_transfer'] = self.policy([['OtherGuide', 2]])
+        actual = self.updates(fixture)
+        self.assertEqual(actual['AuthoredClearance'][2], [.1, .2, .8, .9])
+
+    def test_automatic_transfer_does_not_authorize_a_changed_tip(self):
+        fixture = self.automatic_case()
+        for point in fixture[2]['built_mapping']['sim_positions'][-2:]:
+            point[1] += .01
+        with self.assertRaisesRegex(ValueError, 'endpoint changed'):
+            self.updates(fixture)
+
+    def test_automatic_transfer_does_not_authorize_reversed_rails(self):
+        fixture = self.automatic_case()
+        positions = fixture[2]['built_mapping']['sim_positions']
+        for index in range(0, len(positions), 2):
+            positions[index], positions[index+1] = positions[index+1], positions[index]
+        with self.assertRaisesRegex(ValueError, 'rail orientation changed'):
+            self.updates(fixture)
+
+    def test_incomplete_conversion_proof_cannot_enable_automatic_transfer(self):
+        for field, value in [('profile_points', 3), ('max_center_error_m', .001),
+                             ('identity_basis', 'guessed_nearest'), ('status', 'fallback')]:
+            with self.subTest(field=field):
+                fixture = self.automatic_case()
+                fixture[3]['parts'][0]['simulation_mesh'][field] = value
+                with self.assertRaisesRegex(ValueError, 'correspondence|geometry changed|triangle support changed'):
+                    self.updates(fixture)
+
+    def test_unknown_automatic_policy_is_rejected(self):
+        fixture = self.automatic_case()
+        fixture[3]['source_ribbon_paint_transfer']['version'] = 2
+        with self.assertRaisesRegex(ValueError, 'Unsupported source ribbon'):
+            self.updates(fixture)
+
     def test_root_and_tip_keep_each_authored_rail_value(self):
         old, new = strip([0., .5, 1.]), strip([0., .2, .7, 1.])
         correspondence = self.resample(old, new)

@@ -260,9 +260,16 @@ Duplicate tokens on different guides and empty or malformed tokens are rejected.
 Initialize a token in the source authoring workflow before later renames. When
 migrating existing painted cloth, use the verified historical rename record and
 check its old parent keys; do not guess a token from spatial proximity. A token
-does not authorize geometry resampling. Changed longitudinal sampling still
-requires the explicit `rooted_ribbon_arclength` policy for the exact parent keys,
-with the existing root, rail, topology and authored-paint checks intact.
+does not alone authorize geometry resampling. New exports declare the
+`source_ribbon_paint_transfer` v1 `stable_parent_arclength` contract. Only proven
+two-rail FLAT/CIRCLE ribbon conversions may use it: the receiver matches stable
+parent-spline keys, checks complete strip topology and source vertex identities,
+requires unchanged root and tip centers and consistent rail orientation, then
+interpolates each rail's paint along normalized centerline distance. There is no
+nearest-guide search or averaging between rails. Unsupported or ambiguous
+correspondence still fails before publishing the cloth. This also avoids stale
+manual allow-lists after a verified generator's sample count changes. Legacy
+explicit `rooted_ribbon_arclength` policies remain supported.
 
 ## Native three-stage Hair Tool chains
 
