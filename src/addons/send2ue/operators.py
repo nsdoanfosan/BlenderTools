@@ -215,6 +215,7 @@ class Send2Ue(bpy.types.Operator):
         return {'FINISHED'}
 
     def _begin_coordinated(self, context):
+        unreal.begin_native_import_session()
         self._wq_operation = coordination.begin_operation(
             getattr(self, 'workstation_phase_id', ''), bpy.app.driver_namespace,
             str(bpy.data.filepath or ''),
@@ -233,6 +234,7 @@ class Send2Ue(bpy.types.Operator):
                 raise RuntimeError('The coordinated Send2UE request produced no native Unreal import jobs')
 
     def _complete_coordinated(self):
+        unreal.end_native_import_session()
         operation = getattr(self, '_wq_operation', None)
         if operation is not None:
             if operation.deferred:
@@ -249,6 +251,7 @@ class Send2Ue(bpy.types.Operator):
             self._wq_operation = None
 
     def _fail_coordinated(self, note):
+        unreal.end_native_import_session()
         operation = getattr(self, '_wq_operation', None)
         if operation is not None:
             try:

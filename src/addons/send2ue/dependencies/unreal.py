@@ -27,6 +27,28 @@ _COMMAND_RECORDING_STACK = []
 REMOTE_EXECUTION_CONNECTION_TIMEOUT = 5.0
 REMOTE_EXECUTION_ATTEMPT_TIMEOUT = 1.0
 REMOTE_EXECUTION_POLL_INTERVAL = 0.1
+_NATIVE_IMPORT_SESSION = None
+
+
+def begin_native_import_session():
+    """Track verified imports for manual and coordinated Push Assets alike."""
+    global _NATIVE_IMPORT_SESSION
+    _NATIVE_IMPORT_SESSION = {'imported_count': 0}
+
+
+def end_native_import_session():
+    global _NATIVE_IMPORT_SESSION
+    _NATIVE_IMPORT_SESSION = None
+
+
+def note_native_import_result(asset_data, import_result):
+    if _NATIVE_IMPORT_SESSION is None:
+        return
+    paths = import_result.get('imported_object_paths', []) if isinstance(import_result, dict) else import_result
+    expected = str(asset_data.get('asset_path') or '').split('.', 1)[0].casefold()
+    if expected and isinstance(paths, (list, tuple)) and expected in {
+            str(path).split('.', 1)[0].casefold() for path in paths}:
+        _NATIVE_IMPORT_SESSION['imported_count'] += 1
 
 
 @contextmanager
@@ -115,7 +137,8 @@ def _get_remote_execution_connection_timeout():
     try:
         import bpy
         operation = getattr(bpy.app, 'driver_namespace', {}).get('send2ue_workstation_operation')
-        if operation is not None and getattr(operation, 'imported_count', 0) > 0:
+        imported = (_NATIVE_IMPORT_SESSION or {}).get('imported_count', 0)
+        if imported or (operation is not None and getattr(operation, 'imported_count', 0) > 0):
             preferences = bpy.context.preferences.addons['send2ue'].preferences
             settle_timeout = float(preferences.rpc_response_timeout)
             if math.isfinite(settle_timeout):
