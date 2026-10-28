@@ -353,3 +353,8 @@ input from the live chain and no connected outputs. It does not contribute to an
 terminal. Disconnected subgraphs, paint/geometry branches and parameter consumers
 continue to fail validation. Artists can keep such a config for later use without
 temporarily deleting it for reimport.
+
+Unchanged authored weight arrays are not rewritten from reflected text. This
+preserves native float32 paint precision when the editor's text dump exposes
+fewer decimal places than the stored values. Only arrays whose correspondence
+actually changes are written and included in rollback edits.

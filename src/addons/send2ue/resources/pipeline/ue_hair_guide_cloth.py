@@ -1594,7 +1594,10 @@ def _publish_impl(unreal, source_asset, binding_path, target, owner, content, pa
             # Never keep EdNode handles into the former shared graph.
             fg, fc, fs, fn, fi = _graph(unreal, final)
             writes_started = True
-            for name, (_, _, weights) in maps.items():
+            # Reflected array text may have less precision than the stored
+            # float32 paint. Avoid round-tripping unchanged authored weights.
+            map_writes = {name:entry for name,entry in maps.items() if entry[1] != entry[2]}
+            for name, (_, _, weights) in map_writes.items():
                 fc('UpdateNode', fn[name], json.dumps({'VertexWeights': weights}))
             fc("UpdateNode", fn[imports[0]], json.dumps({"ClothAsset": binding_path, "ImportLod": 0}))
             added_names = {row[0] for row in maps.values()} | response_attributes
@@ -1638,7 +1641,7 @@ def _publish_impl(unreal, source_asset, binding_path, target, owner, content, pa
                     if route_changed:
                         _restore_native_routes(unreal, final, route_plan)
                         fg, fc, fs, fn, fi = _graph(unreal, final)
-                    for name, (_, values, _) in maps.items():
+                    for name, (_, values, _) in map_writes.items():
                         fc('UpdateNode', fn[name], json.dumps({'VertexWeights': values}))
                     fc("UpdateNode", fn[imports[0]], json.dumps({"ClothAsset": old_binding, "ImportLod": 0}))
                 unreal.DataflowBlueprintLibrary.evaluate_terminal_node_by_name(fg, terminals[0], final)

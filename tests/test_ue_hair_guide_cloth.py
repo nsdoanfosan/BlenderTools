@@ -1114,7 +1114,7 @@ class GarmentWindConfigurationTests(unittest.TestCase):
             self.assertIs(saved['config_properties']['ArtistGarmentWind']['bEnabled'], False)
             h.old_binding = next_binding
         self.assertEqual(h.updates, [(h.target, binding) for binding in revisions])
-        self.assertEqual(h.map_updates, [(h.target, h.paint), (h.target, h.paint)])
+        self.assertEqual(h.map_updates, [], 'Unchanged paint must retain native precision without rewrites')
 
     def test_garment_lookalikes_are_rejected_without_mutating_published_configuration(self):
         for node_type in ('FCodexGarmentWindConfigNode_v2', 'FCodexGarmentWindGeometryConfigNode',

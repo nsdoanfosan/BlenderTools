@@ -582,6 +582,22 @@ class ExternalGraphHarness:
 
 
 class ExternalGraphTests(unittest.TestCase):
+    def test_unchanged_paint_does_not_roundtrip_low_precision_native_text(self):
+        h = ExternalGraphHarness(external_source=False,external_final=False)
+        precise = '(0.123456789,0.625000019,0.875000023)'
+        paint = h.graph(h.final).nodes['ArtistPaint']
+        paint.properties['VertexWeights'] = precise
+        original_dump = h.dump_graph
+        def low_precision_dump(path):
+            payload = json.loads(original_dump(path))
+            for node in payload['nodes']:
+                if node['name']=='ArtistPaint':
+                    node['props']['VertexWeights']='(0.123457,0.625000,0.875000)'
+            return json.dumps(payload)
+        h.unreal.CodexClothToolsLibrary.dump_dataflow_nodes = low_precision_dump
+        h.publish()
+        self.assertEqual(h.graph(h.final).nodes['ArtistPaint'].properties['VertexWeights'],precise)
+
     def test_binding_only_reimport_stage_does_not_reapply_max_distance(self):
         h = ExternalGraphHarness(external_source=False)
         before_connections = copy.deepcopy(h.graph(h.final).connections)
