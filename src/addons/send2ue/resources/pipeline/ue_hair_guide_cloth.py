@@ -1520,11 +1520,23 @@ def _publish_impl(unreal, source_asset, binding_path, target, owner, content, pa
                 raise ValueError("Existing cloth graph has user changes; it remains unchanged")
             visited.update(chain)
         dependencies = _configuration_dependencies(fi, fs['connections'], visited, imports)
-        if any(n not in visited | dependencies and fi[n]['type'] not in _VARIABLE_NODES for n in configs):
+        # A parked native config may read the live collection but has no output
+        # consumer. It cannot affect any terminal. Preserve its authored values
+        # and its single input instead of requiring artists to delete it.
+        parked = set()
+        for name in configs - visited - dependencies:
+            incoming_edges = [e for e in fs['connections'] if e['toNode'] == name]
+            if (re.fullmatch(r'FChaosClothAssetSimulation\w*ConfigNode(?:_v\d+)?',fi[name]['type'])
+                    and not any(e['fromNode'] == name for e in fs['connections'])
+                    and len(incoming_edges) == 1
+                    and incoming_edges[0]['fromNode'] in visited | set(imports)
+                    and incoming_edges[0]['fromPin'] == incoming_edges[0]['toPin'] == 'Collection'):
+                parked.add(name)
+        if any(n not in visited | dependencies | parked and fi[n]['type'] not in _VARIABLE_NODES for n in configs):
             raise ValueError('Existing cloth graph has user changes: disconnected configuration branch')
         map_names = _asset_weight_map_names(final, fg, fc, fi, fs['connections'],
             read_native=lambda: _native(unreal.CodexClothToolsLibrary.dump_dataflow_nodes(fg.get_path_name())))
-        response_attributes = _native_response_attributes(fi, fs['connections'], configs, visited,
+        response_attributes = _native_response_attributes(fi, fs['connections'], configs - parked, visited,
                                                           effective_map_names=map_names)
         protected_maps = set(response_attributes) | set(map_names.values())
         response_attributes |= _selection_weight_map_attributes(fi, fs['connections'], visited | dependencies,

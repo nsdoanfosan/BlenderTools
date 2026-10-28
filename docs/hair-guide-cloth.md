@@ -347,3 +347,9 @@ MaxDistance and kinematic selection a second time. This removes redundant
 MaxDistance property warnings without disabling warnings or relaxing the complete
 collection proof. Existing explicit native G routes and first publication keep
 their native route validation.
+
+A parked native simulation config is preserved when it has exactly one Collection
+input from the live chain and no connected outputs. It does not contribute to any
+terminal. Disconnected subgraphs, paint/geometry branches and parameter consumers
+continue to fail validation. Artists can keep such a config for later use without
+temporarily deleting it for reimport.
