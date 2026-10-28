@@ -340,3 +340,10 @@ successfully imported an asset, follow-up discovery can wait up to the configure
 RPC response timeout while Unreal rebuilds dependent Cloth assets. Only discovery
 and a harmless readiness probe are retried; dispatched import commands are never
 replayed automatically.
+
+For an existing binding-only graph, the temporary publication check now imports
+the verified BindingData directly, matching the final graph. It does not apply G,
+MaxDistance and kinematic selection a second time. This removes redundant
+MaxDistance property warnings without disabling warnings or relaxing the complete
+collection proof. Existing explicit native G routes and first publication keep
+their native route validation.

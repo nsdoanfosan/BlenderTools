@@ -1417,7 +1417,16 @@ def _publish_impl(unreal, source_asset, binding_path, target, owner, content, pa
     graph, call, structure, nodes, infos = _graph(unreal, stage)
     terminal = next(n for n, i in infos.items() if "TerminalNode" in i["type"])
     order, retained, dependencies, derived_names = [], {terminal}, set(), set()
-    if sim_mesh_path is not None:
+    native_stage = sim_mesh_path is not None
+    if native_stage and unreal.EditorAssetLibrary.does_asset_exist(target):
+        existing_infos = _graph(unreal, unreal.load_asset(target))[4]
+        # A binding-only target already inherits verified G, MaxDistance and
+        # kinematic selection. Validate that same layout in its temporary stage
+        # instead of writing MaxDistance/selection a second time. Keep explicit
+        # native routes and first-publication behavior intact.
+        native_stage = any(info['type'] == 'FCodexClothVertexColorWeightMapNode'
+                           for info in existing_infos.values())
+    if native_stage:
         order, retained, dependencies, derived_names = _native_stage_nodes(infos, structure, terminal, sim_mesh_path)
     for name, node in nodes.items():
         if name not in retained:
