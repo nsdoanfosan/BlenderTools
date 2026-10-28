@@ -99,6 +99,7 @@ def import_asset(asset_id, property_data):
             coordination.validate_import_result(asset_data, import_result)
         if coordination.current_operation() is not None:
             coordination.current_operation().imported_count += 1
+        unreal_dependency.note_native_import_result(asset_data, import_result)
 
         # import fcurves
         if asset_data.get('fcurve_file_path'):

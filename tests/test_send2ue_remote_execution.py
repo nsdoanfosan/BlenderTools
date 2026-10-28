@@ -275,6 +275,33 @@ class TestRemoteExecutionConfig(unittest.TestCase):
 class TestRunUnrealPythonCommands(unittest.TestCase):
     def setUp(self):
         UNREAL.unreal_response = ""
+        UNREAL.end_native_import_session()
+
+    def tearDown(self):
+        UNREAL.end_native_import_session()
+
+    def test_manual_verified_import_uses_settle_timeout_and_resets(self):
+        bpy = types.ModuleType('bpy')
+        bpy.app = types.SimpleNamespace(driver_namespace={})
+        bpy.context = types.SimpleNamespace(preferences=types.SimpleNamespace(
+            addons={'send2ue': types.SimpleNamespace(
+                preferences=types.SimpleNamespace(rpc_response_timeout=20))}))
+        with mock.patch.dict(sys.modules, {'bpy': bpy}):
+            UNREAL.begin_native_import_session()
+            UNREAL.note_native_import_result({'asset_path': '/Game/Hair'}, ['/Game/Other.Other'])
+            self.assertEqual(UNREAL._get_remote_execution_connection_timeout(), 5)
+            UNREAL.note_native_import_result({'asset_path': '/Game/Hair'}, ['/Game/Hair.Hair'])
+            remote_exec = FakeRemoteExecution(nodes_after_polls=80)
+            clock = FakeClock()
+            monotonic_patch, sleep_patch = self._clock_patches(clock)
+            with monotonic_patch, sleep_patch:
+                UNREAL.run_unreal_python_commands(remote_exec, ['pass'])
+            self.assertGreater(clock.value, 5)
+            self.assertEqual(remote_exec.command_calls, 1)
+            UNREAL.end_native_import_session()
+            self.assertEqual(UNREAL._get_remote_execution_connection_timeout(), 5)
+            UNREAL.begin_native_import_session()
+            self.assertEqual(UNREAL._get_remote_execution_connection_timeout(), 5)
 
     def _clock_patches(self, clock):
         return (
