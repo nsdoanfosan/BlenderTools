@@ -332,7 +332,8 @@ These paths require the project's native CodexClothTools nodes and audit APIs.
 The app-free tests cover graph contracts, preservation and failure paths; they do
 not establish successful native migration or an FBX reimport of a production
 asset. Existing binding-only assets inherit G from their validated BindingData through `GeneratorBindings`; they do not need a duplicate G node in the final graph. Reimport preserves that graph and applies the same complete collection proof. An existing explicit native G route still receives its guarded source rebinding; reimport never implicitly migrates artist graphs.
-# Coordinated import settling
+
+## Coordinated import settling
 
 Initial Unreal discovery keeps its short timeout. After a coordinated request has
 successfully imported an asset, follow-up discovery can wait up to the configured
