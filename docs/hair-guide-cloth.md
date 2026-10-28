@@ -271,6 +271,12 @@ correspondence still fails before publishing the cloth. This also avoids stale
 manual allow-lists after a verified generator's sample count changes. Legacy
 explicit `rooted_ribbon_arclength` policies remain supported.
 
+Temporary project exports use `blender/send2ue-session-data/<process-id>` under
+the system temporary directory. Unregistering one Blender cleans only its own
+process folder. The new folder is outside the legacy shared `send2ue/data`
+directory so an older running Blender's cleanup cannot erase an active FBX or
+paint manifest. Explicit user-selected disk export folders are unchanged.
+
 ## Native three-stage Hair Tool chains
 
 An explicit Hair Tool source identifies its native pipeline. The export selector

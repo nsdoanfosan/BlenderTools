@@ -187,8 +187,10 @@ def get_temp_folder():
     return os.path.join(
         tempfile.gettempdir(),
         'blender',
-        'send2ue',
-        'data'
+        # Keep this outside the legacy shared send2ue/data root: an older
+        # Blender session may still delete that entire folder on unregister.
+        'send2ue-session-data',
+        str(os.getpid())
     )
 
 
