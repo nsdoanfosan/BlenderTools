@@ -94,6 +94,8 @@ def _activate_export_collection(collection):
 def includes(obj):
     if _rules is None:
         return True
+    from . import park_spline_export
+    obj = park_spline_export.source_for_export(obj)
     units, selected, declared = _rules
     if obj.get('_send2ue_hair_tool_temp'):
         return True  # These were generated only from already admitted sources.
