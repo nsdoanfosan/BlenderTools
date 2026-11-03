@@ -15,6 +15,7 @@ from .core import (
     armature_modifier_fix,
     preview_modifier_guard,
     grouppro_export,
+    park_spline_export,
 )
 from .ui import file_browser, dialog, addon_preferences
 from .dependencies import unreal
@@ -319,7 +320,11 @@ class Send2Ue(bpy.types.Operator):
         # discovery and FBX selection. These native groups are temporary.
         grouppro_export.prepare(bpy.context.scene.send2ue)
 
+        # Only PARK Spline Tools' enabled render groups opt into static meshes.
+        park_spline_export.prepare(bpy.context.scene.send2ue)
+
     def post_operation(self):
+        park_spline_export.cleanup()
         grouppro_export.cleanup()
 
         # Restore preview visibility before returning the user's scene state.
