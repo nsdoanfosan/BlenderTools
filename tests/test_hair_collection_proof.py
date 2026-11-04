@@ -96,6 +96,65 @@ def add_attribute(row, group_name, name):
 
 
 class CollectionProofTests(unittest.TestCase):
+    def physics_collection(self):
+        row = collection()
+        row['built_mapping'].update(kinematic_sim_indices=[0], sim_tether_reference_lengths=[[], [1.]],
+                                    sim_tether_kinematic_indices=[[], [0]])
+        attrs = find_group(row, 'SimVertices3D')['attributes']
+        attrs.extend([attribute('TetherKinematicIndex', 3, 'TArray<int32>', 7),
+                      attribute('TetherReferenceLength', 3, 'TArray<float>', 11)])
+        attrs.sort(key=lambda value: value['name'])
+        return row
+
+    def test_artist_physics_derivatives_are_validated_in_stage_and_strict_at_publication(self):
+        binding = self.physics_collection()
+        expected = copy.deepcopy(binding)
+        for field in ('kinematic_sim_indices', 'sim_tether_reference_lengths', 'sim_tether_kinematic_indices'):
+            expected['built_mapping'][field] = [0, 1]
+        for group_name, name in [('Selection', 'KinematicVertices3D'),
+                                 ('SimVertices3D', 'TetherKinematicIndex'),
+                                 ('SimVertices3D', 'TetherReferenceLength')]:
+            change_hash(expected, group_name, name)
+        H._verify_physics_derivation(audit(expected), binding)
+        H._verify_published_collection(audit(expected), expected, set())
+        with self.assertRaises(RuntimeError):
+            H._verify_published_collection(audit(binding), expected, set())
+
+    def test_artist_physics_stage_still_rejects_geometry_uv_color_paint_and_proxy_changes(self):
+        binding = self.physics_collection()
+        for group_name, name in [('SimVertices3D', 'MaxDistance'), ('SimVertices3D', 'ArtistPaint'),
+                                 ('SimVertices3D', 'Color'), ('SimVertices3D', 'Position'),
+                                 ('SimVertices2D', 'UV'), ('RenderVertices', 'ProxyDeformerData')]:
+            with self.subTest(attribute=name):
+                changed = copy.deepcopy(binding)
+                change_hash(changed, group_name, name)
+                with self.assertRaises(RuntimeError):
+                    H._verify_physics_derivation(audit(changed), binding)
+
+    def test_artist_physics_derivation_requires_complete_evidence(self):
+        binding = self.physics_collection()
+        changed = copy.deepcopy(binding)
+        changed['built_mapping'].pop('sim_tether_reference_lengths')
+        with self.assertRaises(ValueError):
+            H._verify_physics_derivation(audit(changed), binding)
+        changed = copy.deepcopy(binding)
+        changed.pop(C.KEY)
+        with self.assertRaises(ValueError):
+            H._verify_physics_derivation(audit(changed), changed)
+
+    def test_transferred_paint_is_allowed_in_stage_and_fully_covered_at_publication(self):
+        binding = self.physics_collection()
+        expected = copy.deepcopy(binding)
+        add_attribute(expected, 'SimVertices3D', 'SideRenderClearance')
+        expected['weight_maps'].append({'name': 'SideRenderClearance', 'avg': 0.75})
+        expected['sim_float_attributes'].append({'name': 'SideRenderClearance'})
+        H._verify_physics_derivation(audit(expected), binding, added_names={'SideRenderClearance'})
+        changed = copy.deepcopy(expected)
+        change_hash(changed, 'SimVertices3D', 'SideRenderClearance')
+        changed[C.KEY]['blake3'] = 'c' * 64
+        with self.assertRaises(RuntimeError):
+            H._verify_published_collection(audit(changed), expected, {'SideRenderClearance'})
+
     def test_only_serialization_and_exposed_name_order_are_normalized(self):
         before, after = audit(), audit()
         after['collections'][0]['non_uv_collection_md5'] = 'new-serialization-order'
