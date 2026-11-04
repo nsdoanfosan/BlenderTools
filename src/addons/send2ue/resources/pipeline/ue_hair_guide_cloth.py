@@ -1325,8 +1325,8 @@ def _collection_proof_module():
     return module
 
 
-def _verify_published_collection(actual, expected, added_names, packet=None):
-    collection = actual['collections'][0]
+def _publication_collection_view(collection, expected, added_names, packet=None):
+    collection = json.loads(json.dumps(collection))
     if packet is not None:
         normalize_ownership(collection['built_mapping'], packet)
     compared, expected_collection = json.loads(json.dumps(collection)), json.loads(json.dumps(expected))
@@ -1343,10 +1343,88 @@ def _verify_published_collection(actual, expected, added_names, packet=None):
     if policy.KEY in compared or policy.KEY in expected_collection:
         compared = policy.publication_view(compared, expected_collection, added_names)
         expected_collection = policy.publication_view(expected_collection, expected_collection, added_names)
+    return compared, expected_collection
+
+
+def _verify_published_collection(actual, expected, added_names, packet=None):
+    compared, expected_collection = _publication_collection_view(
+        actual['collections'][0], expected, added_names, packet)
     if compared != expected_collection:
         changed = sorted(key for key in set(compared) | set(expected_collection)
                          if compared.get(key) != expected_collection.get(key))
         raise RuntimeError('Published cloth differs from its verified collection: ' + ', '.join(changed))
+
+
+def _verify_physics_derivation(actual, binding, packet=None, added_names=()):
+    """Guard the immutable source while independently evaluating artist physics.
+
+    MaxDistance creates a kinematic set using the artist's centimetre range;
+    LongRangeAttachment regenerates tethers from that set. Their resulting
+    values are NOT discarded from publication proof: the final must match the
+    independently evaluated stage, including every selection/tether hash.
+    """
+    left, right = _publication_collection_view(actual['collections'][0], binding, added_names, packet)
+    policy = _collection_proof_module()
+    if policy.KEY not in left or policy.KEY not in right:
+        raise ValueError('Authored physics evaluation requires complete native semantic proof')
+    mapping_fields = {'kinematic_sim_indices', 'sim_tether_reference_lengths',
+                      'sim_tether_kinematic_indices'}
+    attributes = {('Selection', 'KinematicVertices3D'), ('SimVertices3D', 'TetherKinematicIndex'),
+                  ('SimVertices3D', 'TetherReferenceLength')}
+    for row in (left, right):
+        for key in mapping_fields:
+            if key not in row['built_mapping']:
+                raise ValueError('Native authored physics derivation evidence is incomplete')
+            row['built_mapping'].pop(key)
+        found = set()
+        for group in row[policy.KEY]['groups']:
+            for attr in group['attributes']:
+                key = (group['name'], attr['name'])
+                if key in attributes:
+                    found.add(key)
+                    attr.pop('blake3')
+        if found != attributes:
+            raise ValueError('Native authored physics attribute evidence is incomplete')
+    if left != right:
+        raise RuntimeError('Artist physics stage changed source geometry/G/UV/paint/proxy values')
+
+
+def _authored_physics_expected(unreal, final, binding_path, binding, stage_path,
+                               created, disposable, packet=None, weight_updates=None, added_names=()):
+    """Evaluate an exact isolated artist graph before touching its publication."""
+    path = stage_path + '_ArtistPhysics'
+    if unreal.EditorAssetLibrary.does_asset_exist(path):
+        raise ValueError('Artist physics staging destination already exists: ' + path)
+    before = _graph_snapshot(unreal, final)
+    created.append(path)
+    stage = unreal.EditorAssetLibrary.duplicate_asset(final.get_path_name(), path)
+    if not stage or _path(stage.get_path_name()) != path:
+        raise RuntimeError('Could not duplicate artist physics validation stage')
+    isolation = _independent_graph(unreal, stage)
+    if isolation:
+        created.insert(0, isolation['path'])
+        disposable.append(isolation['path'])
+    disposable.append(path)
+    context = _graph_context(final)
+    # Duplicating the Cloth necessarily changes the native instance Owner.
+    # Every other context byte, including variable overrides, must survive.
+    context['owner'] = context['owner'].replace(final.get_path_name(), stage.get_path_name())
+    if _graph_snapshot(unreal, stage) != before or _graph_context(stage) != context:
+        raise RuntimeError('Artist physics stage did not preserve the exact graph/context')
+    graph, call, structure, nodes, infos = _graph(unreal, stage)
+    imports = [n for n, info in infos.items() if info['type'] == 'FChaosClothAssetImportNode']
+    terminals = [n for n, info in infos.items() if 'TerminalNode' in info['type']]
+    if imports != ['GeneratorBindings'] or len(terminals) != 1:
+        raise ValueError('Artist physics stage requires one owned binding import/terminal')
+    for name, weights in (weight_updates or {}).items():
+        if name not in infos or infos[name]['type'] != 'FChaosClothAssetWeightMapNode':
+            raise ValueError('Artist physics stage weight update targets an unsupported node')
+        call('UpdateNode', nodes[name], json.dumps({'VertexWeights': weights}))
+    call('UpdateNode', nodes[imports[0]], json.dumps({'ClothAsset': binding_path, 'ImportLod': 0}))
+    unreal.DataflowBlueprintLibrary.evaluate_terminal_node_by_name(graph, terminals[0], stage)
+    actual = _native(unreal.CodexClothToolsLibrary.dump_cloth_collection_colors(path))
+    _verify_physics_derivation(actual, binding, packet, added_names)
+    return actual['collections'][0]
 
 
 def _restore_native_routes(unreal, asset, plan):
@@ -1586,6 +1664,17 @@ def _publish_impl(unreal, source_asset, binding_path, target, owner, content, pa
                 maximum_node_name=source_maximum, effective_map_names=map_names)
             if route_plan['remove_nodes']:
                 raise ValueError('Native G reimport must preserve authored paint nodes')
+        expected_collection = before['collections'][0]
+        # Binding-only legacy graphs may retain artist MaxDistance/Tether
+        # settings different from the build template. Independently evaluate
+        # those settings; never compare their valid derivatives to the template
+        # and never drop them from the final strict publication comparison.
+        if (not route_api and any('MaxDistanceConfig' in fi[n]['type'] for n in visited)
+                and any('LongRangeAttachmentConfig' in fi[n]['type'] for n in visited)):
+            expected_collection = _authored_physics_expected(unreal, final, binding_path,
+                before['collections'][0], stage_path, created, disposable, packet,
+                weight_updates={name:entry[2] for name,entry in maps.items() if entry[1] != entry[2]},
+                added_names={row[0] for row in maps.values()} | response_attributes)
         # If isolation itself fails, its restoration result is authoritative.
         # Never evaluate/save a possibly uncertain reference in that case.
         isolation = _independent_graph(unreal, final)
@@ -1605,7 +1694,7 @@ def _publish_impl(unreal, source_asset, binding_path, target, owner, content, pa
             def verify_native_route(plan, current_nodes):
                 unreal.DataflowBlueprintLibrary.evaluate_terminal_node_by_name(fg, terminals[0], final)
                 actual = _native(unreal.CodexClothToolsLibrary.dump_cloth_collection_colors(target))
-                _verify_published_collection(actual, before['collections'][0], added_names, packet)
+                _verify_published_collection(actual, expected_collection, added_names, packet)
                 verified[0] = actual
                 return True
             if route_api:
@@ -1625,6 +1714,7 @@ def _publish_impl(unreal, source_asset, binding_path, target, owner, content, pa
                 fg, fc, fs, fn, fi = _graph(unreal, final)
             if verified[0] is None:
                 verify_native_route(route_plan, fn)
+            after = verified[0]
             unreal.EditorAssetLibrary.set_metadata_tag(final, CONTENT, content)
             unreal.EditorAssetLibrary.set_metadata_tag(final, binding_key, binding_path)
             if route_api:
