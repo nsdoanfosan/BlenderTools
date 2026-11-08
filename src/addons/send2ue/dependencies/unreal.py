@@ -1527,45 +1527,142 @@ class UnrealImportAsset(Unreal):
             not self._property_data.get('advanced_ui_import', {}).get('value', False)
         )
 
+    def _begin_managed_hair_import(self):
+        """Admit only a generator-owned single-mesh import, before AssetTools runs.
+
+        Its publisher already builds, saves and refreshes the exact Cloth target.
+        The automatic G reimport watcher must not rebuild historical referencers.
+        Missing native support is an explicit error, never an unsafe fallback.
+        """
+        marker = self._asset_data.get('_hair_guide_cloth')
+        if (not isinstance(marker, dict) or set(marker) != {'package', 'role'}
+                or marker.get('role') not in {'sim', 'render'}
+                or self._asset_data.get('_asset_type') != 'SkeletalMesh'):
+            raise RuntimeError('Invalid generator-owned Hair Guide Cloth import marker')
+        content = marker['package']
+        if (not isinstance(content, str) or len(content) != 64
+                or any(c not in '0123456789abcdefABCDEF' for c in content)):
+            raise RuntimeError('Hair Guide Cloth import marker needs its exact SHA256 package ID')
+        if self._asset_data.get('lods'):
+            raise RuntimeError('Managed Hair Guide Cloth import supports one FBX/LOD0 only; separate LOD RPCs require explicit owner propagation')
+        path = self._asset_data.get('asset_path')
+        if (not isinstance(path, str) or not path.startswith('/Game/') or ':' in path
+                or '..' in path.split('/') or path != path.split('.', 1)[0]):
+            raise RuntimeError('Managed Hair Guide Cloth import requires its exact mesh package path')
+        library = getattr(unreal, 'CodexClothToolsLibrary', None)
+        methods = ('begin_managed_hair_mesh_import', 'end_managed_hair_mesh_import', 'read_managed_hair_mesh_imports')
+        if library is None or any(not callable(getattr(library, name, None)) for name in methods):
+            raise RuntimeError('Native managed Hair Guide Cloth import guard is not loaded; import was not started')
+        # Explicitly synchronous. get_objects() below additionally awaits native
+        # async results before End, including error cleanup after a partial task.
+        self._import_task.async_ = False
+        request = str(uuid.uuid4())
+        scope = {'request_id': request, 'mesh_asset_path': path, 'content_id': content,
+                 'role': marker['role'], 'library': library}
+        result = self._plugin_json(library.begin_managed_hair_mesh_import(path, request, content, marker['role']))
+        self._managed_hair_import_receipts = [{'stage': 'begin', 'native': result}]
+        unreal.log('SEND2UE_MANAGED_HAIR_IMPORT:' + json.dumps(self._managed_hair_import_receipts[-1], sort_keys=True))
+        if (result.get('success') is not True or result.get('guard_version') != 1
+                or result.get('state') != 'active' or result.get('request_id') != request
+                or result.get('mesh_asset_path') != path or result.get('content_id') != content
+                or result.get('role') != marker['role']):
+            raise RuntimeError('Native managed hair import admission failed: ' + json.dumps(result, sort_keys=True))
+        return scope
+
+    def _end_managed_hair_import(self, scope, import_succeeded):
+        """Retain the exact owner through import completion and exact mesh compile."""
+        # AssetImportTask.get_objects() waits AsyncResults->WaitUntilDone(). Native
+        # import/reimport delegates run before that result is marked complete.
+        # This finally path also waits a partial/failed synchronous import task.
+        completion_error = None
+        try:
+            self._import_task.get_objects()
+            if not self._import_task.is_async_import_complete():
+                raise RuntimeError('Native import results are not complete')
+        except Exception as error:
+            completion_error = error
+            import_succeeded = False
+        if completion_error is not None:
+            # Completion is not proven: do not release native suppression. Its
+            # owner/target stays visible through read_managed_hair_mesh_imports.
+            failure = {'stage': 'completion_unproven', 'request_id': scope['request_id'],
+                       'mesh_asset_path': scope['mesh_asset_path'], 'recovery_required': True,
+                       'error': str(completion_error)}
+            self._managed_hair_import_receipts.append(failure)
+            unreal.log('SEND2UE_MANAGED_HAIR_IMPORT:' + json.dumps(failure, sort_keys=True))
+            raise RuntimeError('Managed hair import completion is unproven; native scope retained: ' + json.dumps(failure, sort_keys=True)) from completion_error
+        result = self._plugin_json(scope['library'].end_managed_hair_mesh_import(
+            scope['mesh_asset_path'], scope['request_id'], bool(import_succeeded)))
+        receipt = {'stage': 'end', 'native': result}
+        self._managed_hair_import_receipts.append(receipt)
+        unreal.log('SEND2UE_MANAGED_HAIR_IMPORT:' + json.dumps(receipt, sort_keys=True))
+        if (result.get('success') is not True or result.get('guard_version') != 1
+                or result.get('state') != 'ended' or result.get('request_id') != scope['request_id']
+                or result.get('mesh_asset_path') != scope['mesh_asset_path']
+                or result.get('mesh_ready') is not True
+                or result.get('import_succeeded') is not bool(import_succeeded)):
+            raise RuntimeError('Managed hair import scope could not end safely; inspect native ownership: ' + json.dumps(result, sort_keys=True))
+
     def run_import(self):
         # assign the options object to the import task and import the asset
         self._import_task.options = self._options
-        unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks([self._import_task])
+        scope = None
+        import_succeeded = False
+        import_error = None
+        try:
+            if '_hair_guide_cloth' in self._asset_data:
+                scope = self._begin_managed_hair_import()
+            unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks([self._import_task])
 
-        imported_object_paths = list(
-            self._import_task.get_editor_property('imported_object_paths')
-        )
-        if (
-            (self._asset_data.get('_nested_pivot_component')
-             or self._asset_data.get('_linked_opening_assembly'))
-            and self._asset_data.get('_asset_type') == 'StaticMesh'
-        ):
-            # A task can fail without raising and leave an older asset in place.
-            # Assembly creation requires this import's exact mesh result,
-            # before any material/post-import code can operate on that old asset.
-            expected_path = str(self._asset_data.get('asset_path') or '').split('.', 1)[0]
-            imported_packages = {str(path).split('.', 1)[0] for path in imported_object_paths}
-            if not expected_path or expected_path not in imported_packages:
-                raise RuntimeError(
-                    'Assembly import did not produce the expected StaticMesh: '
-                    + expected_path + '; imported=' + repr(imported_object_paths)
-                )
-            if not isinstance(unreal.load_asset(expected_path), unreal.StaticMesh):
-                raise RuntimeError(
-                    'Assembly import result is missing or is not a StaticMesh: '
-                    + expected_path
-                )
-        expected_morphs = getattr(self, '_morph_names_before', set())
-        if expected_morphs:
-            for path, mesh in self._imported_skeletal_meshes(imported_object_paths):
-                actual = {m.get_name() for m in mesh.get_editor_property('morph_targets')}
-                missing = sorted(expected_morphs - actual)
-                if missing:
-                    raise RuntimeError('Imported mesh lost existing morphs: ' + ', '.join(missing))
-        self.ensure_hair_tool_uv_precision(imported_object_paths)
-        self.ensure_hair_tool_nanite(imported_object_paths)
-        self.audit_hair_tool_payload(imported_object_paths)
-        return imported_object_paths
+            imported_object_paths = list(self._import_task.get_editor_property('imported_object_paths'))
+            if scope is not None:
+                packages = {str(path).split('.', 1)[0] for path in imported_object_paths}
+                if scope['mesh_asset_path'] not in packages:
+                    raise RuntimeError('Managed hair import did not produce its exact mesh: ' + repr(imported_object_paths))
+            if (
+                (self._asset_data.get('_nested_pivot_component')
+                 or self._asset_data.get('_linked_opening_assembly'))
+                and self._asset_data.get('_asset_type') == 'StaticMesh'
+            ):
+                # A task can fail without raising and leave an older asset in place.
+                # Assembly creation requires this import's exact mesh result,
+                # before any material/post-import code can operate on that old asset.
+                expected_path = str(self._asset_data.get('asset_path') or '').split('.', 1)[0]
+                imported_packages = {str(path).split('.', 1)[0] for path in imported_object_paths}
+                if not expected_path or expected_path not in imported_packages:
+                    raise RuntimeError(
+                        'Assembly import did not produce the expected StaticMesh: '
+                        + expected_path + '; imported=' + repr(imported_object_paths)
+                    )
+                if not isinstance(unreal.load_asset(expected_path), unreal.StaticMesh):
+                    raise RuntimeError(
+                        'Assembly import result is missing or is not a StaticMesh: '
+                        + expected_path
+                    )
+            expected_morphs = getattr(self, '_morph_names_before', set())
+            if expected_morphs:
+                for path, mesh in self._imported_skeletal_meshes(imported_object_paths):
+                    actual = {m.get_name() for m in mesh.get_editor_property('morph_targets')}
+                    missing = sorted(expected_morphs - actual)
+                    if missing:
+                        raise RuntimeError('Imported mesh lost existing morphs: ' + ', '.join(missing))
+            self.ensure_hair_tool_uv_precision(imported_object_paths)
+            self.ensure_hair_tool_nanite(imported_object_paths)
+            self.audit_hair_tool_payload(imported_object_paths)
+            import_succeeded = True
+            return imported_object_paths
+        except BaseException as error:
+            import_error = error
+            raise
+        finally:
+            if scope is not None:
+                try:
+                    self._end_managed_hair_import(scope, import_succeeded)
+                except Exception as end_error:
+                    if import_error is not None:
+                        raise RuntimeError('Managed hair import failed: ' + str(import_error)
+                            + '; owner cleanup also requires recovery: ' + str(end_error)) from end_error
+                    raise
 
 
 class UnrealImportSequence(Unreal):

@@ -19,6 +19,70 @@ GUID_ATTRIBUTE = 'send2ue_parent_guide_id'
 STAMP_ATTRIBUTE = 'send2ue_source_guide_island'
 RENDER_ONLY_GUID = -1
 GUIDE_IDENTITY_PROPERTY = 'send2ue_guide_identity'
+SELF_GUIDE_PROPERTY = 'send2ue_cloth_self_guide'
+RESPONSE_MASK_PROPERTY = 'send2ue_cloth_response_mask'
+RESPONSE_MASK_CONTRACT = {'version': 1, 'policy': 'sim_only_R', 'channel': 'R',
+    'attribute': 'HairPixelDepthOffset', 'weight_map': 'HairTipResponse',
+    'precision': 'unorm8', 'render_channel_fallback': 1.0}
+
+
+def response_mask_contract(export_root):
+    """Read explicit Export-unit intent; never repurpose an existing render mask."""
+    value = export_root.get(RESPONSE_MASK_PROPERTY)
+    if value is None or value == '':
+        return None
+    if value != 'sim_only_R':
+        raise ValueError('Unsupported hair simulation response mask policy: ' + str(value))
+    return dict(RESPONSE_MASK_CONTRACT)
+
+
+def own_response_mask(mesh, contract):
+    """Read only the physical guide's authored mask before byte packing."""
+    if contract is None:
+        return None, None
+    if contract != RESPONSE_MASK_CONTRACT:
+        raise ValueError('Unsupported hair simulation response mask contract')
+    attr = mesh.attributes.get(contract['attribute'])
+    if attr is None:
+        raise ValueError('Opted-in simulation guide is missing HairPixelDepthOffset')
+    if attr.domain != 'POINT' or attr.data_type not in {'FLOAT_COLOR', 'BYTE_COLOR', 'FLOAT'}:
+        raise ValueError('Unsupported guide response mask domain/type')
+    raw = [float(item.color[0] if hasattr(item, 'color') else item.value) for item in attr.data]
+    if len(raw) != len(mesh.vertices) or not all(math.isfinite(value) for value in raw):
+        raise ValueError('Guide response mask contains incomplete or non-finite values')
+    values = [max(0., min(1., value)) for value in raw]
+    return values, dict(contract, present=True, clamped_values=sum(a != b for a, b in zip(raw, values)))
+
+
+def _neutralize_response_render(mesh):
+    """Keep the simulation-only filter out of ordinary render R packing."""
+    for name in (RESPONSE_MASK_CONTRACT['attribute'], 'ChaosDepthMask'):
+        attribute = mesh.attributes.get(name)
+        if attribute is not None:
+            mesh.attributes.remove(attribute)
+
+
+def _verify_response_samples(original, converted, contract, ribbon):
+    """A ribbon may change its profile, never its source-sample response."""
+    if contract is None or original is converted:
+        return
+    samples = []
+    for mesh in (original, converted):
+        values, _ = own_response_mask(mesh, contract)
+        ids = ribbon._point_attribute(mesh, ribbon.SPLINE_ATTRIBUTE, 'INT')
+        sample_attr = mesh.attributes.get(ribbon.SAMPLE_ATTRIBUTE)
+        if sample_attr is None or sample_attr.data_type not in {'INT', 'FLOAT'}:
+            raise ValueError('Response mask has no verified ribbon sample identity')
+        points = ribbon._point_attribute(mesh, ribbon.SAMPLE_ATTRIBUTE, sample_attr.data_type)
+        rows = {}
+        for key, value in zip(zip(ids, points), values):
+            if key in rows and abs(rows[key] - value) > 1e-6:
+                raise ValueError('Source cross-section has conflicting response mask values')
+            rows[key] = value
+        samples.append(rows)
+    if samples[0].keys() != samples[1].keys() or any(
+            abs(value - samples[1][key]) > 1e-6 for key, value in samples[0].items()):
+        raise ValueError('Ribbon conversion changed authored response mask samples')
 
 
 def guide_identity(guide):
@@ -122,6 +186,17 @@ def find_guide(render):
     receipt = {'render': render.name, 'active_generator_inputs': inputs,
                'hair_tool_registry': registry, 'hierarchy': hierarchy,
                'search_stages': ['active_generator_inputs', 'hair_tool_registry', 'hierarchy']}
+    self_guide = render.get(SELF_GUIDE_PROPERTY, False)
+    if type(self_guide) is not bool:
+        raise ValueError('Self guide option must be a boolean')
+    if self_guide:
+        profiles = [m for m in render.modifiers if m.type == 'NODES' and m.show_viewport
+                    and m.node_group and m.node_group.name.startswith('Hair_System_Profile')]
+        if render.type not in {'CURVE', 'CURVES'} or len(profiles) != 1:
+            raise ValueError('Self guide requires a native profiled Hair Tool curve output')
+        receipt.update(status='resolved', guide=render.name,
+                       basis='explicit_self_profiled_guide')
+        return render, [], receipt
     sources = {item[0] for item in authoritative}
     if len(sources) == 1:
         guide = next(iter(sources))
@@ -249,9 +324,15 @@ def _capture_render_only(source, export_state, search, include_system_ao, ao_set
         'source': {**search, 'simulation_enabled': False}, 'simulation_enabled': False}
 
 
-def capture_source(source, export_state, include_system_ao=False, ao_settings=None):
+def capture_source(source, export_state, include_system_ao=False, ao_settings=None, response_contract=None):
     """Return (temporary render parts, physical source packet), or defer safely."""
     from . import hair_tool_export as hair
+    def render_only(search):
+        result = _capture_render_only(source, export_state, search, include_system_ao, ao_settings)
+        if response_contract is not None:
+            for obj in result[0]:
+                _neutralize_response_render(obj.data)
+        return result
     copies, group, meshes = [], None, []
     ribbon_plan = None
     try:
@@ -260,7 +341,7 @@ def capture_source(source, export_state, include_system_ao=False, ao_settings=No
             diagnostic(source.name, search)
             return None
         if search['status'] == 'no_guide_after_search':
-            return _capture_render_only(source, export_state, search, include_system_ao, ao_settings)
+            return render_only(search)
         # In a native surface -> profiled guide -> generated hair pipeline the
         # profiled middle stage is always the ribbon source. Old saved fixture
         # helpers may still request ORIGINAL; they must not undo this contract.
@@ -289,7 +370,7 @@ def capture_source(source, export_state, include_system_ao=False, ao_settings=No
                     'requested_mode': simulation_mode,
                     'effective_mode': 'ORIGINAL', 'status': 'source_all_zero',
                     'fallback_reason': None, 'simulation_counts': {'vertices': 0, 'triangles': 0}}}
-            return _capture_render_only(source, export_state, static_source, include_system_ao, ao_settings)
+            return render_only(static_source)
         render_copy = source.copy()
         render_copy.name = source.name + '__GuideCapture'
         bpy.context.scene.collection.objects.link(render_copy)
@@ -306,10 +387,12 @@ def capture_source(source, export_state, include_system_ao=False, ao_settings=No
                 hair._modifier_input_set(render_copy.modifiers[name], identifier, guide_copy)
         # AO changes affect disposable copies only.
         if include_system_ao:
-            for modifier in render_copy.modifiers:
-                if modifier.type == 'NODES' and modifier.node_group and modifier.node_group.name.startswith('HT_Mesh_AO'):
-                    hair._apply_ao_modifier_settings(modifier, ao_settings)
-                    modifier.show_viewport = True
+            ao_copies = (render_copy, guide_copy) if guide == source else (render_copy,)
+            for ao_copy in ao_copies:
+                for modifier in ao_copy.modifiers:
+                    if modifier.type == 'NODES' and modifier.node_group and modifier.node_group.name.startswith('HT_Mesh_AO'):
+                        hair._apply_ao_modifier_settings(modifier, ao_settings)
+                        modifier.show_viewport = True
         bpy.context.view_layer.update()
         gm = _copy_mesh(guide_copy)
         meshes.append(gm)
@@ -327,10 +410,12 @@ def capture_source(source, export_state, include_system_ao=False, ao_settings=No
                 'guide_search_status': search['status'],
                 'excluded_sim_vertices': len(gm.vertices),
                 'simulation_mesh': dict(ribbon_plan.receipt)}
-            return _capture_render_only(source, export_state, static_source,
-                                        include_system_ao, ao_settings)
+            return render_only(static_source)
         identity = guide_identity(guide)
-        rm = _copy_mesh(render_copy)
+        # A directly rendered profiled curve has no separate child generator.
+        # Its unchanged evaluated surface is both the ownership reference and
+        # the complete renderer, before the simulation-only ribbon conversion.
+        rm = _copy_mesh(guide_copy if guide == source else render_copy)
         meshes.append(rm)
         if ribbon_plan.prepared:
             # Stamping is allowed to add identity fields only. Independently
@@ -345,7 +430,7 @@ def capture_source(source, export_state, include_system_ao=False, ao_settings=No
             if not guide_unchanged or not render_unchanged:
                 ribbon_plan.fallback('Identity stamping did not preserve the original guide/render geometry')
                 bpy.context.view_layer.update()
-                gm, rm = _copy_mesh(guide_copy), _copy_mesh(render_copy)
+                gm, rm = _copy_mesh(guide_copy), _copy_mesh(guide_copy if guide == source else render_copy)
                 meshes.extend((gm, rm))
                 weights, weight_receipt = own_weights(gm)
         if include_system_ao and rm.attributes.get('AO') is None:
@@ -371,6 +456,10 @@ def capture_source(source, export_state, include_system_ao=False, ao_settings=No
                     guide_islands[vertex] = owner
             if any(g is None for g in guide_islands):
                 raise ValueError('Guide has loose points without a surface owner.')
+            if guide == source:
+                if ribbon.geometry_signature(rm) != ribbon.geometry_signature(gm):
+                    raise ValueError('Self guide render surface differs from its exact source')
+                _int_attribute(rm, STAMP_ATTRIBUTE, guide_islands)
             attr = rm.attributes.get(STAMP_ATTRIBUTE)
             provenance = 'generator_carried_island'
             if (attr is None or attr.domain != 'POINT' or attr.data_type != 'INT') and _has_grid_generator(render_copy):
@@ -399,7 +488,8 @@ def capture_source(source, export_state, include_system_ao=False, ao_settings=No
                 if native_attr is not None and native_attr.domain == 'POINT' and native_attr.data_type == 'INT':
                     for datum, owner in zip(native_attr.data, render_islands):
                         native_pairs.setdefault(str(datum.value), set()).add(owner)
-                search['render_ownership'] = {'basis': 'independent_source_face_and_curve_stamps',
+                search['render_ownership'] = {'basis': ('exact_self_profile_surface_identity' if guide == source
+                    else 'independent_source_face_and_curve_stamps'),
                     'verified_vertices': len(render_islands), 'spline_mismatches': 0,
                     'generator_native_index_to_source_islands': {key: sorted(values) for key, values in native_pairs.items()}}
         if not set(render_islands).issubset(set(guide_islands)):
@@ -414,6 +504,8 @@ def capture_source(source, export_state, include_system_ao=False, ao_settings=No
         if gm is not original_gm:
             meshes.append(gm)
             weights, weight_receipt = own_weights(gm)
+        _verify_response_samples(original_gm, gm, response_contract, ribbon)
+        response_values, response_receipt = own_response_mask(gm, response_contract)
         search = {**search, 'simulation_mesh': dict(simulation_receipt)}
         if simulation_receipt.get('fallback_reason'):
             row = {'source': source.name, 'status': 'original_simulation_retained',
@@ -440,6 +532,11 @@ def capture_source(source, export_state, include_system_ao=False, ao_settings=No
                   'simulation_enabled': True,
                   'authored_weights': [float(d.color[1] if hasattr(d, 'color') else d.value)
                       for d in gm.attributes['ChaosWeight'].data] if weight_receipt['authored_weight_present'] else [None] * len(weights)}
+        if response_receipt is not None:
+            packet['response_mask'] = dict(response_receipt, authored_values=response_values)
+            # The source filter is simulation-only. Remove its propagated mask
+            # on this disposable render copy so ordinary packing keeps R=1.
+            _neutralize_response_render(rm)
         for local, gid in ids.items():
             vertices = [i for i, g in enumerate(gids) if g == gid]
             packet['parts'].append({'gid': gid, 'source_guide': guide.name,
@@ -456,6 +553,8 @@ def capture_source(source, export_state, include_system_ao=False, ao_settings=No
         return [obj], packet
     except Exception as error:
         diagnostic(source.name, str(error))
+        if response_contract is not None:
+            raise
         return None
     finally:
         if ribbon_plan is not None:
@@ -518,6 +617,10 @@ def _finish_asset(render, captures, asset_name, armature, export_collection, exp
     """Build one unparented simulation export beside a normal prepared render."""
     from . import hair_tool_export as hair
     positions, triangles, gids, weights, authored_weights, parts = [], [], [], [], [], []
+    response_values, response_contract = [], None
+    response_present = [c.get('response_mask') is not None for c in captures if c.get('simulation_enabled', True)]
+    if any(response_present) and not all(response_present):
+        raise ValueError('A response-enabled export unit requires authored masks on every physical source')
     for capture in captures:
         base = len(positions)
         positions.extend(capture['vertices'])
@@ -525,6 +628,11 @@ def _finish_asset(render, captures, asset_name, armature, export_collection, exp
         gids.extend(capture['guide_ids'])
         weights.extend(capture['weights'])
         authored_weights.extend(capture['authored_weights'])
+        if capture.get('response_mask') is not None:
+            response_contract = {key: capture['response_mask'][key] for key in RESPONSE_MASK_CONTRACT}
+            if response_contract != RESPONSE_MASK_CONTRACT:
+                raise ValueError('Export unit mixes incompatible simulation response contracts')
+            response_values.extend(capture['response_mask']['authored_values'])
         for row in capture['parts']:
             row = dict(row)
             row['sim_vertex_indices'] = [base + i for i in row.pop('local_sim_vertex_indices')]
@@ -552,6 +660,7 @@ def _finish_asset(render, captures, asset_name, armature, export_collection, exp
         return
     simulation_enabled = bool(positions)
     quantized = [0.] * len(weights)
+    quantized_response = [0.] * len(weights) if response_contract else None
     targets = [('render', render)]
     if simulation_enabled:
         mesh = bpy.data.meshes.new(asset_name + '__GuideSim')
@@ -571,8 +680,11 @@ def _finish_asset(render, captures, asset_name, armature, export_collection, exp
         _int_attribute(mesh, GUID_ATTRIBUTE, gids)
         colors = mesh.color_attributes.new(name='RFAOS', type='BYTE_COLOR', domain='CORNER')
         for loop, color in zip(mesh.loops, colors.data):
-            color.color_srgb = (1., weights[loop.vertex_index], 1., 1.)
+            color.color_srgb = (response_values[loop.vertex_index] if response_contract else 1.,
+                                weights[loop.vertex_index], 1., 1.)
             quantized[loop.vertex_index] = float(color.color_srgb[1])
+            if quantized_response is not None:
+                quantized_response[loop.vertex_index] = float(color.color_srgb[0])
         mesh.color_attributes.active_color = colors
         mesh.color_attributes.render_color_index = list(mesh.color_attributes).index(colors)
         # Keep an existing material; sim appearance does not require new material assets.
@@ -608,6 +720,9 @@ def _finish_asset(render, captures, asset_name, armature, export_collection, exp
                           'basis': 'existing_send2ue_hair_tool_export_rule'})} if armature else None,
         'weight_policy': 'Own simulation ChaosWeight; whole all-zero or absent-weight sources render-only; retain all vertices of any positive-weight source; never child render G.',
         'missing_guide_policy': 'Render-only after complete guide search; no simulation geometry or proxy binding.'}
+    if response_contract:
+        packet['response_mask'] = dict(response_contract, present=True,
+            values=quantized_response, authored_values=response_values)
     # Verified ribbon exports can change their longitudinal sampling without
     # changing parent-spline identity. Ask the receiver to transfer artist paint
     # in each rooted strip's source coordinates, with independent topology,
@@ -622,6 +737,14 @@ def _finish_asset(render, captures, asset_name, armature, export_collection, exp
                 or not isinstance(transfer.get('guide_keys'), list)):
             raise ValueError('Unsupported explicit cloth paint transfer policy')
         packet['weight_map_transfer'] = transfer
+    manager = getattr(bpy.context, 'window_manager', None)
+    raw_defaults = manager.get('send2ue_new_source_weight_map_defaults', '') if manager else ''
+    if raw_defaults:
+        initializations = json.loads(raw_defaults)
+        if not isinstance(initializations, dict):
+            raise ValueError('New-source map initialization must be keyed by export unit')
+        if asset_name in initializations:
+            packet['new_source_weight_map_defaults'] = initializations[asset_name]
     packet['content_id'] = hashlib.sha256(json.dumps(packet, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()).hexdigest()
     package = {'packet': packet, 'exports': {}, 'imported': set(), 'asset_name': asset_name}
     state()['packages'][packet['content_id']] = package
@@ -654,10 +777,15 @@ def record_export(asset_data):
     # The final exported member is also the final import queue member. Embed a
     # complete portable record there so deferred ingest does not need Blender's
     # driver namespace or disposable objects after post-operation cleanup.
-    asset_data['_hair_guide_cloth_record'] = _package_record(package, key, settings())
+    raw_units = bpy.context.window_manager.get('send2ue_response_only_units', '')
+    units = json.loads(raw_units) if raw_units else []
+    raw_simulation = bpy.context.window_manager.get('send2ue_simulation_only_units', '')
+    simulation_units = json.loads(raw_simulation) if raw_simulation else []
+    asset_data['_hair_guide_cloth_record'] = _package_record(package, key, settings(), units, simulation_units)
+    prepare_response_only_import(asset_data)
 
 
-def _package_record(package, key, cfg):
+def _package_record(package, key, cfg, response_only_units=(), simulation_only_units=()):
     simulation_enabled = package['packet']['simulation_enabled']
     record = {'version': 2, 'content_id': key, 'simulation_enabled': simulation_enabled,
               'manifest_path': package['manifest_path'], 'manifest_sha256': package['manifest_sha256']}
@@ -666,10 +794,44 @@ def _package_record(package, key, cfg):
         record[role + '_fbx'] = package['exports'][role]['fbx']
     for name in ('cloth_template_asset_path', 'body_mesh_asset_path', 'physics_asset_path'):
         record[name] = str(getattr(cfg, name, ''))
+    if (not isinstance(response_only_units, (list, tuple)) or
+            any(not isinstance(unit, str) or not unit for unit in response_only_units)):
+        raise ValueError('Response-only units must be explicit export unit names')
+    if response_only_units and package['asset_name'] in response_only_units:
+        if not simulation_enabled or package['packet'].get('response_mask') is None:
+            raise ValueError('Response-only update requires the authored simulation R contract')
+        record['update_mode'] = 'response_only'
+    if (not isinstance(simulation_only_units, (list, tuple)) or
+            any(not isinstance(unit, str) or not unit for unit in simulation_only_units)):
+        raise ValueError('Simulation-only units must be explicit export unit names')
+    if package.get('asset_name') in simulation_only_units:
+        if not simulation_enabled or record.get('update_mode') is not None:
+            raise ValueError('Simulation-only update needs physical guides and one explicit update mode')
+        record['update_mode'] = 'simulation_only'
     return record
 
 
 def import_record(asset_data, properties):
-    if asset_data.get('skip'):
+    record = asset_data.get('_hair_guide_cloth_record')
+    retained_post = record and ((asset_data.get('_hair_response_only_render') is True and record.get('update_mode') == 'response_only')
+        or (asset_data.get('_hair_simulation_only_render') is True and record.get('update_mode') == 'simulation_only'))
+    if asset_data.get('skip') and not retained_post:
         return None
-    return asset_data.get('_hair_guide_cloth_record')
+    return record
+
+
+def prepare_response_only_import(asset_data):
+    """Skip only this explicitly requested unit's render import, not its post step."""
+    record = asset_data.get('_hair_guide_cloth_record')
+    if not record or record.get('update_mode') not in ('response_only', 'simulation_only'):
+        return
+    flag = '_hair_response_only_render' if record['update_mode'] == 'response_only' else '_hair_simulation_only_render'
+    marker = asset_data.get('_hair_guide_cloth', {})
+    if asset_data.get(flag) is True and asset_data.get('skip') is True:
+        if marker.get('role') == 'render' and asset_data.get('asset_path') == record['render_asset_path']:
+            return
+    if (asset_data.get('skip') or marker.get('role') != 'render' or
+            asset_data.get('asset_path') != record['render_asset_path']):
+        raise ValueError('Response-only final member must be its unskipped render mesh')
+    asset_data['skip'] = True
+    asset_data[flag] = True

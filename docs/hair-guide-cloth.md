@@ -135,6 +135,28 @@ required FBXs have been imported (render only when simulation is disabled).
 Changed geometry, paint, ownership, render payload or
 armature state changes the packet hash and requires a new binding bake.
 
+An Export Empty can explicitly set
+`send2ue_cloth_response_mask = "sim_only_R"` to use the existing
+`HairPixelDepthOffset` Root-to-Tip filter as a physical response mask. Every
+positive-G physical source in that unit must author this POINT attribute;
+absent/all-zero G sources keep their ordinary render-only policy. The optional
+`response_mask` v1 packet records the original evaluated mask, its UNORM8 R
+values and its `HairTipResponse` map name. Unsupported/missing opted-in data
+fails the requested operation instead of falling back to a different source.
+
+This policy keeps render R at neutral one by removing the propagated PDO mask
+only from disposable render copies before ordinary packing. Simulation R carries
+the mask; simulation G, B and A keep their original values. Original source
+attributes, guide shape, skin and render embedding are unchanged. The receiver
+reads actual imported R through the native vertex-color provider, compares every
+welded simulation value to exact manifest source identities, and publishes a
+standard WeightMap in BuildSource/BindingData. The import receipt includes full
+value verification and matching byte hashes. Artists may reference
+`HairTipResponse` in native weighted physics inputs; the exporter changes no
+physical coefficients. The generated map must not be shadowed by an unrelated
+same-name template/final paint node. Units without this explicit property use
+the existing R/G contract and do not generate the response map.
+
 Only the cloth command receives a scoped 900-second response timeout. Existing
 global RPC preferences and all normal import settings are preserved. Cloth
 failures preserve already imported meshes and the previous Cloth, but fail the
@@ -358,3 +380,70 @@ Unchanged authored weight arrays are not rewritten from reflected text. This
 preserves native float32 paint precision when the editor's text dump exposes
 fewer decimal places than the stored values. Only arrays whose correspondence
 actually changes are written and included in rollback edits.
+
+## Response mask updates on an existing binding
+
+For a mask-only operation, set WindowManager
+`send2ue_response_only_units` to a JSON list of exact exported Empty unit names
+and restore its previous value afterward. This mode requires the explicit
+`sim_only_R` contract. The final render member remains in the post-import queue,
+but its native mesh import is skipped; only the guide simulation mesh is imported.
+Ordinary exports keep their existing behavior when this operation scope is absent.
+
+The receiver requires a clean, generator-owned Cloth with its original embedded
+`GeneratorBindings` import. It reconciles every existing simulation/render vertex
+and G against exact source identities before writing. It inserts the standard
+`GuideOwnResponseR` WeightMap after that import, keeping its original BindingData,
+artist paint/config nodes, render package bytes and every other typed collection
+value. Later mask updates require the exact owned response-node GUID. This path
+does not rebuild render bindings or reset live component settings. A failed
+source-identity or G check rejects the operation. This mode deliberately keeps
+the existing topology; use an ordinary geometry update to change it.
+
+The mask receipt compares both evaluated and built native float32 arrays using
+their count-prefixed SHA-256. Graph ExportText values have limited decimal
+precision and are used only as a separate rounding diagnostic. A successful
+response-only import does not change mass or other physical coefficients;
+connect `HairTipResponse` to the intended native configuration explicitly.
+
+## Directly profiled hair and added simulation sources
+
+A final Hair Tool curve that directly renders its own profile may explicitly set
+the Boolean `send2ue_cloth_self_guide=True`. It must be a Curve/Curves object
+with one active Hair Tool profile. The same evaluated profile supplies exact
+render ownership; only its disposable simulation copy is ribbon-optimized.
+An ordinary unpainted source stays render-only unless the artist authors its G.
+The flag never borrows G from a neighboring strand or infers ownership by distance.
+
+Generated paired Sim/render export objects retain their resolved source names
+when immediate-parent naming is enabled. The Sim has no parent intentionally,
+so it remains a separate native FBX/import queue member. It must not become an
+asset named `None` or be merged into its render unit.
+
+WindowManager `send2ue_simulation_only_units` is an explicit operation-scoped JSON
+list for topology updates that retain the existing renderer. The render queue
+member still runs cloth postprocessing, but only the Sim mesh is imported. The
+receiver performs a normal Cloth/binding rebuild and checks that the render
+package bytes are unchanged. This mode does not require an R mask. Restore the
+WindowManager values after the operation; normal exports remain unchanged.
+
+Adding previously static sources can explicitly initialize just their new native
+vertices through `send2ue_new_source_weight_map_defaults`, keyed by export unit.
+The v1 `initialize_new_sources_only` contract names the exact new source
+identities, protected target-package SHA-256, and artist map/default pairs.
+Reserved G/identity maps cannot be initialized this way. Every retained painted
+vertex and triangle support must have exact correspondence. Each new triangle
+must be wholly new. The receiver rejects missing old support, mixed triangles,
+unknown source/map names and ambiguous paint instead of guessing/interpolating.
+
+For this explicit added-source operation, `reference_weight_maps` supplies the
+original float32 values and their length-prefixed SHA-256. The receiver verifies
+them against the current complete evaluated native array and the active paint
+node's independently rounded text before expanding the map. The target disk
+hash must also match. This preserves artist precision while assigning the
+declared default only to the added sources.
+
+Live refresh processes components with an authored Cloth Asset property.
+Native collision pose views can expose a skinned asset through `GetAsset` while
+leaving that property empty. They are excluded from proxy/config refresh so a
+pose-only helper cannot be activated as another simulation.

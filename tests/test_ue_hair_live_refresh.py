@@ -61,6 +61,7 @@ class Cloth(Renderer):
         self.config_generation = self.proxy_generation = self.asset.generation
         self.rebuilds = 0
     def get_editor_property(self, key):
+        if key == 'asset': return self.asset
         if key == 'enable_simulation': return self.enabled
         if key == 'suspend_simulation': return self.suspended
         return super().get_editor_property(key)
@@ -166,6 +167,18 @@ class LiveRefreshTests(unittest.TestCase):
         self.refresh()
         self.assertEqual(self.cloth.rebuilds, 1)
         self.assertEqual(self.other.rebuilds, 0)
+
+    def test_unconfigured_native_collision_pose_view_is_not_activated(self):
+        class PoseView(Cloth):
+            def get_editor_property(self,key):
+                return None if key=='asset' else super().get_editor_property(key)
+            def is_component_tick_enabled(self):return True
+            def get_cloth_outfit_interactor(self,index):return object()
+        helper=PoseView(self.actor,'collision_pose_view',self.asset)
+        helper.parent=None
+        self.refresh()
+        self.assertEqual(helper.rebuilds,0)
+        self.assertEqual(self.cloth.rebuilds,1)
 
     def test_render_only_twice_then_sim_restores_user_renderer_visibility_and_cloth_flags(self):
         renderer = Renderer(self.actor, 'source_render', self.render)

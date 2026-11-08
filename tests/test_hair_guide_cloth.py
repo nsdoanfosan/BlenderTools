@@ -13,8 +13,12 @@ class Object:
     def __init__(self, name, parent=None, kind='MESH'):
         self.name, self.parent, self.type = name, parent, kind
         self.children, self.modifiers = [], []
+        self.custom_properties = {}
         if parent:
             parent.children.append(self)
+
+    def get(self, key, default=None):
+        return self.custom_properties.get(key, default)
 
 
 class GuidePolicyTests(unittest.TestCase):
@@ -45,6 +49,32 @@ class GuidePolicyTests(unittest.TestCase):
         self.api._object_inputs = lambda obj: iter([self.source_input(second)])
         guide, _, _ = self.api.find_guide(third)
         self.assertIs(guide, second)
+
+    def test_explicit_profiled_self_guide_does_not_use_its_static_grid_surface(self):
+        grid, direct = Object('grid'), Object('direct', kind='CURVES')
+        direct.custom_properties[self.api.SELF_GUIDE_PROPERTY] = True
+        direct.modifiers = [SimpleNamespace(type='NODES', show_viewport=True,
+            node_group=SimpleNamespace(name='Hair_System_Profile.001'))]
+        self.api._object_inputs = lambda obj: iter([self.source_input(grid)])
+        guide, sockets, receipt = self.api.find_guide(direct)
+        self.assertIs(guide, direct)
+        self.assertEqual(sockets, [])
+        self.assertEqual(receipt['basis'], 'explicit_self_profiled_guide')
+
+    def test_self_guide_rejects_non_boolean_intent(self):
+        direct = Object('direct', kind='CURVES')
+        direct.custom_properties[self.api.SELF_GUIDE_PROPERTY] = 'True'
+        self.api._object_inputs = lambda obj: iter([])
+        with self.assertRaisesRegex(ValueError, 'boolean'):
+            self.api.find_guide(direct)
+
+    def test_self_guide_rejects_non_curve_and_missing_profile(self):
+        for kind in ('MESH', 'CURVES'):
+            direct = Object('direct', kind=kind)
+            direct.custom_properties[self.api.SELF_GUIDE_PROPERTY] = True
+            self.api._object_inputs = lambda obj: iter([])
+            with self.assertRaisesRegex(ValueError, 'profiled'):
+                self.api.find_guide(direct)
 
     def test_missing_weight_is_static_and_distinct_from_authored_zero(self):
         mesh = SimpleNamespace(vertices=[None] * 3, attributes={})
