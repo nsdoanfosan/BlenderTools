@@ -2,7 +2,9 @@
 
 import copy
 import importlib.util
+import hashlib
 import json
+import struct
 from collections import Counter
 from pathlib import Path
 import unittest
@@ -251,6 +253,77 @@ class BackRibbonIndependentReviewTests(unittest.TestCase):
             previous, Counter({(0, 1, 2): 1})))
         self.assertFalse(M._same_painted_vertex_support(
             previous, Counter({(0, 1, 2): 2, (1, 2, 3): 1})))
+
+
+class NewSourcePaintInitializationTests(unittest.TestCase):
+    def fixture(self):
+        old = strip([0., 1.])
+        new = copy.deepcopy(old)
+        new['sim_positions'] += [[x+4., y, z] for x,y,z in old['sim_positions']]
+        new['sim_triangles'] += [[i+4 for i in t] for t in old['sim_triangles']]
+        values = [.013676358386874199, .24000000953674316, .7200000286102295, 1.]
+        node = map_node('AuthoredClearance', [round(x, 6) for x in values])
+        node['vertex_weights_native'] = values[:]
+        graph = {'nodes':[node], 'connections':[]}
+        contract = {'version':1, 'policy':'initialize_new_sources_only',
+                    'reference_asset_sha256':'a'*64, 'source_identities':['Added'],
+                    'weight_maps':{'AuthoredClearance':0.}}
+        packet = {'parts':[{'gid':0,'source_guide':'Existing'}, {'gid':1,'source_guide':'Added'}],
+                  'new_source_weight_map_defaults':contract}
+        ownership = {'sim_guide_ids':[0]*4+[1]*4}
+        return graph, old, new, values, packet, ownership
+
+    def test_new_guides_only_get_explicit_default_and_existing_paint_stays_exact(self):
+        graph,old,new,values,packet,ownership = self.fixture()
+        updated=M._weight_map_updates(graph,{'built_mapping':old},{'built_mapping':new},packet,ownership)
+        self.assertEqual(updated['AuthoredClearance'][2],values+[0.]*4)
+        self.assertNotEqual(values[0],round(values[0],6))
+
+    def test_new_geometry_without_explicit_defaults_remains_rejected(self):
+        _,old,new,values,_,_ = self.fixture()
+        with self.assertRaisesRegex(ValueError,'geometry changed'):
+            M._transfer_unchanged_simulation_map(old,new,values)
+
+    def test_new_source_initialization_requires_native_float_values(self):
+        graph,old,new,_,packet,ownership = self.fixture()
+        del graph['nodes'][0]['vertex_weights_native']
+        with self.assertRaisesRegex(ValueError,'full-precision'):
+            M._weight_map_updates(graph,{'built_mapping':old},{'built_mapping':new},packet,ownership)
+
+    def test_defaults_cannot_hide_a_missing_old_triangle(self):
+        _,old,new,values,_,_ = self.fixture()
+        del new['sim_triangles'][0]
+        with self.assertRaisesRegex(ValueError,'original painted triangle'):
+            M._transfer_unchanged_simulation_map(old,new,values,new_vertex_defaults={i:0. for i in range(4,8)})
+
+    def test_new_triangle_cannot_cross_into_existing_paint(self):
+        _,old,new,values,_,_ = self.fixture()
+        new['sim_triangles'].append([0,4,5])
+        with self.assertRaisesRegex(ValueError,'crosses retained'):
+            M._transfer_unchanged_simulation_map(old,new,values,new_vertex_defaults={i:0. for i in range(4,8)})
+
+    def test_default_cannot_replace_source_G(self):
+        *_,packet,ownership = self.fixture()
+        packet['new_source_weight_map_defaults']['weight_maps']={'MaxDistance':1.}
+        with self.assertRaisesRegex(ValueError,'Invalid explicit'):
+            M._new_source_map_defaults(packet,ownership,'MaxDistance')
+
+    def test_unknown_source_is_rejected(self):
+        *_,packet,ownership = self.fixture()
+        packet['new_source_weight_map_defaults']['source_identities']=['Unrelated']
+        with self.assertRaisesRegex(ValueError,'absent'):
+            M._new_source_map_defaults(packet,ownership,'AuthoredClearance')
+
+    def test_lossless_reference_must_match_the_current_native_full_array(self):
+        values=[.013676358386874199,.24000000953674316,1.]
+        raw=struct.pack('<3f',*values)
+        digest=hashlib.sha256(struct.pack('<i',3)+raw).hexdigest()
+        reference={'float32_values':values,'sha256':digest}
+        native={'count':3,'non_finite_count':0,'sha256':digest}
+        self.assertEqual(M._reference_artist_weight_values(reference,native,'(0.013676,0.240000,1.000000)'),values)
+        reference['float32_values'][0]=.013676
+        with self.assertRaisesRegex(ValueError,'current full native array'):
+            M._reference_artist_weight_values(reference,native,'(0.013676,0.240000,1.000000)')
 
 
 if __name__ == '__main__':

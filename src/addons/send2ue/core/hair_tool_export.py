@@ -1364,6 +1364,7 @@ def prepare():
 
         for asset_parent, asset_sources in grouped_sources.items():
             ao_configuration = _asset_ao_configuration(asset_parent)
+            response_contract = hair_guide_cloth.response_mask_contract(asset_parent) if guide_cloth_enabled else None
             parts = []
             shape_source_parts = []
             guide_captures = []
@@ -1374,6 +1375,7 @@ def prepare():
                         source_object, state,
                         include_system_ao=(ao_configuration['evaluation_mode'] == 'PER_SYSTEM'),
                         ao_settings=ao_configuration,
+                        response_contract=response_contract,
                     )
                     if captured is not None:
                         source_parts, guide_capture = captured

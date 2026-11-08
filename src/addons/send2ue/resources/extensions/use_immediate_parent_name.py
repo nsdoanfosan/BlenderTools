@@ -105,6 +105,17 @@ class UseImmediateParentNameExtension(ExtensionBase):
         :param object properties: The property group that contains variables that maintain the addon's correct state.
         :return str: The full asset name when use_immediate_parent_name is active,
         """
+        # Paired guide-cloth meshes already carry their resolved export names.
+        # The generated Sim intentionally has no parent so Combine Assets keeps
+        # it separate. Parent lookup would turn that valid name into None.
+        content = mesh_object.get('_send2ue_guide_cloth_package')
+        source_name = mesh_object.get('_send2ue_hair_tool_source_name')
+        if (mesh_object.get('_send2ue_hair_tool_temp') is True
+                and mesh_object.get('_send2ue_guide_cloth_role') in {'sim', 'render'}
+                and isinstance(content, str) and len(content) == 64
+                and all(c in '0123456789abcdefABCDEF' for c in content)
+                and isinstance(source_name, str) and source_name):
+            return utilities.get_asset_name(source_name, properties)
         parent_object = mesh_object.parent
         if parent_object:
             # if immediate parent object is of the type empty, return its name as asset name

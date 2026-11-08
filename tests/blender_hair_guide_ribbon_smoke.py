@@ -101,7 +101,7 @@ def store(group, geometry, name, data_type, domain, value):
     return node.outputs['Geometry']
 
 
-def fixture(name, profile_group=CIRCLE, profile_res=None):
+def fixture(name, profile_group=CIRCLE, profile_res=None, response=False):
     curve = bpy.data.curves.new(name + '_Curves', 'CURVE')
     curve.dimensions = '3D'
     for strand in range(3):
@@ -147,6 +147,13 @@ def fixture(name, profile_group=CIRCLE, profile_res=None):
     group.links.new(mask.outputs[0], weight.inputs[0])
     group.links.new(factor.outputs['Factor'], weight.inputs[1])
     geo = store(group, geo, 'ChaosWeight', 'FLOAT', 'POINT', weight.outputs[0])
+    if response:
+        color = group.nodes.new('FunctionNodeCombineColor')
+        color.mode = 'RGB'
+        for channel in range(3):
+            group.links.new(factor.outputs['Factor'], color.inputs[channel])
+        color.inputs[3].default_value = 1.
+        geo = store(group, geo, 'HairPixelDepthOffset', 'BYTE_COLOR', 'POINT', color.outputs[0])
     profile = group.nodes.new('GeometryNodeGroup')
     profile.node_tree, profile.name = profile_group, profile_group.name
     group.links.new(geo, profile.inputs['Curves'])
@@ -285,6 +292,36 @@ assert cfg is not None and cfg.simulation_mesh_mode == 'RIBBON', 'Ribbon must be
 enum = cfg.bl_rna.properties['simulation_mesh_mode']
 assert {'RIBBON', 'ORIGINAL'}.issubset({item.identifier for item in enum.enum_items})
 assert next(item.name for item in enum.enum_items if item.identifier == 'RIBBON') == 'Optimized ribbon guides'
+
+# Physical R survives actual installed native profile conversion while its
+# propagated render attribute is neutralized only on the disposable copy.
+response_receipts = []
+for response_profile in (CIRCLE, FLAT):
+    response_source = fixture('ResponseR_' + response_profile.name, response_profile, 4, response=True)
+    response_render = renderer(response_source)
+    response_baseline = cloth._copy_mesh(response_render)
+    response_geometry = geometry(response_baseline)
+    dispose_mesh(response_baseline)
+    response_signature = graph_signature(response_source.modifiers['Profile'].node_group)
+    response_state = {'temporary_object_names': set(), 'temporary_mesh_names': set()}
+    cloth.begin()
+    captured = cloth.capture_source(response_render, response_state,
+        response_contract=cloth.response_mask_contract({cloth.RESPONSE_MASK_PROPERTY: 'sim_only_R'}))
+    assert captured is not None and captured[1]['source']['simulation_mesh']['status'] == 'converted'
+    values = captured[1]['response_mask']['authored_values']
+    assert len(values) == len(captured[1]['vertices']) == 30
+    assert min(values) == 0 and max(values) == 1
+    assert len(set(round(value, 4) for value in values)) == 5
+    assert 'HairPixelDepthOffset' not in captured[0][0].data.attributes
+    assert geometry(captured[0][0].data) == response_geometry
+    assert graph_signature(response_source.modifiers['Profile'].node_group) == response_signature
+    response_receipts.append({'profile': response_profile.name, 'samples': len(values),
+                              'r_values': sorted(set(values)), 'render_geometry_preserved': True})
+    for obj in captured[0]:
+        response_mesh = obj.data
+        bpy.data.objects.remove(obj, do_unlink=True)
+        dispose_mesh(response_mesh)
+print('HAIR_TIP_RESPONSE_RIBBON ' + json.dumps(response_receipts), flush=True)
 guide = fixture('RibbonRegression')
 render = renderer(guide)
 baseline_group_signature = graph_signature(guide.modifiers['Profile'].node_group)
@@ -610,6 +647,32 @@ assert graph_signature(static_group) == static_signature
 assert not cloth.state()['diagnostics'], 'A static source must not be reported as a failed conversion'
 assert graph_signature(guide.modifiers['Profile'].node_group) == baseline_group_signature
 assert hashlib.sha256(args.hair_library.read_bytes()).hexdigest() == library_hash
+self_receipts = []
+for profile in (CIRCLE, FLAT):
+    direct = fixture('DirectProfile_' + profile.name, profile_group=profile)
+    direct[cloth.SELF_GUIDE_PROPERTY] = True
+    untouched = cloth._copy_mesh(direct)
+    signature = graph_signature(direct.modifiers['Profile'].node_group)
+    cloth.begin()
+    direct_capture = cloth.capture_source(direct, export_state)
+    assert direct_capture is not None, cloth.state()['diagnostics']
+    objects, packet = direct_capture
+    assert packet['simulation_enabled'] and any(w > 0 for w in packet['weights'])
+    assert packet['source']['basis'] == 'explicit_self_profiled_guide'
+    assert len(packet['parts']) == 3
+    assert {part['source_guide'] for part in packet['parts']} == {direct.name}
+    actual = cloth._copy_mesh(objects[0])
+    assert geometry(actual) == geometry(untouched)
+    assert set(point_attribute(actual, cloth.GUID_ATTRIBUTE)) == set(packet['guide_ids'])
+    assert graph_signature(direct.modifiers['Profile'].node_group) == signature
+    self_receipts.append({'profile': profile.name, 'guides': len(packet['parts']),
+                          'render_vertices': len(actual.vertices), 'simulation_vertices': len(packet['vertices'])})
+    dispose_mesh(actual); dispose_mesh(untouched)
+    for item in objects:
+        mesh = item.data
+        bpy.data.objects.remove(item, do_unlink=True)
+        dispose_mesh(mesh)
+
 report = {
     'blender_version': bpy.app.version_string,
     'hair_library_sha256': library_hash,
@@ -635,6 +698,7 @@ report = {
     'unsupported_original_fallback_with_reason': True,
     'unsupported_capture_retains_geometry_and_emits_diagnostic': True,
     'whole_zero_source_render_only': True,
+    'explicit_direct_profile_self_guide': self_receipts,
     'receipts': receipts,
     'planar_receipts': planar_receipts,
     'fallback_receipt': fallback_receipt,

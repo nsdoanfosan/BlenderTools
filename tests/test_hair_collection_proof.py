@@ -5,6 +5,7 @@ or pretend to evaluate a Dataflow graph.
 """
 import copy
 import importlib.util
+import json
 from pathlib import Path
 import unittest
 
@@ -433,6 +434,82 @@ class PublicationProofTests(unittest.TestCase):
         with self.assertRaises((RuntimeError, ValueError)):
             H._verify_published_collection({'collections': [after]}, before,
                                             {'GeneratedTravel', 'ArtistPaint'})
+
+
+class PublicationMismatchDiagnosticsTests(unittest.TestCase):
+    @staticmethod
+    def native_inventory_counts(row):
+        proof = row[C.KEY]
+        proof['group_count'] = len(proof['groups'])
+        proof['attribute_count'] = sum(len(group['attributes']) for group in proof['groups'])
+        for group in proof['groups']:
+            group['attribute_count'] = len(group['attributes'])
+            for attr in group['attributes']:
+                attr['serialized_bytes'] = 4 * attr['count']
+
+    def response_pair(self):
+        before = collection()
+        self.native_inventory_counts(before)
+        after = copy.deepcopy(before)
+        add_attribute(after, 'SimVertices3D', 'HairTipResponse')
+        after['weight_maps'].append({'name': 'HairTipResponse', 'avg': 0.2})
+        after['sim_float_attributes'].append({'name': 'HairTipResponse'})
+        after['non_uv_collection_md5'] = 'with-native-R'
+        self.native_inventory_counts(after)
+        return before, after
+
+    def failure_details(self, before, after):
+        original = copy.deepcopy((before, after))
+        with self.assertRaises(RuntimeError) as error:
+            H._verify_published_collection(audit(after), before, {'HairTipResponse'})
+        self.assertEqual((before, after), original)
+        text = str(error.exception)
+        self.assertIn('collection_semantic_v1', text)
+        self.assertNotIn('sim_positions', text)
+        return json.loads(text.split('; semantic_delta=', 1)[1])
+
+    def test_native_R_inventory_addition_alone_already_passes_without_relaxation(self):
+        before, after = self.response_pair()
+        original = copy.deepcopy((before, after))
+        H._verify_published_collection(audit(after), before, {'HairTipResponse'})
+        self.assertEqual((before, after), original)
+
+    def test_failure_names_only_the_normalized_changed_leaf_and_opaque_hashes(self):
+        before, after = self.response_pair()
+        change_hash(after, 'SimVertices3D', 'ArtistPaint')
+        details = self.failure_details(before, after)
+        self.assertEqual(details['changed_entries'], 1)
+        self.assertEqual(details['changes'], [{'path': 'SimVertices3D.ArtistPaint',
+            'expected_hash': '1' * 64, 'actual_hash': '2' * 64}])
+        self.assertNotIn('HairTipResponse', json.dumps(details))
+        self.assertFalse(details['truncated'])
+
+    def test_metadata_difference_is_reported_and_still_rejected(self):
+        before, after = self.response_pair()
+        find_attribute(after, 'SimVertices3D', 'ArtistPaint')['persistent'] = False
+        details = self.failure_details(before, after)
+        leaf = details['changes'][0]
+        self.assertEqual(leaf['path'], 'SimVertices3D.ArtistPaint')
+        self.assertEqual(leaf['metadata'], {'persistent': {'expected': True, 'actual': False}})
+        self.assertEqual(leaf['expected_hash'], leaf['actual_hash'])
+
+    def test_many_changed_leaves_keep_the_failure_diagnostic_small(self):
+        before, after = self.response_pair()
+        for index in range(40):
+            name = 'Paint_%02d' % index
+            for row in (before, after):
+                add_attribute(row, 'SimVertices3D', name)
+                row['weight_maps'].append({'name': name, 'avg': 0.4})
+                row['sim_float_attributes'].append({'name': name})
+            find_attribute(after, 'SimVertices3D', name)['blake3'] = '2' * 64
+        for row in (before, after):
+            self.native_inventory_counts(row)
+        after[C.KEY]['blake3'] = 'c' * 64
+        details = self.failure_details(before, after)
+        self.assertEqual(details['changed_entries'], 40)
+        self.assertLessEqual(details['shown_entries'], 8)
+        self.assertTrue(details['truncated'])
+        self.assertLessEqual(len(json.dumps(details, ensure_ascii=False, separators=(',', ':'))), 3072)
 
 
 if __name__ == '__main__':

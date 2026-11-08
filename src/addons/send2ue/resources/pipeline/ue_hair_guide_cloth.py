@@ -13,6 +13,7 @@ import math
 from pathlib import Path
 import re
 import sys
+import struct
 import traceback
 import uuid
 from collections import defaultdict, Counter
@@ -23,6 +24,37 @@ NATIVE_DERIVED_MAPS = 'Send2UE.HairGuideCloth.NativeDerivedMaps'
 SOURCE_MAXIMUM = 'Send2UE.HairGuideCloth.SourceMaximum'
 VERSION = "send2ue.hair_guide_cloth.v1"
 RENDER_ONLY_SOURCE_STATUSES = {"no_guide_after_search", "guide_weights_all_zero"}
+RESPONSE_MASK_CONTRACT = {'version': 1, 'policy': 'sim_only_R', 'channel': 'R',
+    'attribute': 'HairPixelDepthOffset', 'weight_map': 'HairTipResponse',
+    'precision': 'unorm8', 'render_channel_fallback': 1.0}
+RESPONSE_NODE_NAME = 'GuideOwnResponseR'
+RESPONSE_OWNER = 'Send2UE.HairGuideCloth.ResponseNode'
+
+
+def validate_response_mask(packet):
+    """An optional physical-source mask never changes the legacy G contract."""
+    mask = packet.get('response_mask')
+    if mask is None:
+        return None
+    if (not isinstance(mask, dict) or mask.get('present') is not True or
+            any(mask.get(key) != value for key, value in RESPONSE_MASK_CONTRACT.items())):
+        raise ValueError('Unsupported simulation response mask contract')
+    count = len(packet['meshes']['sim']['vertices'])
+    if not count or packet.get('simulation_enabled', True) is not True:
+        raise ValueError('Response mask requires real simulation geometry')
+    for field in ('values', 'authored_values'):
+        values = mask.get(field)
+        if (not isinstance(values, list) or len(values) != count or
+                any(type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1
+                    for value in values)):
+            raise ValueError('Simulation response mask has invalid ' + field)
+    if any(abs(value - round(authored * 255.) / 255.) > 1e-6
+           for value, authored in zip(mask['values'], mask['authored_values'])):
+        raise ValueError('Simulation response mask byte values differ from authored values')
+    rgba = packet['meshes'].get('render', {}).get('rgba_srgb')
+    if rgba is not None and any(len(color) != 4 or abs(color[0] - 1.) > 1e-6 for color in rgba):
+        raise ValueError('Simulation-only response mask changed the render R channel')
+    return mask
 
 
 class _RetainDependenciesError(RuntimeError):
@@ -288,6 +320,16 @@ def validate_record(record):
         raise ValueError("Render strands refer to missing simulation guides")
     if not simulation_enabled and guided:
         raise ValueError("Render-only export still contains guided simulation vertices")
+    validate_response_mask(packet)
+    if out.get('update_mode') not in (None, 'response_only', 'simulation_only'):
+        raise ValueError('Unsupported hair update mode')
+    if out.get('update_mode') == 'simulation_only' and not simulation_enabled:
+        raise ValueError('Simulation-only update requires physical simulation guides')
+    if out.get('update_mode') == 'response_only' and (not simulation_enabled or validate_response_mask(packet) is None):
+        raise ValueError('R-only update requires an authored simulation R mask')
+    if packet.get('new_source_weight_map_defaults') is not None:
+        # Validate the complete contract before building or saving any assets.
+        _new_source_map_defaults(packet, {'sim_guide_ids': packet['meshes']['sim']['guide_ids']}, None)
     out["manifest_path"] = str(filename)
     return out, packet
 
@@ -299,6 +341,7 @@ def normalize_ownership(built, packet, tolerance_cm=0.0002):
     only restores source vertex identity after FBX import; it never chooses which
     guide owns a strand.
     """
+    response_mask = validate_response_mask(packet)
     result, receipt = {}, {}
     for role in ("sim", "render"):
         source = packet["meshes"][role]
@@ -323,6 +366,9 @@ def normalize_ownership(built, packet, tolerance_cm=0.0002):
                 raise ValueError(role + " coincident source vertices have ambiguous guide identity")
             if role == "sim" and len({round(source["weights"][i], 6) for _, i in candidates}) != 1:
                 raise ValueError("Coincident simulation vertices have conflicting source G")
+            if role == 'sim' and response_mask is not None and len({
+                    round(response_mask['values'][i], 6) for _, i in candidates}) != 1:
+                raise ValueError('Coincident simulation vertices have conflicting source response R')
             error, index = min(candidates)
             gids.append(source["guide_ids"][index]); source_indices.append(index); errors.append(error)
             # Same-parent coincident strands can have several original vertices.
@@ -341,6 +387,10 @@ def normalize_ownership(built, packet, tolerance_cm=0.0002):
             if len(actual) != len(expected) or any(abs(a - b) > 1e-6 for a, b in zip(actual, expected)):
                 raise ValueError("Chaos MaxDistance map differs from exported simulation G")
             result["sim_weights"] = actual
+            if response_mask is not None:
+                result['sim_response_mask'] = dict(response_mask,
+                    values=[response_mask['values'][i] for i in source_indices],
+                    authored_values=[response_mask['authored_values'][i] for i in source_indices])
     for tri in result["sim_triangles"]:
         if len({result["sim_guide_ids"][i] for i in tri}) != 1:
             raise ValueError("Chaos import welded different source guides")
@@ -728,7 +778,188 @@ def _build_source(unreal, record, path, packet=None):
         raise
 
 
+def _native_weight_values(native, node_name):
+    rows = [row for row in native.get('nodes', []) if row.get('name') == node_name]
+    if len(rows) != 1 or rows[0].get('type') != 'FChaosClothAssetWeightMapNode':
+        raise ValueError('Response mask native WeightMap node is missing or ambiguous')
+    raw = rows[0].get('props', {}).get('VertexWeights')
+    if isinstance(raw, str) and raw.startswith('(') and raw.endswith(')'):
+        try:
+            values = [float(value) for value in raw[1:-1].split(',') if value.strip()]
+        except ValueError as error:
+            raise ValueError('Response mask native values are invalid') from error
+    elif isinstance(raw, list):
+        values = raw
+    else:
+        raise ValueError('Response mask native full-value evidence is unavailable')
+    if any(type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1 for value in values):
+        raise ValueError('Response mask native values are invalid')
+    return values
+
+
+def _verify_response_float32(unreal, asset, expected):
+    """Read full native arrays; ExportText rounds floats to six decimal places."""
+    raw = b''.join(struct.pack('<f', value) for value in expected)
+    full_hash = hashlib.sha256(struct.pack('<i', len(expected)) + raw).hexdigest()
+    audit = _native(unreal.CodexGarmentWindAuditLibrary.audit_asset(asset))
+    models = audit.get('models', [])
+    if len(models) != 1 or len(models[0].get('lods', [])) != 1:
+        raise RuntimeError('Response mask requires one native model and LOD')
+    lod = models[0]['lods'][0]
+    for row in (lod, lod.get('built_simulation', {})):
+        values = row.get('weight_maps', {}).get('HairTipResponse', {})
+        if (values.get('count') != len(expected) or values.get('non_finite_count') != 0 or
+                values.get('sha256') != full_hash):
+            raise RuntimeError('Native response-mask float32 array differs from its source')
+    return {'float32_sha256': hashlib.sha256(raw).hexdigest(),
+            'native_array_sha256': full_hash, 'native_array_count': len(expected)}
+
+
+def _without_response_collection(audit):
+    """Remove only the explicitly owned R attribute from an equality comparison."""
+    result = json.loads(json.dumps(audit))
+    row = result['collections'][0]
+    for key in ('weight_maps', 'sim_float_attributes'):
+        row[key] = [item for item in row[key] if item['name'] != 'HairTipResponse']
+    proof = row['collection_semantic_v1']
+    for group in proof['groups']:
+        if group['name'] == 'SimVertices3D':
+            old = len(group['attributes'])
+            group['attributes'] = [item for item in group['attributes'] if item['name'] != 'HairTipResponse']
+            removed = old - len(group['attributes'])
+            group['attribute_count'] -= removed
+            proof['attribute_count'] -= removed
+    return result
+
+
+def _install_response_map(unreal, asset, record, packet, audit, *, anchor_name='GuideOwnG', owned_existing=False):
+    """Bake actual imported R, then check every value against exact source IDs.
+
+    A standard WeightMap publishes this data in the immutable binding. No
+    material, physical coefficient, G mask or render embedding is rewritten.
+    """
+    if validate_response_mask(packet) is None:
+        return audit
+    ownership = normalize_ownership(audit['collections'][0]['built_mapping'], packet)
+    expected = ownership['sim_response_mask']['values']
+    graph, call, structure, nodes, infos = _graph(unreal, asset)
+    names = _asset_weight_map_names(asset, graph, call, infos, structure['connections'],
+        read_native=lambda: _native(unreal.CodexClothToolsLibrary.dump_dataflow_nodes(graph.get_path_name())))
+    if owned_existing:
+        if (infos.get(RESPONSE_NODE_NAME, {}).get('type') != 'FChaosClothAssetWeightMapNode' or
+                names.get(RESPONSE_NODE_NAME) != 'HairTipResponse' or
+                [name for name, value in names.items() if value == 'HairTipResponse'] != [RESPONSE_NODE_NAME]):
+            raise ValueError('Owned response node is not the unique standard simulation R map')
+    elif RESPONSE_NODE_NAME in nodes or 'HairTipResponse' in names.values():
+        raise ValueError('Physics template already authors the reserved HairTipResponse map')
+    native_bake = getattr(unreal.CodexClothToolsLibrary, 'bake_vertex_color_weight_map', None)
+    if not callable(native_bake):
+        raise RuntimeError('The native imported vertex-color reader is not loaded')
+    outgoing = [edge for edge in structure['connections']
+                if edge['fromNode'] == anchor_name and edge['fromPin'] == 'Collection']
+    if owned_existing:
+        if (len(outgoing) != 1 or outgoing[0]['toNode'] != RESPONSE_NODE_NAME or
+                outgoing[0]['toPin'] != 'Collection'):
+            raise ValueError('Owned response node is no longer directly after its generated import')
+        outgoing = [edge for edge in structure['connections'] if edge['fromNode'] == RESPONSE_NODE_NAME]
+    regular_route = len(outgoing) == 1 and outgoing[0]['toPin'] == 'Collection'
+    terminal_indices = [re.fullmatch(r'CollectionLods\[(\d+)\]', edge['toPin']) for edge in outgoing]
+    terminal_route = (bool(outgoing) and all(terminal_indices) and
+        len({edge['toNode'] for edge in outgoing}) == 1 and
+        'TerminalNode' in infos.get(outgoing[0]['toNode'], {}).get('type', '') and
+        sorted(int(match[1]) for match in terminal_indices) == list(range(len(outgoing))))
+    if not regular_route and not terminal_route:
+        raise ValueError('Response mask requires one generated Collection route or all contiguous pins of one Cloth terminal')
+    if not owned_existing:
+        new_node = call('AddNode', graph, 'FChaosClothAssetWeightMapNode', RESPONSE_NODE_NAME,
+            json.dumps({'OutputName': {'StringValue': 'HairTipResponse'}, 'MeshTarget': 'Simulation',
+                        'MapOverrideType': 'ReplaceAll', 'InputName': {'StringValue': ''},
+                        'VertexWeights': [0.] * len(expected)}), -450, 350)
+        if not new_node:
+            raise RuntimeError('Could not create the simulation response WeightMap')
+        for edge in outgoing:
+            call('DisconnectNodePins', nodes[anchor_name], 'Collection', nodes[edge['toNode']], edge['toPin'])
+        if not call('ConnectNodePins', nodes[anchor_name], 'Collection', new_node, 'Collection'):
+            raise RuntimeError('Could not connect the simulation response map')
+        for edge in outgoing:
+            if not call('ConnectNodePins', new_node, 'Collection', nodes[edge['toNode']], edge['toPin']):
+                raise RuntimeError('Could not connect the simulation response map')
+    receipt = _native(native_bake(asset.get_path_name(), record['sim_asset_path'], RESPONSE_NODE_NAME,
+                                 'Red', 1.0, False, True))
+    if (receipt.get('apply_changes') is not True or receipt.get('color_channel') != 'Red' or
+            receipt.get('source_kind') != 'SkeletalMeshImportedModel' or
+            receipt.get('active_snapshot_deactivated') is not True or
+            receipt.get('unmatched_sim_vertices') != 0 or receipt.get('sim_vertices_3d') != len(expected)):
+        raise RuntimeError('Native response-mask import did not produce a complete verified write')
+    actual = _native_weight_values(_native(unreal.CodexClothToolsLibrary.dump_dataflow_nodes(
+        graph.get_path_name())), RESPONSE_NODE_NAME)
+    if len(actual) != len(expected) or any(not math.isfinite(value) or abs(value - wanted) > 1e-6
+                                           for value, wanted in zip(actual, expected)):
+        raise RuntimeError('Imported simulation R differs from the authored response manifest')
+    updated = _native(unreal.CodexClothToolsLibrary.dump_cloth_collection_colors(asset.get_path_name()))
+    if owned_existing:
+        _verify_published_collection(_without_response_collection(updated),
+            _without_response_collection(audit)['collections'][0], set(), packet)
+    else:
+        _verify_published_collection(updated, audit['collections'][0], {'HairTipResponse'}, packet)
+    exact = _verify_response_float32(unreal, asset, expected)
+    updated['response_mask_import'] = dict(RESPONSE_MASK_CONTRACT, present=True,
+        source_mesh=record['sim_asset_path'], full_values_verified=True, vertex_count=len(actual),
+        maximum_error=0., graph_text_maximum_rounding_error=max((abs(a-b) for a,b in zip(actual, expected)), default=0.), native=receipt,
+        expected_unorm8_sha256=hashlib.sha256(bytes(round(v * 255.) for v in expected)).hexdigest(),
+        imported_unorm8_sha256=hashlib.sha256(bytes(round(v * 255.) for v in actual)).hexdigest(),
+        expected_float32_sha256=exact['float32_sha256'], imported_float32_sha256=exact['float32_sha256'],
+        native_array_sha256=exact['native_array_sha256'], native_array_count=exact['native_array_count'])
+    return updated
+
+
+def _response_from_frozen_source(unreal, frozen, path, created, record, packet, audit):
+    """Import the saved G collection so R baking cannot rerun the mesh merge.
+
+    The native merge's new resizing buffers can be uninitialized when its
+    input has no resizing data. Keep every existing typed value, including
+    those buffers, and prove the immutable import before adding the R map.
+    """
+    if unreal.EditorAssetLibrary.does_asset_exist(path):
+        raise ValueError('Response source destination already exists: ' + path)
+    created.append(path)
+    asset = unreal.EditorAssetLibrary.duplicate_asset(_path(frozen.get_path_name()), path)
+    if not asset or _path(asset.get_path_name()) != path:
+        raise RuntimeError('Could not duplicate the verified immutable source')
+    isolation = _independent_graph(unreal, asset)
+    if isolation:
+        created.insert(len(created) - 1, isolation['path'])
+    graph, call, structure, nodes, infos = _graph(unreal, asset)
+    terminals = [name for name, info in infos.items() if 'TerminalNode' in info['type']]
+    if len(terminals) != 1:
+        raise ValueError('Immutable response source requires one terminal')
+    terminal = terminals[0]
+    for name, node in nodes.items():
+        if name != terminal:
+            call('RemoveNode', graph, node)
+    imported = call('AddNode', graph, 'FChaosClothAssetImportNode', 'GuideOwnG',
+        json.dumps({'ClothAsset': _path(frozen.get_path_name()), 'ImportLod': 0}), -600, 0)
+    if not imported:
+        raise RuntimeError('Could not create the immutable G collection import')
+    for pin in infos[terminal]['inputPins']:
+        if pin['name'].startswith('CollectionLods['):
+            if not call('ConnectNodePins', imported, 'Collection', nodes[terminal], pin['name']):
+                raise RuntimeError('Could not connect the immutable G collection')
+    unreal.DataflowBlueprintLibrary.evaluate_terminal_node_by_name(graph, terminal, asset)
+    imported_audit = _native(unreal.CodexClothToolsLibrary.dump_cloth_collection_colors(path))
+    _verify_published_collection(imported_audit, audit['collections'][0], set(), packet)
+    result = _install_response_map(unreal, asset, record, packet, imported_audit)
+    _save_cloth(unreal, asset, 'Could not save the verified response source')
+    result['geometry_input_asset_path'] = _path(frozen.get_path_name())
+    result['source_request_assets'] = list(created)
+    return asset, result
+
+
 def _build_source_impl(unreal, record, path, created, packet=None):
+    response_path = path
+    has_response = packet is not None and validate_response_mask(packet) is not None
+    if has_response:
+        path += '_GeometryInput'
     if unreal.EditorAssetLibrary.does_asset_exist(path):
         raise ValueError("Cloth build destination already exists: " + path)
     created.append(path)
@@ -763,6 +994,8 @@ def _build_source_impl(unreal, record, path, created, packet=None):
         collection_sources=set(chain) - set(config))
     map_names = _asset_weight_map_names(asset, graph, call, infos, structure['connections'],
         read_native=lambda: _native(unreal.CodexClothToolsLibrary.dump_dataflow_nodes(graph.get_path_name())))
+    if has_response and (RESPONSE_NODE_NAME in nodes or 'HairTipResponse' in map_names.values()):
+        raise ValueError('Physics template already authors the reserved HairTipResponse map')
     response_names = _native_response_attributes(infos, structure['connections'], set(config) | dependencies,
                                                 set(config), effective_map_names=map_names)
     _selection_weight_map_attributes(infos, structure['connections'], set(config) | dependencies, response_names)
@@ -829,6 +1062,8 @@ def _build_source_impl(unreal, record, path, created, packet=None):
         # its input map untouched. No source build is saved on that failure.
         normalize_ownership(audit['collections'][0]['built_mapping'], packet)
     _save_cloth(unreal, asset, "Could not save the cloth build source")
+    if has_response:
+        asset, audit = _response_from_frozen_source(unreal, asset, response_path, created, record, packet, audit)
     return asset, audit
 
 
@@ -936,7 +1171,7 @@ def _guide_identity_rows(packet, owner):
 
 
 
-def _transfer_unchanged_simulation_map(old, new, values):
+def _transfer_unchanged_simulation_map(old, new, values, *, new_vertex_defaults=None):
     """Transfer paint only through unchanged positions AND triangle support.
 
     Import order and omitted whole render-only guides may differ. Coincident
@@ -944,13 +1179,21 @@ def _transfer_unchanged_simulation_map(old, new, values):
     This does not interpolate paint onto edited geometry or search for guides.
     """
     tolerance = 0.0001  # Same centimeter contract as native ownership validation.
+    defaults = dict(new_vertex_defaults or {})
+    if any(type(i) is not int or not 0 <= i < len(new['sim_positions'])
+           or type(v) not in (float, int) or not math.isfinite(v) or not 0 <= v <= 1
+           for i, v in defaults.items()):
+        raise ValueError('Invalid explicit new-source vertex defaults')
     buckets = defaultdict(list)
     def key(position):
         return tuple(math.floor(float(x) / tolerance) for x in position)
     for index, position in enumerate(old['sim_positions']):
         buckets[key(position)].append(index)
     candidates = []
-    for position in new['sim_positions']:
+    for new_index, position in enumerate(new['sim_positions']):
+        if new_index in defaults:
+            candidates.append(set())
+            continue
         center = key(position)
         matches = set()
         for delta in itertools.product((-1, 0, 1), repeat=3):
@@ -965,25 +1208,98 @@ def _transfer_unchanged_simulation_map(old, new, values):
     for triangle in old['sim_triangles']:
         for index in triangle:
             incident[index].append(triangle)
+    retained_triangle_support = set()
     for triangle in new['sim_triangles']:
+        if any(i in defaults for i in triangle):
+            if not all(i in defaults for i in triangle):
+                raise ValueError('A new-source triangle crosses retained artist paint')
+            continue
         valid = [set(), set(), set()]
         for a in candidates[triangle[0]]:
             for previous in incident[a]:
                 for ordered in itertools.permutations(previous):
                     if ordered[0] == a and all(ordered[j] in candidates[triangle[j]] for j in (1, 2)):
+                        retained_triangle_support.add(tuple(sorted(previous)))
                         for j in range(3):
                             valid[j].add(ordered[j])
         if any(not support for support in valid):
             raise ValueError('WeightMap simulation triangle support changed')
         for j in range(3):
             candidates[triangle[j]].intersection_update(valid[j])
+    if defaults and set().union(*candidates) != set(range(len(old['sim_positions']))):
+        raise ValueError('New sources must retain every original painted vertex and its triangle support')
+    if defaults and retained_triangle_support != {tuple(sorted(t)) for t in old['sim_triangles']}:
+        raise ValueError('New sources must retain every original painted triangle support')
     transferred = []
-    for matches in candidates:
+    for index, matches in enumerate(candidates):
+        if index in defaults:
+            transferred.append(float(defaults[index]))
+            continue
         painted = {values[index] for index in matches}
         if len(painted) != 1:
             raise ValueError('WeightMap source correspondence is ambiguous')
         transferred.append(painted.pop())
     return transferred
+
+
+def _new_source_map_defaults(packet, ownership, map_name):
+    contract = (packet or {}).get('new_source_weight_map_defaults')
+    if contract is None:
+        return {}
+    if (not isinstance(contract, dict) or contract.get('version') != 1
+            or contract.get('policy') != 'initialize_new_sources_only'):
+        raise ValueError('Unsupported new-source map initialization')
+    reference = contract.get('reference_asset_sha256', '')
+    sources, maps = contract.get('source_identities'), contract.get('weight_maps')
+    if (not isinstance(reference, str) or re.fullmatch(r'[0-9a-f]{64}', reference) is None
+            or not isinstance(sources, list) or not sources
+            or any(not isinstance(s, str) or not s for s in sources) or len(set(sources)) != len(sources)
+            or not isinstance(maps, dict) or not maps
+            or any(not isinstance(k, str) or not k or k in {'MaxDistance', 'CodexParentForceKey'}
+                   or type(v) not in (float, int) or not math.isfinite(v) or not 0 <= v <= 1
+                   for k, v in maps.items())):
+        raise ValueError('Invalid explicit new-source map defaults')
+    by_gid = {int(p['gid']): p.get('source_identity', p['source_guide']) for p in packet['parts']}
+    if not set(sources) <= set(by_gid.values()):
+        raise ValueError('Declared new sources are absent from the actual packet')
+    if map_name not in maps:
+        return {}
+    if ownership is None:
+        raise ValueError('New-source defaults require verified generator ownership')
+    result = {i: float(maps[map_name]) for i, gid in enumerate(ownership['sim_guide_ids'])
+              if by_gid.get(int(gid)) in sources}
+    if not result:
+        raise ValueError('Declared new sources have no imported vertices')
+    return result
+
+
+def _stored_weight_values(node, *, require_native=False):
+    values = node.get('vertex_weights_native')
+    if values is None:
+        if require_native:
+            raise ValueError('New sources require full-precision native artist paint')
+        values = [float(v) for v in node['props']['VertexWeights'].strip('()').split(',') if v]
+    if not isinstance(values, list) or any(type(v) not in (float, int) or not math.isfinite(v) for v in values):
+        raise ValueError('Incomplete native artist weight array')
+    return [float(v) for v in values]
+
+
+def _reference_artist_weight_values(reference, native, exported_text):
+    """Accept a lossless reference only when the current native full map agrees."""
+    values = reference.get('float32_values') if isinstance(reference, dict) else None
+    if (not isinstance(values, list) or len(values) != native.get('count')
+            or native.get('non_finite_count') != 0
+            or any(type(v) not in (int, float) or not math.isfinite(v) for v in values)):
+        raise ValueError('Incomplete full-precision artist map reference')
+    raw = struct.pack('<' + 'f' * len(values), *values)
+    digest = hashlib.sha256(struct.pack('<i', len(values)) + raw).hexdigest()
+    if reference.get('sha256') != digest or native.get('sha256') != digest:
+        raise ValueError('Artist map reference differs from the current full native array')
+    actual = list(struct.unpack('<' + 'f' * len(values), raw))
+    text = [float(v) for v in exported_text.strip('()').split(',') if v]
+    if len(text) != len(actual) or any(abs(a-b) > .500001e-6 for a,b in zip(actual,text)):
+        raise ValueError('Artist map reference differs from its active node')
+    return actual
 
 
 def _same_painted_vertex_support(old_faces, new_faces):
@@ -1216,7 +1532,8 @@ def _weight_map_updates(full_graph, old, new, packet, ownership, *, effective_ma
         if (props.get('MeshTarget') != 'Simulation' or props.get('MapOverrideType') != 'ReplaceAll'
                 or props.get('Snapshots') != '(ActiveSnapshot=-1)' or props.get('bIsFrozen') != 'False'):
             raise ValueError('Unsupported authored WeightMap state: ' + node['name'])
-        values = [float(v) for v in props['VertexWeights'].strip('()').split(',') if v]
+        new_defaults = _new_source_map_defaults(packet, ownership, effective_map_names.get(node['name']))
+        values = _stored_weight_values(node, require_native=bool(new_defaults))
         if len(values) != old_count or any(not math.isfinite(v) for v in values):
             raise ValueError('Incomplete authored WeightMap: ' + node['name'])
         name = effective_map_names.get(node['name'])
@@ -1251,7 +1568,8 @@ def _weight_map_updates(full_graph, old, new, packet, ownership, *, effective_ma
                 weights = [values[a]*(1.-t)+values[b]*t
                            for a,b,t in (paint_correspondence[i] for i in range(new_count))]
             else:
-                weights = _transfer_unchanged_simulation_map(old_native, new_native, values)
+                weights = _transfer_unchanged_simulation_map(old_native, new_native, values,
+                    new_vertex_defaults=new_defaults)
         if len(weights) != new_count:
             raise ValueError('WeightMap vertex count differs from the rebuilt simulation')
         updates[node['name']] = (name, values, weights)
@@ -1346,13 +1664,77 @@ def _publication_collection_view(collection, expected, added_names, packet=None)
     return compared, expected_collection
 
 
+def _semantic_mismatch_details(expected, actual, max_entries=8, max_chars=3072):
+    """Bounded leaf diagnostics from the already normalized native proofs.
+
+    Hashes stay opaque; no geometry/weight arrays are included, and no
+    attribute is excluded from the comparison to produce this diagnostic.
+    """
+    changes, total = [], 0
+
+    def scalar(value):
+        if isinstance(value, str):
+            return value if len(value) <= 96 else value[:93] + '...'
+        return value if value is None or type(value) in (bool, int, float) else '<non-scalar>'
+
+    def add(row):
+        nonlocal total
+        total += 1
+        if len(changes) < max_entries:
+            changes.append(row)
+
+    old_groups = {row['name']: row for row in expected.get('groups', [])}
+    new_groups = {row['name']: row for row in actual.get('groups', [])}
+    if expected.get('algorithm') != actual.get('algorithm'):
+        add({'path': 'algorithm', 'expected': scalar(expected.get('algorithm')),
+             'actual': scalar(actual.get('algorithm'))})
+    for name in sorted(old_groups.keys() | new_groups.keys()):
+        old, new = old_groups.get(name), new_groups.get(name)
+        path = str(name)[:192]
+        if old is None or new is None:
+            add({'path': path, 'field': 'group_present', 'expected': old is not None,
+                 'actual': new is not None})
+        elif old['count'] != new['count']:
+            add({'path': path, 'field': 'count', 'expected': old['count'], 'actual': new['count']})
+        old_attrs = {row['name']: row for row in (old or {}).get('attributes', [])}
+        new_attrs = {row['name']: row for row in (new or {}).get('attributes', [])}
+        for attr_name in sorted(old_attrs.keys() | new_attrs.keys()):
+            before, after = old_attrs.get(attr_name), new_attrs.get(attr_name)
+            if before == after:
+                continue
+            entry = {'path': (str(name) + '.' + str(attr_name))[:192],
+                     'expected_hash': (before or {}).get('blake3'),
+                     'actual_hash': (after or {}).get('blake3')}
+            if before is None or after is None:
+                entry['attribute_present'] = {'expected': before is not None, 'actual': after is not None}
+            metadata = {key: {'expected': scalar((before or {}).get(key)),
+                              'actual': scalar((after or {}).get(key))}
+                        for key in sorted((before or {}).keys() | (after or {}).keys())
+                        if key not in ('name', 'blake3') and (before or {}).get(key) != (after or {}).get(key)}
+            if metadata:
+                entry['metadata'] = metadata
+            add(entry)
+    result = {'changed_entries': total, 'shown_entries': len(changes), 'changes': changes,
+              'truncated': len(changes) < total}
+    while changes and len(json.dumps(result, ensure_ascii=False, separators=(',', ':'))) > max_chars:
+        changes.pop()
+        result['shown_entries'] = len(changes)
+        result['truncated'] = True
+    return result
+
+
 def _verify_published_collection(actual, expected, added_names, packet=None):
     compared, expected_collection = _publication_collection_view(
         actual['collections'][0], expected, added_names, packet)
     if compared != expected_collection:
         changed = sorted(key for key in set(compared) | set(expected_collection)
                          if compared.get(key) != expected_collection.get(key))
-        raise RuntimeError('Published cloth differs from its verified collection: ' + ', '.join(changed))
+        message = 'Published cloth differs from its verified collection: ' + ', '.join(changed)
+        key = 'collection_semantic_v1'
+        if key in changed and key in compared and key in expected_collection:
+            detail = _semantic_mismatch_details(expected_collection[key], compared[key])
+            message += '; semantic_delta=' + json.dumps(detail, ensure_ascii=False, separators=(',', ':'))
+        raise RuntimeError(message)
 
 
 def _verify_physics_derivation(actual, binding, packet=None, added_names=()):
@@ -1566,6 +1948,9 @@ def _publish_impl(unreal, source_asset, binding_path, target, owner, content, pa
         old_content = unreal.EditorAssetLibrary.get_metadata_tag(final, CONTENT)
         old_binding = unreal.EditorAssetLibrary.get_metadata_tag(final, binding_key)
         old_source_maximum = unreal.EditorAssetLibrary.get_metadata_tag(final, SOURCE_MAXIMUM)
+        initialization = packet.get('new_source_weight_map_defaults') if packet else None
+        if initialization is not None and _asset_disk_sha(unreal, target) != initialization.get('reference_asset_sha256'):
+            raise ValueError('New-source initialization reference differs from the protected original asset')
         baked_maps = json.loads(unreal.EditorAssetLibrary.get_metadata_tag(final, NATIVE_DERIVED_MAPS) or '[]')
         if not isinstance(baked_maps, list) or any(not isinstance(name, str) for name in baked_maps):
             raise ValueError('Existing cloth has invalid generated-map ownership metadata')
@@ -1614,6 +1999,10 @@ def _publish_impl(unreal, source_asset, binding_path, target, owner, content, pa
             raise ValueError('Existing cloth graph has user changes: disconnected configuration branch')
         map_names = _asset_weight_map_names(final, fg, fc, fi, fs['connections'],
             read_native=lambda: _native(unreal.CodexClothToolsLibrary.dump_dataflow_nodes(fg.get_path_name())))
+        if initialization is not None and not set(initialization['weight_maps']) <= set(map_names.values()):
+            raise ValueError('New-source defaults refer to absent artist maps')
+        if packet is not None and validate_response_mask(packet) is not None and 'HairTipResponse' in map_names.values():
+            raise ValueError('Artist-authored HairTipResponse overrides the imported source mask')
         response_attributes = _native_response_attributes(fi, fs['connections'], configs - parked, visited,
                                                           effective_map_names=map_names)
         protected_maps = set(response_attributes) | set(map_names.values())
@@ -1638,6 +2027,16 @@ def _publish_impl(unreal, source_asset, binding_path, target, owner, content, pa
         if any(fi[n]['type'] == 'FChaosClothAssetWeightMapNode' for n in configs):
             full_graph = _native(unreal.CodexClothToolsLibrary.dump_dataflow_nodes(fg.get_path_name()))
             old_collection = _native(unreal.CodexClothToolsLibrary.dump_cloth_collection_colors(target))
+            if initialization is not None:
+                reference_maps = initialization.get('reference_weight_maps', {})
+                native_maps = _native(unreal.CodexGarmentWindAuditLibrary.audit_asset(final))['models'][0]['lods'][0]['weight_maps']
+                for node in full_graph['nodes']:
+                    name = map_names.get(node['name'])
+                    if node['type'] == 'FChaosClothAssetWeightMapNode' and name in initialization.get('weight_maps', {}):
+                        if name not in reference_maps or name not in native_maps:
+                            raise ValueError('New sources require the current exact artist map reference')
+                        node['vertex_weights_native'] = _reference_artist_weight_values(
+                            reference_maps[name], native_maps[name], node['props']['VertexWeights'])
             maps = _weight_map_updates(full_graph, old_collection['collections'][0],
                                        before['collections'][0], packet, ownership, effective_map_names=map_names)
         # Older published graphs inherit their verified G/MaxDistance data from
@@ -1799,10 +2198,13 @@ def _build_in_editor(record, output_directory, created, committed):
     build_folder = folder + "/HairGuideCloth/" + stem + "/" + revision
     source_path, binding_path = build_folder + "/CA_BuildSource", build_folder + "/CA_BindingData"
     source, initial = _build_source(unreal, record, source_path, packet)
-    source_graph = _graph(unreal, source)[0]
-    if not _graph_owned_by(source_graph, source):
-        created.append(_path(source_graph.get_path_name()))
-    created.append(source_path)
+    if initial.get('source_request_assets'):
+        created.extend(initial['source_request_assets'])
+    else:
+        source_graph = _graph(unreal, source)[0]
+        if not _graph_owned_by(source_graph, source):
+            created.append(_path(source_graph.get_path_name()))
+        created.append(source_path)
     ownership = normalize_ownership(initial["collections"][0]["built_mapping"], packet)
     # Sharing a USkeleton does not guarantee identical imported reference-pose
     # scales. The native helper uses the actual leader's reference skeleton,
@@ -1840,6 +2242,9 @@ def _build_in_editor(record, output_directory, created, committed):
                "authored_weight_map_transfer": packet.get('weight_map_transfer'),
                "source_ribbon_paint_transfer": packet.get('source_ribbon_paint_transfer'),
                "native_binding": repaired}
+    if initial.get('response_mask_import') is not None:
+        receipt['response_mask'] = initial['response_mask_import']
+        receipt['geometry_input_asset_path'] = initial['geometry_input_asset_path']
     if final.get("staging_cleanup_warning"):
         receipt["staging_cleanup_warning"] = final["staging_cleanup_warning"]
     (output / "receipt.json").write_text(json.dumps(receipt, indent=2), encoding="utf8")
@@ -1896,6 +2301,12 @@ def _refresh_live_components(record, final=None):
             cloth = next((c for c in actor.get_components_by_class(unreal.ChaosClothComponent)
                           if c.get_name() == cloth_name), None)
             if cloth is None:
+                continue
+            # Native collision-pose views expose a skinned asset through
+            # GetAsset, but do not author the Cloth Asset property. Only
+            # configured Cloth components participate in artist refresh;
+            # assigning Asset to a pose view would activate another simulation.
+            if cloth.get_editor_property('asset') is None:
                 continue
             asset = cloth.get_asset()
             if not asset:
@@ -2005,6 +2416,121 @@ def _refresh_live_components(record, final=None):
     return rows
 
 
+def _response_graph_unchanged(before, after, anchor, existing):
+    """Keep every original node property/GUID and all unrelated pin links."""
+    left, right = json.loads(json.dumps(before)), json.loads(json.dumps(after))
+    for value in (left, right):
+        for key in ('nodes', 'native_nodes'):
+            value[key] = [row for row in value[key] if row['name'] != RESPONSE_NODE_NAME]
+        value['infos'].pop(RESPONSE_NODE_NAME, None)
+    if not existing:
+        old_edges = [edge for edge in left['connections'] if edge['fromNode'] == anchor]
+        new_edges = [edge for edge in right['connections']
+                     if edge['fromNode'] == RESPONSE_NODE_NAME or edge['toNode'] == RESPONSE_NODE_NAME]
+        shape = lambda edge: (edge['fromNode'], edge['fromPin'], edge['toNode'], edge['toPin'])
+        expected = {(anchor, 'Collection', RESPONSE_NODE_NAME, 'Collection')} | {
+            (RESPONSE_NODE_NAME, 'Collection', edge['toNode'], edge['toPin']) for edge in old_edges}
+        if len(new_edges) != len(expected) or {shape(edge) for edge in new_edges} != expected:
+            raise RuntimeError('R-only update changed the original Collection route')
+        left['connections'] = [edge for edge in left['connections'] if edge not in old_edges]
+        right['connections'] = [edge for edge in right['connections'] if edge not in new_edges]
+    if left != right:
+        raise RuntimeError('R-only update changed an original graph node, variable or pin connection')
+
+
+def _asset_disk_sha(unreal, path):
+    project = Path(unreal.Paths.convert_relative_path_to_full(unreal.Paths.get_project_file_path())).resolve().parent
+    return _sha(project / 'Content' / (_path(path).removeprefix('/Game/') + '.uasset'))
+
+
+def _apply_response_only(unreal, record, packet, current):
+    """Add/update R in the existing owned graph without rebuilding its binding."""
+    if not current or validate_response_mask(packet) is None:
+        raise ValueError('R-only update requires an existing owned Cloth and explicit simulation R')
+    graph, call, structure, nodes, infos = _graph(unreal, current)
+    if not _graph_owned_by(graph, current):
+        raise ValueError('R-only update requires the existing embedded Dataflow')
+    anchor = 'GeneratorBindings'
+    if infos.get(anchor, {}).get('type') != 'FChaosClothAssetImportNode':
+        raise ValueError('R-only update needs the original GeneratorBindings import')
+    before = _native(unreal.CodexClothToolsLibrary.dump_cloth_collection_colors(current.get_path_name()))
+    if len(before['collections']) != 1:
+        raise ValueError('R-only update requires the existing single LOD')
+    ownership = normalize_ownership(before['collections'][0]['built_mapping'], packet)
+    original_graph = _graph_snapshot(unreal, current)
+    original_metadata = {key: unreal.EditorAssetLibrary.get_metadata_tag(current, key)
+                         for key in (OWNER, CONTENT, NATIVE_DERIVED_MAPS, SOURCE_MAXIMUM,
+                                     'Send2UE.HairGuideCloth.BindingData', RESPONSE_OWNER)}
+    render_sha = _asset_disk_sha(unreal, record['render_asset_path'])
+    existing = RESPONSE_NODE_NAME in nodes
+    old_values = None
+    if existing:
+        if original_metadata[RESPONSE_OWNER] != infos[RESPONSE_NODE_NAME]['guid']:
+            raise ValueError('Existing response node has no exact generator ownership')
+        text = _native_weight_values({'nodes': original_graph['native_nodes']}, RESPONSE_NODE_NAME)
+        old_values = [round(value * 255.) / 255. for value in text]
+        # Recover exact old unorm8->float32 values only after native bit proof.
+        _verify_response_float32(unreal, current, old_values)
+    elif original_metadata[RESPONSE_OWNER]:
+        raise ValueError('Response ownership metadata has no matching native node')
+    try:
+        updated = _install_response_map(unreal, current, record, packet, before,
+            anchor_name=anchor, owned_existing=existing)
+        _response_graph_unchanged(original_graph, _graph_snapshot(unreal, current), anchor, existing)
+        if _asset_disk_sha(unreal, record['render_asset_path']) != render_sha:
+            raise RuntimeError('R-only update changed the render package')
+        # The import target was already written by native Send2UE. Save it even
+        # though neither the render nor immutable binding is republished.
+        if not unreal.EditorAssetLibrary.save_loaded_asset(unreal.load_asset(record['sim_asset_path'])):
+            raise RuntimeError('Imported R simulation mesh could not be saved')
+        infos = _graph(unreal, current)[4]
+        maps = json.loads(original_metadata[NATIVE_DERIVED_MAPS] or '[]')
+        unreal.EditorAssetLibrary.set_metadata_tag(current, NATIVE_DERIVED_MAPS,
+            json.dumps(sorted(set(maps) | {'HairTipResponse'})))
+        unreal.EditorAssetLibrary.set_metadata_tag(current, CONTENT, record['manifest_sha256'])
+        unreal.EditorAssetLibrary.set_metadata_tag(current, RESPONSE_OWNER, infos[RESPONSE_NODE_NAME]['guid'])
+        _save_cloth(unreal, current, 'R-only Cloth update could not be saved')
+    except Exception as error:
+        try:
+            graph, call, state, current_nodes, current_infos = _graph(unreal, current)
+            if existing:
+                call('UpdateNode', current_nodes[RESPONSE_NODE_NAME], json.dumps({'VertexWeights': old_values}))
+            elif RESPONSE_NODE_NAME in current_nodes:
+                call('RemoveNode', graph, current_nodes[RESPONSE_NODE_NAME])
+                for edge in structure['connections']:
+                    if edge['fromNode'] == anchor and not call('ConnectNodePins', current_nodes[anchor],
+                            edge['fromPin'], current_nodes[edge['toNode']], edge['toPin']):
+                        raise RuntimeError('Could not restore original binding route')
+            terminals = [name for name, info in current_infos.items() if 'TerminalNode' in info['type']]
+            if len(terminals) != 1:
+                raise RuntimeError('Could not identify original Cloth terminal')
+            unreal.DataflowBlueprintLibrary.evaluate_terminal_node_by_name(graph, terminals[0], current)
+            restored = _native(unreal.CodexClothToolsLibrary.dump_cloth_collection_colors(current.get_path_name()))
+            _verify_published_collection(restored, before['collections'][0], set(), packet)
+            if _graph_snapshot(unreal, current) != original_graph:
+                raise RuntimeError('Original graph could not be restored exactly')
+            for key, value in original_metadata.items():
+                if value:
+                    unreal.EditorAssetLibrary.set_metadata_tag(current, key, value)
+                else:
+                    unreal.EditorAssetLibrary.remove_metadata_tag(current, key)
+            _save_cloth(unreal, current, 'Restored original Cloth could not be saved')
+        except Exception as rollback:
+            raise _RetainDependenciesError(str(error) + '; R-only rollback failed: ' + str(rollback)) from error
+        raise
+    native = updated['collections'][0]['built_mapping']
+    return {'verified': True, 'version': record['version'], 'update_mode': 'response_only',
+        'simulation_enabled': True, 'cloth_asset_path': _path(current.get_path_name()),
+        'sim_asset_path': record['sim_asset_path'], 'render_asset_path': record['render_asset_path'],
+        'binding_asset_path': original_metadata['Send2UE.HairGuideCloth.BindingData'],
+        'manifest_sha256': record['manifest_sha256'], 'response_mask': updated['response_mask_import'],
+        'sim_vertices': len(native['sim_positions']), 'render_vertices': len(native['render_positions']),
+        'guide_count': len(set(ownership['sim_guide_ids'])), 'remesh': False,
+        'render_package_sha256': render_sha, 'source_matching': ownership['provenance']['source_matching'],
+        'original_collection_preserved': True, 'original_authored_graph_preserved': True,
+        'live_component_refresh': False, 'weight_source': 'simulation_source_own_g'}
+
+
 def _apply_hair_guide_cloth(record):
     """Ordinary Send2UE post-import entry. Require a completed verified receipt."""
     import unreal
@@ -2047,7 +2573,11 @@ def _apply_hair_guide_cloth(record):
         graph = asset.get_editor_property("dataflow_instance").get_editor_property("dataflow_asset")
         if graph and _path(graph.get_path_name()) in dirty:
             raise ValueError("Cloth Dataflow has unsaved edits; save it before Send to Unreal: " + graph.get_path_name())
-    for asset in assets[:2]:
+    if record.get('update_mode') == 'response_only':
+        return _apply_response_only(unreal, record, packet, current)
+    simulation_only = record.get('update_mode') == 'simulation_only'
+    render_sha = _asset_disk_sha(unreal, record['render_asset_path']) if simulation_only else None
+    for asset in assets[:1] if simulation_only else assets[:2]:
         if not unreal.EditorAssetLibrary.save_loaded_asset(asset):
             raise RuntimeError("Imported hair mesh could not be saved")
     project = Path(unreal.Paths.convert_relative_path_to_full(unreal.Paths.get_project_file_path())).resolve()
@@ -2065,6 +2595,10 @@ def _apply_hair_guide_cloth(record):
             unreal.EditorAssetLibrary.get_metadata_tag(final, "Send2UE.HairGuideCloth.BindingData") != receipt["binding_asset_path"]):
         raise RuntimeError("The editor still has an older cloth result loaded")
     receipt["live_components"] = _refresh_live_components(record, final)
+    if simulation_only:
+        if _asset_disk_sha(unreal, record['render_asset_path']) != render_sha:
+            raise RuntimeError('Simulation-only update changed the original render package')
+        receipt.update(update_mode='simulation_only', render_package_sha256=render_sha)
     return receipt
 
 

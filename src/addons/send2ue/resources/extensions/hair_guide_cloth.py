@@ -70,6 +70,10 @@ class HairGuideClothExtension(ExtensionBase):
             hair_guide_cloth.diagnostic(asset_data.get('asset_path', ''), str(error))
             raise RuntimeError('Hair Guide Cloth export failed: ' + str(error)) from error
 
+    def pre_import(self, asset_data, properties):
+        if self.enabled:
+            hair_guide_cloth.prepare_response_only_import(asset_data)
+
     def post_import(self, asset_data, properties):
         if not self.enabled:
             return
