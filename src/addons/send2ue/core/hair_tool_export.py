@@ -2,11 +2,12 @@
 
 import json
 import math
+import re
 import sys
 
 import bpy
-from mathutils import Matrix
-from . import armature_modifier_fix, utilities
+from mathutils import Euler, Matrix
+from . import armature_modifier_fix, hair_mesh_ao, utilities
 from ..constants import BlenderTypes, ToolInfo
 
 
@@ -22,8 +23,14 @@ RFAOS_NANITE_UV_RG = 'HairTool_RFAOS_RG'
 RFAOS_NANITE_UV_BA = 'HairTool_AO_SystemB'
 SYSTEM_COLOR_UV_INDEX = 1
 RFAOS_NANITE_UV_TAG = 6.0
+WHOLE_MESH_AO_UV_TAG = 8.0
+SHORT_FUR_MATERIAL = re.compile(r'^(?:mi?_)?ht_default_material_short_\d+(?:\.\d+)?$')
+EXTRA_GROWTH_SURFACE_PROPERTY = '_htue_extra_growth_surface'
+GROWTH_AO_RECEIPT_PROPERTY = '_send2ue_hair_whole_ao_growth_surfaces'
+GROWTH_AO_MIRROR_PROPERTY = '_send2ue_hair_whole_ao_growth_mirrors'
+GROWTH_AO_ATTRIBUTE = '_send2ue_hair_growth_ao'
 RFAOS_NANITE_UV_START_INDEX = 2
-RFAOS_PAYLOAD_VERSION = 5
+RFAOS_PAYLOAD_VERSION = 7
 RFAOS_MINIMUM_RANGE = 1.0 / 255.0
 CHAOS_WEIGHT_ATTRIBUTE = 'ChaosWeight'
 HAIR_PIXEL_DEPTH_OFFSET_ATTRIBUTE = 'HairPixelDepthOffset'
@@ -38,7 +45,6 @@ AO_MODIFIER_SETTING_IDS = {
     'second_bounce_factor': 'Input_15',
     'use_custom_normals': 'Socket_0',
 }
-COMBINED_MAX_RAY_DISTANCE_DEFAULT = 0.011
 
 
 def _modifier_input_group(modifier, identifier):
@@ -332,14 +338,16 @@ def _ao_statistics(mesh):
     }
 
 
-def _pack_rfaos(mesh):
-    """Pack the material PDO mask and cloth Weight into vertex color."""
+def _pack_rfaos(mesh, *, has_whole_mesh_ao=False):
+    """Pack PDO, cloth weight and whole-mesh AO into the export color layer."""
     if mesh.attributes.get(SYSTEM_COLOR_PRESENT_ATTRIBUTE) is None:
         _stamp_system_color_presence(mesh)
     random_attribute = mesh.attributes.get('Random')
     factor_attribute = mesh.attributes.get('Factor')
     system_color_attribute = mesh.attributes.get('SystemColor')
     ao_attribute = mesh.attributes.get('AO')
+    whole_ao_attribute = mesh.attributes.get(hair_mesh_ao.ATTRIBUTE) if has_whole_mesh_ao else None
+    growth_ao_attribute = mesh.attributes.get(GROWTH_AO_ATTRIBUTE) if has_whole_mesh_ao else None
     depth_attribute = mesh.attributes.get('Depth')
     chaos_weight_attribute = mesh.attributes.get(CHAOS_WEIGHT_ATTRIBUTE)
     pixel_depth_offset_attribute = mesh.attributes.get(
@@ -409,6 +417,7 @@ def _pack_rfaos(mesh):
     packed_values = []
     vertex_color_values = []
     invalid_channels = set()
+    whole_ao_covered = True
     channel_names = (
         'Random',
         'Factor',
@@ -458,6 +467,14 @@ def _pack_rfaos(mesh):
         packed = tuple(min(max(value, 0.0), 1.0) for value in packed)
         packed_values.append(packed)
 
+        encoded_growth_ao = (
+            growth_ao_attribute.data[loop_index].value if growth_ao_attribute is not None else 0.0
+        )
+        whole_ao_covered &= bool(encoded_growth_ao or whole_ao_attribute is not None)
+        whole_ao = encoded_growth_ao - 1.0 if encoded_growth_ao else _attribute_component(
+            mesh, whole_ao_attribute, loop_index,
+            loop_to_polygon=loop_to_polygon, default=1.0,
+        )
         vertex_channels = [
             _attribute_component(
                 mesh,
@@ -473,13 +490,13 @@ def _pack_rfaos(mesh):
                 loop_to_polygon=loop_to_polygon,
                 default=0.0,
             ),
-            packed[2],
+            whole_ao,
             1.0,
         ]
         vertex_channel_names = (
             HAIR_PIXEL_DEPTH_OFFSET_ATTRIBUTE,
             CHAOS_WEIGHT_ATTRIBUTE,
-            'AO vertex fallback',
+            hair_mesh_ao.ATTRIBUTE,
             'Reserved Alpha',
         )
         vertex_fallbacks = (1.0, 0.0, 1.0, 1.0)
@@ -516,7 +533,12 @@ def _pack_rfaos(mesh):
     mesh.color_attributes.active_color = mesh.color_attributes[RFAOS_NAME]
     mesh.color_attributes.render_color_index = mesh.color_attributes.find(RFAOS_NAME)
 
-    _pack_rfaos_nanite_uvs(mesh, packed_values)
+    has_whole_mesh_ao = (
+        (whole_ao_attribute is not None or growth_ao_attribute is not None)
+        and whole_ao_covered
+        and hair_mesh_ao.ATTRIBUTE not in invalid_channels
+    )
+    _pack_rfaos_nanite_uvs(mesh, packed_values, has_whole_mesh_ao)
 
 
 def _ensure_payload_uv(mesh, name, index):
@@ -566,12 +588,13 @@ def _stamp_system_color_presence(mesh):
     presence.data.foreach_set('value', [value] * len(mesh.loops))
 
 
-def _pack_rfaos_nanite_uvs(mesh, packed_values):
-    """Write the v3 Nanite-safe scalar and SystemColor RGB payload.
+def _pack_rfaos_nanite_uvs(mesh, packed_values, has_whole_mesh_ao):
+    """Write the Nanite-safe scalar and SystemColor RGB payload.
 
     UV1 stores linear SystemColor RG.
     UV2 stores tagged packed Random+Depth in U and Factor in V.
-    UV3 stores tagged AO in U and linear SystemColor B in V; absent colors
+    UV3 stores local AO in U with tag 8 when vertex B has whole-mesh AO,
+    or tag 6 when vertex B lacks the bake. V stores SystemColor B; absent colors
     use raw B=-1 (Blender V=2). Valid black, including alpha=0, stays present.
     The FBX skeletal importer applies ``V = 1 - V``, so Unreal receives the
     original G, Factor, and B values in the V components.
@@ -595,6 +618,7 @@ def _pack_rfaos_nanite_uvs(mesh, packed_values):
     presence = mesh.attributes.get(SYSTEM_COLOR_PRESENT_ATTRIBUTE)
     has_system_color = mesh.attributes.get('SystemColor') is not None
     loop_to_polygon = _loop_to_polygon_indices(mesh)
+    ao_tag = WHOLE_MESH_AO_UV_TAG if has_whole_mesh_ao else RFAOS_NANITE_UV_TAG
     for index, packed in enumerate(packed_values):
         random_value, factor, ao, depth, system_r, system_g, system_b = packed
         present = _attribute_component(
@@ -610,7 +634,7 @@ def _pack_rfaos_nanite_uvs(mesh, packed_values):
             1.0 - factor,
         )
         ba_layer.data[index].uv = (
-            RFAOS_NANITE_UV_TAG + ao,
+            ao_tag + ao,
             1.0 - system_b if present else 2.0,
         )
 
@@ -663,204 +687,6 @@ def _apply_ao_modifier_settings(modifier, ao_settings):
     for field, identifier in AO_MODIFIER_SETTING_IDS.items():
         if field in ao_settings:
             _modifier_input_set(modifier, identifier, ao_settings[field])
-
-
-def _combined_ao_node_group(source_group, ao_settings=None):
-    """Copy HT_Mesh_AO and set its unlinked ray-distance inputs safely."""
-    maximum_distance = float(
-        (ao_settings or {}).get(
-            'combined_max_ray_distance',
-            COMBINED_MAX_RAY_DISTANCE_DEFAULT,
-        )
-    )
-    temporary_group = source_group.copy()
-    temporary_group.name = '__S2U_HT_Mesh_AO'
-    adjusted_nodes = 0
-    for node in temporary_group.nodes:
-        child_group = getattr(node, 'node_tree', None)
-        if (
-            node.type != 'GROUP'
-            or child_group is None
-            or not child_group.name.startswith('AO_With_Bounces')
-        ):
-            continue
-        ray_distance = node.inputs.get('Max Ray Dist')
-        if ray_distance is None or ray_distance.is_linked:
-            continue
-        ray_distance.default_value = maximum_distance
-        adjusted_nodes += 1
-    if adjusted_nodes == 0:
-        _warn(
-            'The temporary HT_Mesh_AO copy has no adjustable '
-            'AO_With_Bounces Max Ray Dist inputs.'
-        )
-    return temporary_group
-
-
-def _evaluate_combined_ao(scene_object, state, ao_settings=None):
-    """Evaluate Hair Tool AO once on the final, joined export geometry."""
-    node_group = bpy.data.node_groups.get('HT_Mesh_AO')
-    if not node_group:
-        _warn(
-            'Hair Tool node group "HT_Mesh_AO" was not found. '
-            'Export continues with neutral AO=1.'
-        )
-        _set_neutral_ao(scene_object.data)
-        state.setdefault('ao_stats', {})[scene_object.name] = {
-            'minimum': 1.0,
-            'maximum': 1.0,
-            'source': 'combined_export_geometry',
-            'fallback': True,
-        }
-        return
-
-    original_mesh = scene_object.data
-    original_world_matrix = scene_object.matrix_world.copy()
-    world_mesh = None
-    evaluated_mesh = None
-    modifier = None
-    temporary_node_group = None
-
-    try:
-        # The input is already one realized mesh containing every final Hair
-        # Tool system in this export asset. Bake world space before AO so the
-        # ray distances match the geometry that Unreal receives.
-        world_mesh = original_mesh.copy()
-        world_mesh.transform(original_world_matrix, shape_keys=True)
-        existing_ao = world_mesh.attributes.get('AO')
-        if existing_ao:
-            world_mesh.attributes.remove(existing_ao)
-        scene_object.data = world_mesh
-        scene_object.matrix_world = Matrix.Identity(4)
-
-        temporary_node_group = _combined_ao_node_group(node_group, ao_settings)
-        modifier = scene_object.modifiers.new(name='__S2U_HAIR_AO', type='NODES')
-        modifier.node_group = temporary_node_group
-        _apply_ao_modifier_settings(modifier, ao_settings)
-        if _modifier_input_has(modifier, 'Input_7'):
-            _modifier_input_set(modifier, 'Input_7', 'AO')
-
-        depsgraph = bpy.context.evaluated_depsgraph_get()
-        depsgraph.update()
-        evaluated_object = scene_object.evaluated_get(depsgraph)
-        evaluated_mesh = bpy.data.meshes.new_from_object(evaluated_object)
-
-        # Combined AO must not change topology. A mismatch means the proxy was
-        # not the final realized export geometry and is unsafe to pack.
-        if (
-            len(evaluated_mesh.vertices) != len(world_mesh.vertices)
-            or len(evaluated_mesh.polygons) != len(world_mesh.polygons)
-        ):
-            raise RuntimeError(
-                'HT_Mesh_AO changed final joined topology: '
-                f'{len(world_mesh.vertices)}->{len(evaluated_mesh.vertices)} vertices, '
-                f'{len(world_mesh.polygons)}->{len(evaluated_mesh.polygons)} polygons'
-            )
-
-        ao_attribute = evaluated_mesh.attributes.get('AO')
-        if not ao_attribute:
-            _warn(
-                f'Hair Tool AO evaluation produced no "AO" attribute for '
-                f'"{scene_object.name}"; export continues with neutral AO=1.'
-            )
-            ao_attribute = _set_neutral_ao(evaluated_mesh)
-
-        loop_to_polygon = _loop_to_polygon_indices(evaluated_mesh)
-        ao_values = [
-            _attribute_component(
-                evaluated_mesh,
-                ao_attribute,
-                loop_index,
-                loop_to_polygon=loop_to_polygon,
-            )
-            for loop_index in range(len(evaluated_mesh.loops))
-        ]
-        invalid_ao = any(
-            not math.isfinite(value) or value < -1.0e-5 or value > 1.00001
-            for value in ao_values
-        )
-        if not ao_values or invalid_ao:
-            _warn(
-                f'Hair Tool AO evaluation produced values outside finite 0-1 '
-                f'for "{scene_object.name}"; export continues with neutral AO=1.'
-            )
-            _set_neutral_ao(evaluated_mesh)
-            ao_values = [1.0] * len(evaluated_mesh.loops)
-
-        ao_min = min(ao_values)
-        ao_max = max(ao_values)
-        ao_stats = _ao_statistics(evaluated_mesh) or {
-            'minimum': ao_min,
-            'maximum': ao_max,
-            'mean': sum(ao_values) / len(ao_values),
-        }
-        if ao_max - ao_min <= RFAOS_MINIMUM_RANGE:
-            _warn(
-                f'Hair Tool AO evaluation produced a constant value '
-                f'({ao_min:.6f}) for "{scene_object.name}". Export continues.'
-            )
-
-        evaluated_mesh.transform(original_world_matrix.inverted_safe())
-        scene_object.modifiers.remove(modifier)
-        modifier = None
-        bpy.data.node_groups.remove(temporary_node_group)
-        temporary_node_group = None
-        if original_mesh.shape_keys:
-            # AO is attribute-only. Replacing the mesh with new_from_object()
-            # would discard the evaluated expression keys baked before joining.
-            if any(
-                tuple(a.vertices) != tuple(b.vertices)
-                for a, b in zip(original_mesh.polygons, evaluated_mesh.polygons)
-            ):
-                raise RuntimeError('HT_Mesh_AO reordered shape-key topology')
-            existing_ao = original_mesh.attributes.get('AO')
-            if existing_ao:
-                original_mesh.attributes.remove(existing_ao)
-            preserved_ao = original_mesh.attributes.new('AO', 'FLOAT', 'CORNER')
-            preserved_ao.data.foreach_set('value', ao_values)
-            scene_object.data = original_mesh
-            bpy.data.meshes.remove(evaluated_mesh)
-            evaluated_mesh = None
-        else:
-            scene_object.data = evaluated_mesh
-        scene_object.matrix_world = original_world_matrix
-        state.setdefault('ao_stats', {})[scene_object.name] = {
-            **ao_stats,
-            'source': 'combined_export_geometry',
-            'vertices': len(scene_object.data.vertices),
-            'polygons': len(scene_object.data.polygons),
-            'fallback': False,
-        }
-        state['temporary_mesh_names'].add(scene_object.data.name)
-        evaluated_mesh = None
-
-        if original_mesh.users == 0:
-            bpy.data.meshes.remove(original_mesh)
-        if world_mesh.users == 0:
-            bpy.data.meshes.remove(world_mesh)
-        world_mesh = None
-    except Exception as error:
-        if modifier and modifier.name in scene_object.modifiers:
-            scene_object.modifiers.remove(modifier)
-        if temporary_node_group and temporary_node_group.users == 0:
-            bpy.data.node_groups.remove(temporary_node_group)
-        scene_object.data = original_mesh
-        scene_object.matrix_world = original_world_matrix
-        for mesh in (evaluated_mesh, world_mesh):
-            if mesh and mesh.users == 0:
-                bpy.data.meshes.remove(mesh)
-        _set_neutral_ao(original_mesh)
-        state.setdefault('ao_stats', {})[scene_object.name] = {
-            'minimum': 1.0,
-            'maximum': 1.0,
-            'source': 'combined_export_geometry',
-            'fallback': True,
-            'error': str(error),
-        }
-        _warn(
-            f'Hair Tool AO evaluation failed for "{scene_object.name}": '
-            f'{error}. Export continues with neutral AO=1.'
-        )
 
 
 def _preserve_per_system_ao(scene_object, state):
@@ -933,7 +759,7 @@ def get_rfaos_payload_contract(mesh_object=None):
         'vertex_color_channels': {
             'R': HAIR_PIXEL_DEPTH_OFFSET_ATTRIBUTE,
             'G': CHAOS_WEIGHT_ATTRIBUTE,
-            'B': 'AO',
+            'B': hair_mesh_ao.ATTRIBUTE,
             'A': 'ReservedOne',
         },
         'chaos_weight_attribute': CHAOS_WEIGHT_ATTRIBUTE,
@@ -943,6 +769,11 @@ def get_rfaos_payload_contract(mesh_object=None):
         'pixel_depth_offset_channel': 'R',
         'pixel_depth_offset_fallback': 1.0,
         'pixel_depth_offset_legacy_attribute': LEGACY_CHAOS_DEPTH_MASK_ATTRIBUTE,
+        'texture_ao_source': 'ORM Map.R',
+        'per_system_ao_attribute': 'AO',
+        'per_system_ao_source': 'UV3.R minus its AO tag (6 or 8)',
+        'whole_mesh_ao_channel': 'B',
+        'whole_mesh_ao_uv_tag': WHOLE_MESH_AO_UV_TAG,
         'system_color_uv_index': SYSTEM_COLOR_UV_INDEX,
         'uv_rg_index': RFAOS_NANITE_UV_START_INDEX,
         'uv_ba_index': RFAOS_NANITE_UV_START_INDEX + 1,
@@ -964,6 +795,19 @@ def get_rfaos_payload_contract(mesh_object=None):
             RFAOS_NANITE_UV_START_INDEX + 1,
         ],
     }
+    if mesh_object is not None:
+        ao_uv = mesh_object.data.uv_layers.get(RFAOS_NANITE_UV_BA)
+        if ao_uv is not None and len(ao_uv.data):
+            contract['ao_uv_tag'] = (
+                WHOLE_MESH_AO_UV_TAG if ao_uv.data[0].uv[0] >= WHOLE_MESH_AO_UV_TAG
+                else RFAOS_NANITE_UV_TAG
+            )
+            growth_receipt = mesh_object.get(GROWTH_AO_RECEIPT_PROPERTY)
+            if contract['ao_uv_tag'] == WHOLE_MESH_AO_UV_TAG and growth_receipt:
+                contract['whole_mesh_ao_growth_surfaces'] = json.loads(growth_receipt)
+                mirror_receipt = mesh_object.get(GROWTH_AO_MIRROR_PROPERTY)
+                if mirror_receipt:
+                    contract['whole_mesh_ao_growth_mirrors'] = json.loads(mirror_receipt)
     if mesh_object is not None and mesh_object.data.shape_keys:
         import numpy as np
         keys = mesh_object.data.shape_keys.key_blocks
@@ -1085,20 +929,10 @@ def _evaluated_mesh_objects(
 def _asset_ao_configuration(asset_parent):
     settings = getattr(asset_parent, 'htue_ao_settings', None)
     if settings is None:
-        return {'evaluation_mode': 'PER_SYSTEM'}
+        return {}
     return {
-        'evaluation_mode': str(settings.evaluation_mode),
-        'combined_max_ray_distance': float(
-            getattr(
-                settings,
-                'combined_max_ray_distance',
-                COMBINED_MAX_RAY_DISTANCE_DEFAULT,
-            )
-        ),
-        **{
-            field: getattr(settings, field)
-            for field in AO_MODIFIER_SETTING_IDS
-        },
+        field: getattr(settings, field)
+        for field in AO_MODIFIER_SETTING_IDS
     }
 
 
@@ -1194,20 +1028,24 @@ def _link_to_export_collection(scene_object, export_collection):
     export_collection.objects.link(scene_object)
 
 
-def _asset_group_key(scene_object, export_collection=None):
+def _asset_group_key(scene_object, export_collection=None, original_links=None):
     """Group a Hair Tool system by its explicit or inherited Export Empty."""
     export_collection = export_collection or bpy.data.collections.get(
         ToolInfo.EXPORT_COLLECTION.value
     )
     exported_objects = set(export_collection.all_objects) if export_collection else set()
+    if original_links is not None:
+        exported_objects.update(original_links)
 
     if EXPORT_TARGET_PROPERTY in scene_object:
         explicit_target = scene_object.get(EXPORT_TARGET_PROPERTY)
         if (
             isinstance(explicit_target, bpy.types.Object)
             and explicit_target.type == 'EMPTY'
-            and export_collection is not None
-            and export_collection in explicit_target.users_collection
+            and (
+                (export_collection is not None and export_collection in explicit_target.users_collection)
+                or (original_links is not None and explicit_target in original_links)
+            )
         ):
             return explicit_target
         raise RuntimeError(
@@ -1240,22 +1078,269 @@ def _export_source_candidates(export_collection):
     ]
 
 
-def _final_export_sources(export_collection):
+def _suppress_upstream_hair(source_candidates):
     """Return final Hair Tool outputs after global upstream suppression."""
-    source_candidates = _export_source_candidates(export_collection)
+    candidate_set = set(source_candidates)
     upstream_sources = {
         input_object
         for input_object in (
             _get_hair_tool_input_object(scene_object)
             for scene_object in source_candidates
         )
-        if input_object in source_candidates
+        if input_object in candidate_set
     }
     return [
         scene_object
         for scene_object in source_candidates
         if scene_object not in upstream_sources
     ]
+
+
+def _final_export_sources(export_collection):
+    return _suppress_upstream_hair(_export_source_candidates(export_collection))
+
+
+def _short_fur_material_indices(part):
+    """Classify evaluated faces; unused Blender material slots are irrelevant."""
+    mesh = part.data
+    result = set()
+    for index in {polygon.material_index for polygon in mesh.polygons}:
+        material = mesh.materials[index] if index < len(mesh.materials) else None
+        if material is None:
+            continue
+        target = str(material.get('unreal_existing_material_instance') or '').rsplit('/', 1)[-1]
+        target = target.split('.', 1)[0]
+        if any(SHORT_FUR_MATERIAL.fullmatch(name.casefold()) for name in (material.name, target)):
+            result.add(index)
+    return result
+
+
+def _active_node_ancestors(group):
+    """Visit nodes connected to the active Geometry Nodes output."""
+    pending = [node for node in group.nodes if node.type == 'GROUP_OUTPUT' and node.is_active_output]
+    seen = set()
+    while pending:
+        node = pending.pop()
+        if node in seen:
+            continue
+        seen.add(node)
+        if not node.mute:
+            yield node
+            inputs = node.inputs
+        else:
+            inputs = [link.from_socket for link in node.internal_links]
+        pending.extend(
+            link.from_node for socket in inputs if socket.enabled
+            for link in socket.links if link.is_valid and not link.is_muted
+        )
+
+
+def _growth_surface_mirror(systems, depsgraph):
+    """Read the built-in Hair Tool reflection in the evaluated system frame."""
+    world_mirror = None
+    for system in systems:
+        for modifier in system.modifiers:
+            group = getattr(modifier, 'node_group', None)
+            if (modifier.type != 'NODES' or not modifier.show_viewport or group is None
+                    or not group.name.startswith('Hair_System_Main')):
+                continue
+            for node in _active_node_ancestors(group):
+                mirror_group = getattr(node, 'node_tree', None)
+                if mirror_group is None or not re.fullmatch(r'HD_Mirror(?:\.\d+)?', mirror_group.name):
+                    continue
+                settings = [node.inputs.get(name) for name in ('Mask', 'Bisect', 'Flip', 'Mirror Target')]
+                mask = settings[0]
+                if mask is not None and not mask.is_linked and mask.default_value == 0:
+                    continue
+                mirror = mirror_group.nodes.get('Combine Transform.002')
+                transform = [mirror.inputs.get(name) for name in ('Translation', 'Rotation', 'Scale')] if (
+                    mirror is not None and mirror.bl_idname == 'FunctionNodeCombineTransform'
+                    and mirror.outputs[0].is_linked
+                ) else []
+                if (any(socket is None or socket.is_linked for socket in settings)
+                        or tuple(socket.default_value for socket in settings) != (1.0, False, False, None)
+                        or not transform or any(socket is None or socket.is_linked for socket in transform)):
+                    raise RuntimeError(f'Unsupported Hair Tool growth mirror settings on "{system.name}".')
+                translation, rotation, scale = (socket.default_value for socket in transform)
+                local = Matrix.LocRotScale(translation, Euler(rotation), scale)
+                frame = system.evaluated_get(depsgraph).matrix_world
+                if local.determinant() >= 0 or frame.determinant() == 0:
+                    raise RuntimeError(f'Invalid Hair Tool growth reflection on "{system.name}".')
+                current = frame @ local @ frame.inverted()
+                if world_mirror is not None and any(
+                    not math.isclose(left, right, abs_tol=1e-6)
+                    for old_row, new_row in zip(world_mirror, current)
+                    for left, right in zip(old_row, new_row)
+                ):
+                    raise RuntimeError(f'Conflicting Hair Tool growth reflections on "{system.name}".')
+                world_mirror = current
+    return tuple(tuple(row) for row in world_mirror) if world_mirror is not None else None
+
+
+def _growth_surfaces(source, depsgraph):
+    """Follow typed generator links through guides to the actual growth mesh."""
+    from . import hair_guide_cloth
+
+    current, systems = source, []
+    while current not in systems:
+        systems.append(current)
+        upstream = {
+            value for modifier, socket, value in hair_guide_cloth._object_inputs(current)
+            if modifier.node_group.name.startswith('Hair_System_Setup')
+            and socket.name.replace('_', ' ').strip().casefold() == 'source surface'
+            and isinstance(value, bpy.types.Object)
+        }
+        if len(upstream) != 1:
+            break
+        current = next(iter(upstream))
+        if current.type == 'MESH' and not is_hair_tool_object(current):
+            if EXTRA_GROWTH_SURFACE_PROPERTY not in source:
+                return (current,), _growth_surface_mirror(systems, depsgraph)
+            extra = source[EXTRA_GROWTH_SURFACE_PROPERTY]
+            if (not isinstance(extra, bpy.types.Object) or extra.type != 'MESH'
+                    or extra == current or is_hair_tool_object(extra)):
+                raise RuntimeError(f'Invalid extra Hair Tool growth surface for "{source.name}".')
+            return (current, extra), None
+    raise RuntimeError(f'Could not resolve one Hair Tool growth surface for "{source.name}".')
+
+
+def _bake_short_fur_ao(root, source_parts):
+    """Bake disposable short-fur parts separately before their export join."""
+    parts_by_surfaces = {}
+    growth_surfaces = {}
+    growth_mirrors = {}
+    depsgraph = None
+    short_fur_corners = 0
+    for source, parts in source_parts:
+        fur_parts = []
+        for part in parts:
+            existing = part.data.attributes.get(GROWTH_AO_ATTRIBUTE)
+            if existing is not None:
+                part.data.attributes.remove(existing)
+            short_indices = _short_fur_material_indices(part)
+            if short_indices:
+                fur_parts.append((part, short_indices))
+        if fur_parts:
+            if depsgraph is None:
+                depsgraph = bpy.context.evaluated_depsgraph_get()
+            surfaces, mirror = _growth_surfaces(source, depsgraph)
+            parts_by_surfaces.setdefault((surfaces, mirror), []).extend(fur_parts)
+            growth_surfaces[source.name_full] = [surface.name_full for surface in surfaces]
+            if mirror is not None:
+                growth_mirrors[source.name_full] = mirror
+    if not parts_by_surfaces:
+        return {}, {}, 0
+    settings = getattr(root, 'htue_ao_settings', None)
+    distance = getattr(settings, 'combined_max_ray_distance', hair_mesh_ao.DEFAULT_DISTANCE)
+    for (surfaces, mirror), parts in parts_by_surfaces.items():
+        baked = hair_mesh_ao.bake_group(
+            [(part, distance) for part, _ in parts], (), surfaces, depsgraph,
+            growth_surface_only=True,
+            growth_surface_mirror=Matrix(mirror) if mirror is not None else None,
+        )
+        if baked != {part for part, _ in parts}:
+            raise RuntimeError(f'Whole-mesh AO did not cover every fur part in "{root.name}".')
+        for part, short_indices in parts:
+            mesh = part.data
+            values = mesh.attributes[hair_mesh_ao.ATTRIBUTE]
+            growth = mesh.attributes.new(GROWTH_AO_ATTRIBUTE, 'FLOAT', 'CORNER')
+            # Zero is the default for parts without this attribute after
+            # joining. Encode AO in [1, 2] to distinguish even a dark value.
+            for polygon in mesh.polygons:
+                if polygon.material_index in short_indices:
+                    for loop in polygon.loop_indices:
+                        growth.data[loop].value = 1.0 + values.data[mesh.loops[loop].vertex_index].value
+                        short_fur_corners += 1
+            mesh.attributes.remove(values)
+    return growth_surfaces, growth_mirrors, short_fur_corners
+
+
+def _bake_whole_mesh_ao(prepared, source_objects, export_collection, state):
+    """Keep an asset's ray targets stable across full and partial sends."""
+    from . import export_selection, hair_guide_cloth
+
+    original_objects = set(export_selection.original_visible_export_objects(export_collection))
+    declared = export_selection.declared_hair_outputs()
+    original_objects.update(declared)
+    declared_sources = {obj for outputs in declared.values() for obj in outputs}
+    candidates = set(source_objects) | declared_sources
+    for obj in export_selection.original_visible_export_objects(export_collection):
+        if not is_hair_tool_object(obj):
+            continue
+        owner = _asset_group_key(obj, export_collection, original_objects)
+        if owner not in declared:
+            candidates.add(obj)
+    occluder_sources = sorted(
+        _suppress_upstream_hair(candidates), key=lambda obj: obj.name_full,
+    )
+    targets_by_rig = {}
+    for obj, root, rig, *_ in prepared:
+        key = rig or root
+        settings = getattr(root, 'htue_ao_settings', None)
+        distance = getattr(settings, 'combined_max_ray_distance', hair_mesh_ao.DEFAULT_DISTANCE)
+        targets_by_rig.setdefault(key, []).append((obj, distance))
+
+    cards_by_rig = {}
+    surfaces_by_rig = {}
+    temporary_cards = []
+    baked_objects = set()
+    try:
+        for source in occluder_sources:
+            rig = hair_guide_cloth.resolve_export_armature(source)
+            key = rig or _asset_group_key(source, export_collection, original_objects)
+            if key in targets_by_rig:
+                linked_for_ao = source not in bpy.context.view_layer.objects.values()
+                hidden, viewport = source.hide_get(), source.hide_viewport
+                try:
+                    if linked_for_ao:
+                        bpy.context.scene.collection.objects.link(source)
+                    if linked_for_ao or hidden or viewport:
+                        source.hide_viewport = False
+                        bpy.context.view_layer.update()
+                        source.hide_set(False)
+                        bpy.context.view_layer.update()
+                    cards = _evaluated_mesh_objects(source, state)
+                finally:
+                    if linked_for_ao or hidden or viewport:
+                        source.hide_set(hidden)
+                        source.hide_viewport = viewport
+                        if linked_for_ao:
+                            bpy.context.scene.collection.objects.unlink(source)
+                        bpy.context.view_layer.update()
+                temporary_cards.extend(cards)
+                cards_by_rig.setdefault(key, []).extend(cards)
+
+        surface_candidates = {
+            obj for obj in original_objects
+            if obj.type == 'MESH' and not is_hair_tool_object(obj)
+        }
+        for obj in bpy.context.view_layer.objects:
+            if obj.type != 'MESH' or obj.hide_render:
+                continue
+            if any(
+                slot.material and slot.material.name.casefold().startswith(hair_mesh_ao.HEAD_MATERIAL_PREFIX)
+                for slot in obj.material_slots
+            ):
+                surface_candidates.add(obj)
+        for obj in sorted(surface_candidates, key=lambda obj: obj.name_full):
+            rig = obj.find_armature()
+            if rig in targets_by_rig:
+                surfaces_by_rig.setdefault(rig, []).append(obj)
+
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        for key, targets in targets_by_rig.items():
+            surfaces = surfaces_by_rig.get(key, ())
+            baked_objects.update(hair_mesh_ao.bake_group(
+                targets, cards_by_rig.get(key, ()), surfaces, depsgraph,
+            ))
+    finally:
+        for obj in temporary_cards:
+            state['temporary_object_names'].discard(obj.name)
+            mesh = obj.data
+            bpy.data.objects.remove(obj, do_unlink=True)
+            if mesh.users == 0:
+                bpy.data.meshes.remove(mesh)
+    return baked_objects
 
 
 def restore_debug_view():
@@ -1266,39 +1351,13 @@ def restore_debug_view():
         restore_debug()
 
 
-def prepare():
-    """Create export-only mesh copies for Hair Tool systems in the Export collection."""
-    restore_debug_view()
-    cleanup()
-    from . import hair_guide_cloth
-    guide_cloth_enabled = hair_guide_cloth.enabled()
-    hair_guide_cloth.begin()
-
-    # M_LayerBlend height in Blender is a clearance/silhouette preview only.
-    # Send to Unreal must export the authored base mesh so Unreal applies Nanite
-    # displacement exactly once. Restore any state left by an interrupted run,
-    # then suspend every Bridge-owned height preview for this operation.
-    try:
-        from hair_tool_unreal_bridge import layerblend_preview
-
-        stale_states = bpy.app.driver_namespace.pop(
-            MATERIAL_HEIGHT_PREVIEW_RESTORE_KEY, None
-        )
-        if stale_states is not None:
-            layerblend_preview.restore_height_previews(stale_states)
-        height_preview_states = layerblend_preview.suspend_height_previews()
-        bpy.app.driver_namespace[
-            MATERIAL_HEIGHT_PREVIEW_RESTORE_KEY
-        ] = height_preview_states
-    except ImportError:
-        pass
-
-    # A Bridge AO preview is a disposable display cache, not an export source.
-    # Restore the untouched live Hair Tool systems before discovering outputs.
+def suspend_bridge_ao_previews():
+    """Restore live Hair Tool sources before taking the export selection snapshot."""
     try:
         from hair_tool_unreal_bridge import deformer_sync
 
-        bpy.app.driver_namespace.pop(PREVIEW_RESTORE_KEY, None)
+        if PREVIEW_RESTORE_KEY in bpy.app.driver_namespace:
+            return
         preview_objects = [
             scene_object
             for scene_object in bpy.data.objects
@@ -1334,6 +1393,32 @@ def prepare():
     except ImportError:
         pass
 
+
+def prepare():
+    """Create export-only mesh copies for Hair Tool systems in the Export collection."""
+    restore_debug_view()
+    suspend_bridge_ao_previews()
+    cleanup()
+    from . import hair_guide_cloth
+    guide_cloth_enabled = hair_guide_cloth.enabled()
+    hair_guide_cloth.begin()
+
+    # M_LayerBlend height is a clearance preview. Unreal applies displacement
+    # to the authored base mesh after import.
+    try:
+        from hair_tool_unreal_bridge import layerblend_preview
+
+        stale_states = bpy.app.driver_namespace.pop(
+            MATERIAL_HEIGHT_PREVIEW_RESTORE_KEY, None
+        )
+        if stale_states is not None:
+            layerblend_preview.restore_height_previews(stale_states)
+        bpy.app.driver_namespace[MATERIAL_HEIGHT_PREVIEW_RESTORE_KEY] = (
+            layerblend_preview.suspend_height_previews()
+        )
+    except ImportError:
+        pass
+
     # The UE Groom path reads evaluated Curves directly. Only the Cards and
     # Cards + Groom modes need temporary evaluated mesh copies.
     from . import ue_groom_adapter
@@ -1362,6 +1447,8 @@ def prepare():
                 [],
             ).append(source_object)
 
+        prepared = []
+        growth_baked_objects = set()
         for asset_parent, asset_sources in grouped_sources.items():
             ao_configuration = _asset_ao_configuration(asset_parent)
             response_contract = hair_guide_cloth.response_mask_contract(asset_parent) if guide_cloth_enabled else None
@@ -1373,7 +1460,7 @@ def prepare():
                 if guide_cloth_enabled:
                     captured = hair_guide_cloth.capture_source(
                         source_object, state,
-                        include_system_ao=(ao_configuration['evaluation_mode'] == 'PER_SYSTEM'),
+                        include_system_ao=True,
                         ao_settings=ao_configuration,
                         response_contract=response_contract,
                     )
@@ -1387,9 +1474,7 @@ def prepare():
                 source_parts = _evaluated_mesh_objects(
                     source_object,
                     state,
-                    include_system_ao=(
-                        ao_configuration['evaluation_mode'] == 'PER_SYSTEM'
-                    ),
+                    include_system_ao=True,
                     ao_settings=ao_configuration,
                 )
                 parts.extend(source_parts)
@@ -1399,20 +1484,31 @@ def prepare():
                 continue
 
             shapes_baked = _bake_group_shape_keys(shape_source_parts)
+            growth_surfaces, growth_mirrors, short_fur_corners = _bake_short_fur_ao(asset_parent, shape_source_parts)
 
             # Stamp each disposable part before joining: Blender fills missing
             # SystemColor with black when only some joined parts have it.
             for part in parts:
                 _stamp_system_color_presence(part.data)
 
-            # Only actually generated card meshes are joined. AO evaluation
-            # order is the explicit per-asset mode stored on the export Empty.
+            # Individual Hair Tool AO has already been evaluated on each part.
             temporary_object = _join_objects(parts)
             asset_name = asset_parent.name if asset_parent != asset_sources[0] else asset_sources[0].name
             temporary_object.name = f'{asset_name}__S2U_HAIR'
             temporary_object.data.name = f'{asset_name}__S2U_HAIR'
             temporary_object[SOURCE_NAME_PROPERTY] = asset_name
             temporary_object[TEMP_PROPERTY] = True
+            if growth_surfaces:
+                ao = temporary_object.data.attributes.get(GROWTH_AO_ATTRIBUTE)
+                if (ao is None or ao.domain != 'CORNER' or ao.data_type != 'FLOAT'
+                        or len(ao.data) != len(temporary_object.data.loops)
+                        or sum(1 <= item.value <= 2 for item in ao.data) != short_fur_corners):
+                    raise RuntimeError(f'Whole-mesh AO was lost while joining "{asset_name}".')
+                if short_fur_corners == len(ao.data):
+                    growth_baked_objects.add(temporary_object)
+                temporary_object[GROWTH_AO_RECEIPT_PROPERTY] = json.dumps(growth_surfaces)
+                if growth_mirrors:
+                    temporary_object[GROWTH_AO_MIRROR_PROPERTY] = json.dumps(growth_mirrors)
             _copy_transfer_settings(temporary_object, asset_sources)
             if shapes_baked:
                 temporary_object.ue_unique_transfer_shape_keys = False
@@ -1430,21 +1526,6 @@ def prepare():
                 )
                 temporary_object.matrix_world = world_matrix
 
-            if ao_configuration['evaluation_mode'] == 'COMBINED':
-                _evaluate_combined_ao(
-                    temporary_object,
-                    state,
-                    ao_settings=ao_configuration,
-                )
-            else:
-                _preserve_per_system_ao(temporary_object, state)
-            temporary_object['_htue_ao_evaluation_mode'] = ao_configuration[
-                'evaluation_mode'
-            ]
-            _write_hair_tool_uvs(temporary_object.data)
-            _pack_rfaos(temporary_object.data)
-            _remove_empty_material_slots(temporary_object)
-
             armatures = {
                 armature
                 for armature in (
@@ -1458,6 +1539,23 @@ def prepare():
                     f'Hair Tool asset "{asset_name}" is bound to multiple armatures.'
                 )
             armature_object = next(iter(armatures), None)
+            prepared.append((
+                temporary_object, asset_parent, armature_object,
+                asset_name, guide_capture_complete, guide_captures,
+            ))
+
+        broad_targets = [entry for entry in prepared if entry[0] not in growth_baked_objects]
+        baked_objects = growth_baked_objects
+        if broad_targets:
+            baked_objects.update(_bake_whole_mesh_ao(broad_targets, source_objects, export_collection, state))
+        for (
+            temporary_object, _asset_parent, armature_object, asset_name,
+            guide_capture_complete, guide_captures,
+        ) in prepared:
+            _preserve_per_system_ao(temporary_object, state)
+            _write_hair_tool_uvs(temporary_object.data)
+            _pack_rfaos(temporary_object.data, has_whole_mesh_ao=temporary_object in baked_objects)
+            _remove_empty_material_slots(temporary_object)
             if armature_object:
                 _bind_export_skin(temporary_object, armature_object)
 

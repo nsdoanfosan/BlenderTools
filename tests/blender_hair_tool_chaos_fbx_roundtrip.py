@@ -9,7 +9,7 @@ import bpy
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src" / "addons"))
 
-from send2ue.core import hair_tool_export
+from send2ue.core import hair_mesh_ao, hair_tool_export
 
 
 mesh = bpy.data.meshes.new("HTUE_CHAOS_FBX_ROUNDTRIP")
@@ -31,6 +31,7 @@ values = {
     "Random": (0.1, 0.5, 0.9),
     "Factor": (0.0, 0.5, 1.0),
     "AO": (0.25, 0.5, 0.75),
+    hair_mesh_ao.ATTRIBUTE: (0.35, 0.85, 0.1),
     "Depth": (0.0, 0.5, 1.0),
     "ChaosWeight": (0.0, 0.375, 1.0),
     "HairPixelDepthOffset": (1.0, 0.625, 0.125),
@@ -48,10 +49,11 @@ for item, color in zip(
     item.color = color
 
 hair_tool_export._write_hair_tool_uvs(mesh)
-hair_tool_export._pack_rfaos(mesh)
+hair_tool_export._pack_rfaos(mesh, has_whole_mesh_ao=True)
 
 source = bpy.data.objects.new("HTUE_CHAOS_FBX_ROUNDTRIP", mesh)
 bpy.context.scene.collection.objects.link(source)
+assert hair_tool_export.get_rfaos_payload_contract(source)["ao_uv_tag"] == 8.0
 bpy.ops.object.select_all(action="DESELECT")
 source.select_set(True)
 bpy.context.view_layer.objects.active = source
@@ -85,6 +87,11 @@ attribute = imported_mesh.color_attributes["RFAOS"]
 assert attribute.domain == "CORNER"
 for loop_index, loop in enumerate(imported_mesh.loops):
     vertex_index = loop.vertex_index
+    assert math.isclose(
+        imported_mesh.uv_layers[3].data[loop_index].uv[0],
+        8.0 + values["AO"][vertex_index],
+        abs_tol=1.0e-6,
+    )
     color_item = attribute.data[loop_index]
     color = (
         color_item.color_srgb
@@ -94,7 +101,7 @@ for loop_index, loop in enumerate(imported_mesh.loops):
     expected = (
         values["HairPixelDepthOffset"][vertex_index],
         values["ChaosWeight"][vertex_index],
-        values["AO"][vertex_index],
+        values[hair_mesh_ao.ATTRIBUTE][vertex_index],
         1.0,
     )
     for actual, target in zip(color, expected):

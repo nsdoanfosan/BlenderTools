@@ -288,6 +288,7 @@ class Send2Ue(bpy.types.Operator):
         # get the current state of the scene and its objects
         self.state['context'] = utilities.get_current_context()
         from .core import export_selection
+        hair_tool_export.suspend_bridge_ao_previews()
         export_selection.prepare()
 
         # Expose the current contents of open GroupPro groups before extensions

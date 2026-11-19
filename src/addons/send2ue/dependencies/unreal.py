@@ -1282,6 +1282,9 @@ class UnrealImportAsset(Unreal):
             required_indices.append(system_color_uv_index)
         required_uv_count = max(required_indices) + 1
         tag = float(contract['uv_tag'])
+        ao_tag = float(contract.get('ao_uv_tag', tag))
+        whole_ao_tag = contract.get('whole_mesh_ao_uv_tag')
+        expects_whole_ao = whole_ao_tag is not None and ao_tag == float(whole_ao_tag)
         minimum_range = 1.0 / 255.0
 
         for asset_path in asset_paths:
@@ -1302,6 +1305,8 @@ class UnrealImportAsset(Unreal):
                 )
                 continue
             issues = []
+            whole_ao_issues = []
+            whole_ao_sections = []
             uv_count = int(stream_data.get('uv_channel_count', 0))
             if uv_count < required_uv_count:
                 issues.append(
@@ -1329,14 +1334,39 @@ class UnrealImportAsset(Unreal):
                     )
                     continue
 
-                for label, channel in (('Random/Depth', rg['u']), ('AO', ba['u'])):
+                for label, channel, expected_tag in (
+                    ('Random/Depth', rg['u'], tag),
+                    ('AO', ba['u'], ao_tag),
+                ):
                     minimum = float(channel['min'])
                     maximum = float(channel['max'])
-                    if minimum < tag - 0.01 or maximum > tag + 1.01:
+                    if minimum < expected_tag - 0.01 or maximum > expected_tag + 1.01:
                         issues.append(
                             f'section {section_index} {label} tag range is '
                             f'{minimum:.6f}..{maximum:.6f}, expected '
-                            f'{tag:.2f}..{tag + 1.0:.2f}'
+                            f'{expected_tag:.2f}..{expected_tag + 1.0:.2f}'
+                        )
+
+                if expects_whole_ao:
+                    if not (
+                        ao_tag - 0.01 <= float(ba['u']['min'])
+                        <= float(ba['u']['max']) <= ao_tag + 1.01
+                    ):
+                        whole_ao_issues.append(f'section {section_index} missing AO tag {ao_tag:g}')
+                    blue = section.get('b') or {}
+                    alpha = section.get('a') or {}
+                    if (
+                        not blue.get('count')
+                        or not alpha.get('count')
+                        or float(alpha['min']) < 0.999
+                        or not 0.0 <= float(blue['min']) <= float(blue['max']) <= 1.0
+                    ):
+                        whole_ao_issues.append(
+                            f'section {section_index} missing valid source-triangle vertex B/A'
+                        )
+                    else:
+                        whole_ao_sections.append(
+                            f'{section_index}: {float(blue["min"]):.6f}..{float(blue["max"]):.6f}'
                         )
 
                 factor_range = float(rg['v']['max']) - float(rg['v']['min'])
@@ -1352,18 +1382,30 @@ class UnrealImportAsset(Unreal):
                         f'(range {ao_range:.6f})'
                     )
                 if payload_version >= 3:
-                    for label, channel in (
-                        ('SystemColor.R', system_rg['u']),
-                        ('SystemColor.G', system_rg['v']),
-                        ('SystemColor.B', ba['v']),
+                    for label, channel, minimum_valid in (
+                        ('SystemColor.R', system_rg['u'], -0.01),
+                        ('SystemColor.G', system_rg['v'], -0.01),
+                        ('SystemColor.B', ba['v'], -1.01),
                     ):
                         minimum = float(channel['min'])
                         maximum = float(channel['max'])
-                        if minimum < -0.01 or maximum > 1.01:
+                        if minimum < minimum_valid or maximum > 1.01:
                             issues.append(
                                 f'section {section_index} {label} range is '
-                                f'{minimum:.6f}..{maximum:.6f}, expected 0..1'
+                                f'{minimum:.6f}..{maximum:.6f}, outside the '
+                                'linear color and absence encoding range'
                             )
+
+            if expects_whole_ao:
+                if whole_ao_issues or not sections or len(whole_ao_sections) != len(sections):
+                    issues.append('whole-mesh AO vertex B was not verified')
+                    issues.extend(whole_ao_issues)
+                else:
+                    unreal.log(
+                        f'Hair Tool whole-mesh AO verified for "{asset_path}": '
+                        f'UV{uv_ba_index}.R tag {ao_tag:g}; vertex B by section '
+                        + ', '.join(whole_ao_sections)
+                    )
 
             if issues:
                 unreal.log_warning(

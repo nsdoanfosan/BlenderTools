@@ -283,6 +283,23 @@ class TestHairToolPayloadContract(unittest.TestCase):
         self.importer.audit_hair_tool_payload(["/Game/Test/SK_Hair"])
         self.assertEqual(fake_unreal.warning_messages, [])
 
+    def test_accepts_whole_ao_tag_with_triangle_vertex_color_and_missing_system_color(self):
+        contract = self.importer._asset_data["_hair_tool_payload"]
+        contract.update(version=7, ao_uv_tag=8.0, whole_mesh_ao_uv_tag=8.0)
+        section = AuditLibrary.channel_payload["sections"][0]
+        section["uvs"][2].update(u={"min": 8.0, "max": 9.0}, v={"min": -1.0, "max": 1.0})
+        section.update(b={"min": 0.2, "max": 0.9, "count": 3},
+                       a={"min": 1.0, "max": 1.0, "count": 3})
+        self.importer.audit_hair_tool_payload(["/Game/Test/SK_Hair"])
+        self.assertEqual(fake_unreal.warning_messages, [])
+
+    def test_flags_old_ao_tag_when_whole_mesh_ao_was_expected(self):
+        contract = self.importer._asset_data["_hair_tool_payload"]
+        contract.update(version=7, ao_uv_tag=8.0, whole_mesh_ao_uv_tag=8.0)
+        self.importer.audit_hair_tool_payload(["/Game/Test/SK_Hair"])
+        self.assertTrue(any("whole-mesh AO vertex B was not verified" in item
+                            for item in fake_unreal.warning_messages))
+
     def test_warns_without_failing_when_uv3_payload_is_missing(self):
         AuditLibrary.stream_payload = {"uv_channel_count": 3}
         AuditLibrary.channel_payload["sections"][0]["uvs"] = [
