@@ -2860,6 +2860,44 @@ def _slot_index_for_entry(mesh, entry: dict, mat_name: str):
     return None
 
 
+def _fallback_slot_index(entry: dict, claimed_slots):
+    """JSON slot index for an unmatched entry, unless another entry owns it by name.
+
+    A FabricTwoSided back material has no section of its own once Solidify is
+    off for export; without this guard it fell back onto the front section's
+    slot and replaced the front MI with the back MI.
+    """
+    index = int(entry.get("slot_index", 0))
+    return None if index in claimed_slots else index
+
+
+def _drop_backface_slot_collisions(materials, name_matched_slots):
+    """Unmatch a back material whose slot also matched its two-sided front.
+
+    The front FabricTwoSided MI already carries the backface textures. A
+    reimported slot can keep the front name in one name field and the back
+    name in another, so both entries matched the same section and the back MI
+    replaced the front one.
+    """
+    backface_names = {
+        str(entry.get("backface_material") or "")
+        for entry in materials
+        if entry.get("backface_material") and entry.get("backface_material") != entry.get("name")
+    }
+    for index, entry in enumerate(materials):
+        slot = name_matched_slots[index]
+        if slot is None or str(entry.get("name", "")) not in backface_names:
+            continue
+        if any(
+            other != index
+            and name_matched_slots[other] == slot
+            and str(materials[other].get("name", "")) not in backface_names
+            for other in range(len(materials))
+        ):
+            name_matched_slots[index] = None
+    return name_matched_slots
+
+
 def _sync_fbx_duplicate_material_slots(mesh, data):
     """Assign FBX's duplicate-name aliases from the exact authored slot."""
     property_name, slots = _mesh_material_entries(mesh)
@@ -5211,6 +5249,15 @@ def process_mesh(
     tex_cache_before = dict(tex_cache)
     skeletal_slot_assignments = {}
 
+    # Name matches are resolved before any slot is renamed, so a fallback can
+    # tell which slots already belong to another authored material.
+    name_matched_slots = [
+        _slot_index_for_entry(mesh, entry, str(entry.get("name", "")))
+        for entry in data.get("materials", [])
+    ]
+    _drop_backface_slot_collisions(data.get("materials", []), name_matched_slots)
+    claimed_slots = {index for index in name_matched_slots if index is not None}
+
     for entry_index, entry in enumerate(data.get("materials", [])):
         mat_name = str(entry.get("name", ""))
         slot_name = _entry_slot_display_name(entry, mat_name)
@@ -5220,12 +5267,18 @@ def process_mesh(
             continue
 
         # 실제 슬롯을 머티리얼 이름으로 매칭(Empty 결합 export 대응). 없으면 JSON slot_index 로 폴백.
-        slot_index = _slot_index_for_entry(mesh, entry, mat_name)
+        slot_index = name_matched_slots[entry_index]
         if slot_index is None:
             if entry.get("slot_match_required"):
                 _warn(f"  slot not found for target-only material '{mat_name}' -> skip")
                 continue
-            slot_index = int(entry.get("slot_index", 0))
+            slot_index = _fallback_slot_index(entry, claimed_slots)
+            if slot_index is None:
+                _warn(
+                    f"  slot not found for '{mat_name}'; JSON slot[{entry.get('slot_index', 0)}] "
+                    "belongs to another material -> skip"
+                )
+                continue
 
         # Explicit artist-owned assignments can reference a base Material as
         # well as an MI. Never reparent, initialize or synchronize either.
