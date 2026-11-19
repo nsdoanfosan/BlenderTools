@@ -11,6 +11,8 @@ import bpy
 _state = None
 _rules = None
 _collection_state = None
+_visible_export_objects = None
+_declared_hair_outputs = None
 
 
 def keep_prepared_hair_in_mesh_export(selected, anchor, combined_parent=None):
@@ -108,8 +110,21 @@ def includes(obj):
     return True  # Shared rig/dependency, rather than an export unit.
 
 
+def original_visible_export_objects(collection):
+    """Keep AO context stable when a partial send narrows the output set."""
+    if _visible_export_objects is not None:
+        return _visible_export_objects
+    return tuple(obj for obj in collection.objects
+                 if not (obj.hide_get() or obj.hide_viewport or obj.hide_render))
+
+
+def declared_hair_outputs():
+    """The terminal Hair Tool systems explicitly declared across Export units."""
+    return _declared_hair_outputs or {}
+
+
 def prepare():
-    global _state, _rules
+    global _state, _rules, _visible_export_objects, _declared_hair_outputs
     if _state is not None:
         raise RuntimeError('An explicit export selection is already active')
     collection = bpy.data.collections.get('Export')
@@ -128,23 +143,32 @@ def prepare():
         return None
 
     declared = {}
-    for name in selected:
-        unit = units[name]
+    hair_outputs = {}
+    for name, unit in units.items():
         if unit.get('send2ue_export_source_names'):
-            names = json.loads(unit['send2ue_export_source_names'])
-            objects = [bpy.data.objects.get(name) for name in names]
-            if len(set(names)) != len(names) or any(o is None for o in objects):
-                raise ValueError('Explicit export source list is incomplete: ' + name)
-            # Only native Hair Tool systems have an implicit downstream pipeline.
-            # Do not widen ordinary explicit mesh selections (legacy children).
-            native = any(any(getattr(getattr(mod, 'node_group', None), 'name', '').startswith(
-                'Hair_System_Setup') for mod in getattr(obj, 'modifiers', ())) for obj in objects)
-            if native:
-                from . import hair_tool_export as hair
-                declared[name] = resolve_hair_outputs(objects, bpy.data.objects, name,
-                    hair.is_hair_tool_object, hair._get_hair_tool_input_object, owner)
-            else:
-                declared[name] = set(objects)
+            try:
+                names = json.loads(unit['send2ue_export_source_names'])
+                objects = [bpy.data.objects.get(obj_name) for obj_name in names]
+                if len(set(names)) != len(names) or any(o is None for o in objects):
+                    raise ValueError('Explicit export source list is incomplete: ' + name)
+                # Only native Hair Tool systems have an implicit downstream pipeline.
+                native = any(
+                    getattr(getattr(modifier, 'node_group', None), 'name', '').startswith('Hair_System_Setup')
+                    for obj in objects for modifier in obj.modifiers
+                )
+                if native:
+                    from . import hair_tool_export as hair
+                    outputs = resolve_hair_outputs(objects, bpy.data.objects, name,
+                        hair.is_hair_tool_object, hair._get_hair_tool_input_object, owner)
+                    hair_outputs[unit] = {obj for obj in outputs if hair.is_hair_tool_object(obj)}
+                else:
+                    outputs = set(objects)
+                if name in selected:
+                    declared[name] = outputs
+            except (TypeError, ValueError) as error:
+                if name in selected:
+                    raise
+                print(f'[send2ue] Ignoring invalid unselected AO context for {name}: {error}')
     for name, objects in declared.items():
         if any(owner(o) != name for o in objects):
             raise ValueError('Explicit export source has a different Empty owner: ' + name)
@@ -167,8 +191,10 @@ def prepare():
     affected = (set(collection.objects) | set().union(*declared.values()) | dependencies) if declared else set(collection.objects)
     _state = [(o, collection in o.users_collection, o.hide_get(), o.hide_viewport, o.hide_render, o.hide_select) for o in affected]
     _rules = units, selected, declared
+    _declared_hair_outputs = hair_outputs
     try:
         _activate_export_collection(collection)
+        _visible_export_objects = original_visible_export_objects(collection)
         for obj in affected:
             name = owner(obj)
             if name and (name not in selected or (name in declared and obj != units[name] and obj not in declared[name])):
@@ -189,9 +215,11 @@ def prepare():
 
 
 def cleanup():
-    global _state, _rules, _collection_state
+    global _state, _rules, _collection_state, _visible_export_objects, _declared_hair_outputs
     state, _state = _state, None
     _rules = None
+    _visible_export_objects = None
+    _declared_hair_outputs = None
     collection = bpy.data.collections.get('Export')
     for obj, linked, hidden, viewport, render, selectable in state or []:
         if linked and collection not in obj.users_collection:
