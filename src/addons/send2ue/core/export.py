@@ -6,6 +6,7 @@ import os
 import bpy
 from contextlib import contextmanager
 from . import utilities, validations, settings, ingest, extension, io, hair_tool_export, ue_groom_adapter, nested_pivots, bevel_modifier_export, fabric_twosided_export
+from . import subsurface_uv_export
 from ..constants import BlenderTypes, UnrealTypes, FileTypes, PreFixToken, ToolInfo, ExtensionTasks
 
 
@@ -490,11 +491,16 @@ def export_file(properties, lod=0, file_type=FileTypes.FBX):
             )
         if numerical_flags == {True}:
             export_settings['colors_type'] = 'LINEAR'
-    if file_type == FileTypes.FBX and any(o.get(hair_tool_export.TEMP_PROPERTY) for o in bpy.context.selected_objects):
-        export_settings['mesh_smooth_type'] = 'FACE'
-
     if file_type == FileTypes.FBX:
-        export_fbx_file(file_path, export_settings)
+        selected = bpy.context.selected_objects
+        is_hair_export = any(obj.get(hair_tool_export.TEMP_PROPERTY) for obj in selected)
+        if is_hair_export:
+            export_settings['mesh_smooth_type'] = 'FACE'
+        if asset_data.get('_asset_type') == UnrealTypes.SKELETAL_MESH and not is_hair_export:
+            with subsurface_uv_export.packed_for_export(selected, asset_path=asset_data.get('asset_path', '')):
+                export_fbx_file(file_path, export_settings)
+        else:
+            export_fbx_file(file_path, export_settings)
 
     elif file_type == FileTypes.ABC:
         export_alembic_file(file_path, export_settings)
