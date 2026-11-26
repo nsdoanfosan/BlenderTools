@@ -16,6 +16,7 @@ VERSION = 'send2ue.guide_ribbon.v1'
 SPLINE_ATTRIBUTE = 'send2ue_ribbon_spline_id'
 SAMPLE_ATTRIBUTE = 'send2ue_ribbon_sample_id'
 CENTER_ATTRIBUTE = 'send2ue_ribbon_sample_center'
+FACTOR_ATTRIBUTE = 'send2ue_ribbon_curve_factor'
 
 
 def _base_name(name):
@@ -417,13 +418,14 @@ def prepare(guide_copy, requested_mode='RIBBON'):
         copied_profile.node_tree = inner
         _stamp(top, copied_profile.inputs['Curves'], SPLINE_ATTRIBUTE, 'INT', 'CURVE')
         capture = _schema(inner)['samples']
+        parameter = inner.nodes.new('GeometryNodeSplineParameter')
+        _stamp(inner, capture.inputs['Geometry'], FACTOR_ATTRIBUTE, 'FLOAT', 'POINT', parameter.outputs['Factor'])
         if kind == 'FLAT':
             # Curve to Mesh evaluates flat Catmull/Bezier samples implicitly.
             # Integer control-point IDs interpolate to duplicates. Carry the
             # continuous native spline parameter instead: each evaluated row
             # has one exact key on both profiles, without resampling the artist
             # curve (which would change its normals and rendered geometry).
-            parameter = inner.nodes.new('GeometryNodeSplineParameter')
             _stamp(inner, capture.inputs['Geometry'], SAMPLE_ATTRIBUTE, 'FLOAT', 'POINT', parameter.outputs['Factor'])
         else:
             _stamp(inner, capture.inputs['Geometry'], SAMPLE_ATTRIBUTE, 'INT', 'POINT')

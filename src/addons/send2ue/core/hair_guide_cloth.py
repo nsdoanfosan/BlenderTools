@@ -314,10 +314,12 @@ def own_weights(mesh):
 def _capture_render_only(source, export_state, search, include_system_ao, ao_settings):
     """Keep the ordinary complete render output without inventing a sim mesh."""
     from . import hair_tool_export as hair
+    from . import hair_guide_factors as factors
     objects = hair._evaluated_mesh_objects(source, export_state,
         include_system_ao=include_system_ao, ao_settings=ao_settings)
     for obj in objects:
         _int_attribute(obj.data, GUID_ATTRIBUTE, [RENDER_ONLY_GUID] * len(obj.data.vertices))
+        factors.store_render(obj.data, [-1.] * len(obj.data.vertices))
     return objects, {'vertices': [], 'triangles': [], 'guide_ids': [],
         'weights': [], 'authored_weights': [], 'parts': [],
         'render_vertex_count': sum(len(obj.data.vertices) for obj in objects),
@@ -333,7 +335,8 @@ def capture_source(source, export_state, include_system_ao=False, ao_settings=No
             for obj in result[0]:
                 _neutralize_response_render(obj.data)
         return result
-    copies, group, meshes = [], None, []
+    copies, group, meshes, factor_groups = [], None, [], []
+    from . import hair_guide_factors as factors
     ribbon_plan = None
     try:
         guide, sockets, search = find_guide(source)
@@ -380,6 +383,9 @@ def capture_source(source, export_state, include_system_ao=False, ao_settings=No
         if guide:
             from . import hair_guide_ribbon as ribbon
             ribbon_plan = ribbon.prepare(guide_copy, simulation_mode)
+            factor_generators = []
+            if ribbon_plan.prepared and guide != source:
+                factor_generators = factors.stamp_generators(render_copy, factor_groups)
             group = _stamp_group()
             stamp = guide_copy.modifiers.new('Send2UE Export Ownership', 'NODES')
             stamp.node_group = group
@@ -495,7 +501,8 @@ def capture_source(source, export_state, include_system_ao=False, ao_settings=No
         if not set(render_islands).issubset(set(guide_islands)):
             raise ValueError('Generated strands refer to an absent guide island.')
         strand_owners = {}
-        for strand, owner in zip(components(rm), render_islands):
+        strands = components(rm)
+        for strand, owner in zip(strands, render_islands):
             strand_owners.setdefault(strand, set()).add(owner)
         if any(len(owners) != 1 for owners in strand_owners.values()):
             raise ValueError('A connected strand has multiple generating guide IDs.')
@@ -518,6 +525,22 @@ def capture_source(source, export_state, include_system_ao=False, ao_settings=No
             state()['next_gid'] += 1
         gids = [ids[i] for i in guide_islands]
         render_gids = [ids[i] for i in render_islands]
+        sim_factors, render_factors = factors.source_factors(gm, rm, gids, render_gids, strands, guide == source)
+        curve_source = (factor_generators or ribbon_plan.receipt.get('profile') in {'CIRCLE', 'FLAT'}
+                        or guide.type in {'CURVE', 'CURVES'})
+        if curve_source and -1. in render_factors:
+            raise factors.MissingGeneratorParameter(
+                f'{source.name}: no verified parameter on generating curve {guide.name}; '
+                'retaining the existing Cloth until its generator can provide source samples')
+        search['curve_parameter'] = {
+            'version': 1, 'generators': factor_generators, 'self_guide': guide == source,
+            'supported_guides': len({g for g, t in zip(gids, sim_factors) if t >= 0.}),
+            'unsupported_guides': len({g for g, t in zip(gids, sim_factors) if t < 0.}),
+            'basis': ('legacy_noncurve_surface' if all(t < 0. for t in sim_factors) else
+                      'native_profile_parameter' if guide == source else 'native_generator_position_samples'),
+            'unsupported_reason': (None if -1. not in sim_factors else
+                'Source layout or child generator did not carry a complete profile parameter')}
+        factors.store_render(rm, render_factors)
         _int_attribute(rm, GUID_ATTRIBUTE, render_gids)
         longitudinal = rm.attributes.get('UVHelperGN')
         if longitudinal and longitudinal.domain == 'CORNER' and longitudinal.data_type == 'FLOAT_VECTOR':
@@ -528,7 +551,7 @@ def capture_source(source, export_state, include_system_ao=False, ao_settings=No
         gm.calc_loop_triangles()
         packet = {'vertices': [list(v.co) for v in gm.vertices],
                   'triangles': [list(t.vertices) for t in gm.loop_triangles],
-                  'guide_ids': gids, 'weights': weights, 'parts': [], 'source': search,
+                  'guide_ids': gids, 'curve_factors': sim_factors, 'weights': weights, 'parts': [], 'source': search,
                   'simulation_enabled': True,
                   'authored_weights': [float(d.color[1] if hasattr(d, 'color') else d.value)
                       for d in gm.attributes['ChaosWeight'].data] if weight_receipt['authored_weight_present'] else [None] * len(weights)}
@@ -553,7 +576,7 @@ def capture_source(source, export_state, include_system_ao=False, ao_settings=No
         return [obj], packet
     except Exception as error:
         diagnostic(source.name, str(error))
-        if response_contract is not None:
+        if response_contract is not None or isinstance(error, factors.MissingGeneratorParameter):
             raise
         return None
     finally:
@@ -561,6 +584,8 @@ def capture_source(source, export_state, include_system_ao=False, ao_settings=No
             ribbon_plan.close()
         for obj in reversed(copies):
             bpy.data.objects.remove(obj, do_unlink=True)
+        if factor_groups:
+            ribbon._remove_groups(factor_groups)
         if group and group.users == 0:
             bpy.data.node_groups.remove(group)
         for mesh in meshes:
@@ -616,8 +641,10 @@ def finish_asset(render, captures, asset_name, armature, export_collection, expo
 def _finish_asset(render, captures, asset_name, armature, export_collection, export_state):
     """Build one unparented simulation export beside a normal prepared render."""
     from . import hair_tool_export as hair
+    from . import hair_guide_factors as factors
     positions, triangles, gids, weights, authored_weights, parts = [], [], [], [], [], []
     response_values, response_contract = [], None
+    sim_factors = []
     response_present = [c.get('response_mask') is not None for c in captures if c.get('simulation_enabled', True)]
     if any(response_present) and not all(response_present):
         raise ValueError('A response-enabled export unit requires authored masks on every physical source')
@@ -626,6 +653,7 @@ def _finish_asset(render, captures, asset_name, armature, export_collection, exp
         positions.extend(capture['vertices'])
         triangles.extend([[i + base for i in triangle] for triangle in capture['triangles']])
         gids.extend(capture['guide_ids'])
+        sim_factors.extend(capture.get('curve_factors', [-1.] * len(capture['guide_ids'])))
         weights.extend(capture['weights'])
         authored_weights.extend(capture['authored_weights'])
         if capture.get('response_mask') is not None:
@@ -647,6 +675,10 @@ def _finish_asset(render, captures, asset_name, armature, export_collection, exp
     # Triangulate disposable exports so the packet describes actual FBX topology.
     _triangulate(render.data)
     render_gids = [v.value for v in render.data.attributes[GUID_ATTRIBUTE].data]
+    render_factor_attr = render.data.attributes.get(factors.RENDER_ATTRIBUTE)
+    if not render_factor_attr or len(render_factor_attr.data) != len(render_gids):
+        raise ValueError('Final export lost the source guide-parameter attribute')
+    render_factors = [v.value for v in render_factor_attr.data]
     render_only = [i for i, gid in enumerate(render_gids) if gid == RENDER_ONLY_GUID]
     if set(render_gids) - {RENDER_ONLY_GUID} - set(gids):
         diagnostic(asset_name, 'Final export processing changed source guide ownership.')
@@ -695,10 +727,10 @@ def _finish_asset(render, captures, asset_name, armature, export_collection, exp
     packet = {'version': 2, 'recipe': 'send2ue.generator_owned_cloth.v2', 'remesh': False,
         'simulation_enabled': simulation_enabled,
         'meshes': {'sim': {'vertices': positions, 'triangles': triangles, 'guide_ids': gids, 'weights': quantized,
-                           'authored_weights': authored_weights},
+                           'authored_weights': authored_weights, 'curve_factors': sim_factors},
                    'render': {'vertices': [list(render.matrix_world @ v.co) for v in render.data.vertices],
                               'triangles': [list(p.vertices) for p in render.data.polygons],
-                              'guide_ids': render_gids,
+                              'guide_ids': render_gids, 'curve_factors': render_factors,
                               'render_only_vertex_indices': render_only,
                               'root_indices': [i for i, d in enumerate(render.data.attributes['send2ue_strand_root'].data) if d.value]
                                   if render.data.attributes.get('send2ue_strand_root') else [],

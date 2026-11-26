@@ -23,6 +23,7 @@ CONTENT = "Send2UE.HairGuideCloth.Content"
 NATIVE_DERIVED_MAPS = 'Send2UE.HairGuideCloth.NativeDerivedMaps'
 SOURCE_MAXIMUM = 'Send2UE.HairGuideCloth.SourceMaximum'
 VERSION = "send2ue.hair_guide_cloth.v1"
+SOURCE_CURVE_BINDING_VERSION = 2
 RENDER_ONLY_SOURCE_STATUSES = {"no_guide_after_search", "guide_weights_all_zero"}
 RESPONSE_MASK_CONTRACT = {'version': 1, 'policy': 'sim_only_R', 'channel': 'R',
     'attribute': 'HairPixelDepthOffset', 'weight_map': 'HairTipResponse',
@@ -254,7 +255,7 @@ def _target(record):
     return _path(record.get("cloth_asset_path") or folder + "/CA_" + re.sub(r"^(?:SK|SM)_", "", name) + "_GuideCloth")
 
 
-def validate_record(record):
+def validate_record(record, *, for_import=False):
     """Validate real file hashes and per-vertex provenance before asset writes."""
     if not isinstance(record, dict) or record.get("version") not in (1, 2):
         raise ValueError("Unsupported hair guide cloth handoff version")
@@ -320,6 +321,7 @@ def validate_record(record):
         raise ValueError("Render strands refer to missing simulation guides")
     if not simulation_enabled and guided:
         raise ValueError("Render-only export still contains guided simulation vertices")
+    _curve_factor_fields(packet)
     validate_response_mask(packet)
     if out.get('update_mode') not in (None, 'response_only', 'simulation_only'):
         raise ValueError('Unsupported hair update mode')
@@ -327,11 +329,87 @@ def validate_record(record):
         raise ValueError('Simulation-only update requires physical simulation guides')
     if out.get('update_mode') == 'response_only' and (not simulation_enabled or validate_response_mask(packet) is None):
         raise ValueError('R-only update requires an authored simulation R mask')
+    if for_import and simulation_enabled and out.get('update_mode') != 'response_only':
+        _require_generated_curve_parameters(packet)
     if packet.get('new_source_weight_map_defaults') is not None:
         # Validate the complete contract before building or saving any assets.
         _new_source_map_defaults(packet, {'sim_guide_ids': packet['meshes']['sim']['guide_ids']}, None)
     out["manifest_path"] = str(filename)
     return out, packet
+
+
+def _curve_factor_fields(packet):
+    meshes = packet['meshes']
+    fields = {role: mesh.get('curve_factors') for role, mesh in meshes.items()}
+    if all(values is None for values in fields.values()):
+        return None
+    available = {}
+    for role in ('sim', 'render'):
+        mesh, values = meshes[role], fields[role]
+        if not isinstance(values, list) or len(values) != len(mesh['vertices']):
+            raise ValueError('Both meshes require one source curve parameter per vertex; re-export the source from Blender')
+        for gid, t in zip(mesh['guide_ids'], values):
+            if type(t) not in (float, int) or not (t == -1 or 0 <= t <= 1):
+                raise ValueError('Invalid generator curve parameter')
+            if gid == -1 and t != -1:
+                raise ValueError('Render-only vertices cannot declare a simulation curve parameter')
+            supported = t != -1
+            if available.setdefault(gid, supported) != supported:
+                raise ValueError('Incomplete curve parameter correspondence within a generating guide; re-export the source from Blender')
+    return fields
+
+
+def _require_generated_curve_parameters(packet):
+    """A new binding must preserve explicit generator-to-spline correspondence in older manifests."""
+    source_pairs = set()
+    for source in packet.get('sources', []):
+        if source.get('status') != 'resolved':
+            continue
+        ownership = source.get('render_ownership', {})
+        parameter = source.get('curve_parameter', {})
+        if (source.get('basis') == 'explicit_self_profiled_guide' or
+                ownership.get('basis') in {'independent_source_face_and_curve_stamps', 'exact_self_profile_surface_identity'} or
+                parameter.get('generators') or parameter.get('self_guide')):
+            source_pairs.add((source['guide'], source['render']))
+    required = {}
+    for part in packet.get('parts', []):
+        mesh = part.get('simulation_mesh', {})
+        if (mesh.get('native_island_to_spline') or
+                mesh.get('identity_basis') == 'native_mesh_island_to_stamped_curve_and_sample' or
+                (part.get('source_guide'), part.get('source_render')) in source_pairs):
+            required[part['gid']] = part['source_guide']
+    if required:
+        render = packet['meshes']['render']
+        factors = render.get('curve_factors')
+        for i, gid in enumerate(render['guide_ids']):
+            if gid in required and (factors is None or factors[i] < 0.):
+                raise ValueError(f"Re-export {required[gid]} from Blender with source curve parameters before rebuilding its cloth binding")
+
+
+def _triangle_fans(triangles):
+    fans = defaultdict(list)
+    for a, b, c in triangles:
+        fans[a].append((b, c))
+        fans[b].append((c, a))
+        fans[c].append((a, b))
+    return fans
+
+
+def _match_corner_fan(candidates, imported_index, imported_positions, source_positions,
+                      imported_fans, source_fans, resolved, tolerance):
+    """FBX may split a source fan into multiple corners, each retaining a subset of its triangles."""
+    faces = imported_fans[imported_index]
+    if not faces:
+        return []
+    def same_vertex(i, j):
+        if i in resolved:
+            return resolved[i] == j
+        return math.dist(imported_positions[i], source_positions[j]) <= tolerance
+    def same_edge(i, j, a, b):
+        return ((same_vertex(i, a) and same_vertex(j, b)) or
+                (same_vertex(i, b) and same_vertex(j, a)))
+    return [(error, src) for error, src in candidates if all(
+        any(same_edge(i, j, a, b) for a, b in source_fans[src]) for i, j in faces)]
 
 
 def normalize_ownership(built, packet, tolerance_cm=0.0002):
@@ -342,6 +420,7 @@ def normalize_ownership(built, packet, tolerance_cm=0.0002):
     guide owns a strand.
     """
     response_mask = validate_response_mask(packet)
+    curve_factors = _curve_factor_fields(packet)
     result, receipt = {}, {}
     for role in ("sim", "render"):
         source = packet["meshes"][role]
@@ -351,7 +430,9 @@ def normalize_ownership(built, packet, tolerance_cm=0.0002):
         for index, point in enumerate(positions):
             buckets[cell(point)].append(index)
         gids, source_indices, errors, unique_source_identity = [], [], [], []
-        for point in built[role + "_positions"]:
+        imported_positions = built[role + "_positions"]
+        possible_corners, ambiguous_factors = {}, set()
+        for imported_index, point in enumerate(imported_positions):
             key = cell(point)
             candidates = []
             for delta in itertools.product((-1, 0, 1), repeat=3):
@@ -364,6 +445,11 @@ def normalize_ownership(built, packet, tolerance_cm=0.0002):
             owners = {source["guide_ids"][i] for _, i in candidates}
             if len(owners) != 1:
                 raise ValueError(role + " coincident source vertices have ambiguous guide identity")
+            if curve_factors and len(candidates) > 1:
+                possible_corners[imported_index] = candidates
+                factors = [curve_factors[role][i] for _, i in candidates]
+                if max(factors) != min(factors):
+                    ambiguous_factors.add(imported_index)
             if role == "sim" and len({round(source["weights"][i], 6) for _, i in candidates}) != 1:
                 raise ValueError("Coincident simulation vertices have conflicting source G")
             if role == 'sim' and response_mask is not None and len({
@@ -375,10 +461,29 @@ def normalize_ownership(built, packet, tolerance_cm=0.0002):
             # Their parent remains known, but they must not share a position
             # embedding merely because coordinate matching selected one index.
             unique_source_identity.append(len(candidates) == 1)
+        if ambiguous_factors:
+            source_fans = _triangle_fans(source['triangles'])
+            imported_fans = _triangle_fans(built[role + '_triangles'])
+            resolved = {i: source_indices[i] for i, unique in enumerate(unique_source_identity) if unique}
+            while ambiguous_factors:
+                resolved_before = len(resolved)
+                for corner, candidates in list(possible_corners.items()):
+                    matches = _match_corner_fan(candidates, corner, imported_positions, positions,
+                        imported_fans, source_fans, resolved, tolerance_cm)
+                    if len(matches) == 1:
+                        errors[corner], source_indices[corner] = matches[0]
+                        unique_source_identity[corner] = True
+                        resolved[corner] = source_indices[corner]
+                        del possible_corners[corner]
+                        ambiguous_factors.discard(corner)
+                if len(resolved) == resolved_before:
+                    raise ValueError(role + " coincident source vertices have ambiguous guide parameters")
         result[role + "_positions"] = built[role + "_positions"]
         result[role + "_triangles"] = built[role + "_triangles"]
         result[role + "_guide_ids"] = gids
         result[role + "_source_indices"] = source_indices
+        if curve_factors:
+            result[role + '_curve_factors'] = [curve_factors[role][i] for i in source_indices]
         result[role + "_source_identity_unique"] = unique_source_identity
         receipt[role] = {"maximum_import_error_cm": max(errors), "ambiguous": 0, "unmatched": 0}
         if role == "sim":
@@ -428,6 +533,20 @@ def _verify_render_only_binding(receipt, expected_count):
             receipt.get("render_only_dormant_mapping_indices_valid") is not True or
             receipt.get("simulation_geometry_preserved") is not True):
         raise RuntimeError("Native helper did not verify render-only skinning for unguided geometry")
+
+
+def _verify_curve_binding(receipt, expected_count, *, built=False):
+    if not expected_count:
+        return
+    version = receipt.get('source_curve_binding_version')
+    if version != SOURCE_CURVE_BINDING_VERSION:
+        raise RuntimeError(f'Native helper reported source curve binding version {version!r}; '
+                           f'version {SOURCE_CURVE_BINDING_VERSION} is required for a new binding')
+    if receipt.get('source_curve_edge_coherent') is not True:
+        raise RuntimeError('Native helper did not verify connected-edge longitudinal correction for the new binding')
+    if (receipt.get('source_curve_bound_vertices') != expected_count or
+            (built and receipt.get('compiled_source_curve_storage_verified') is not True)):
+        raise RuntimeError('Native helper did not verify all generator curve-parameter bindings')
 
 
 def _graph(unreal, asset):
@@ -2170,10 +2289,12 @@ def build_in_editor(record, output_directory):
 
 def _build_in_editor(record, output_directory, created, committed):
     import unreal
-    record, packet = validate_record(record)
+    record, packet = validate_record(record, for_import=True)
     output = Path(output_directory); output.mkdir(parents=True, exist_ok=True)
-    if not record["simulation_enabled"]:
-        receipt = _render_only_receipt(record, packet)
+    if not record["simulation_enabled"] or record.get('update_mode') == 'response_only':
+        # Direct builder callers must use the same existing-binding route as ordinary imports.
+        receipt = (_apply_hair_guide_cloth(record) if record.get('update_mode') == 'response_only'
+                   else _render_only_receipt(record, packet))
         (output / "receipt.json").write_text(json.dumps(receipt, indent=2), encoding="utf8")
         return receipt
     if not callable(getattr(unreal.CodexClothToolsLibrary, "repair_cloth_proxy_bindings", None)):
@@ -2218,10 +2339,13 @@ def _build_in_editor(record, output_directory, created, committed):
     preview = _native(unreal.CodexClothToolsLibrary.repair_cloth_proxy_bindings(
         source_path, binding_path, str(ownership_path), False), output / "binding_preview.json")
     render_only_count = len(ownership["render_only_vertex_indices"])
+    curve_count = sum(t >= 0. for t in ownership.get('render_curve_factors', []))
+    _verify_curve_binding(preview, curve_count)
     _verify_render_only_binding(preview, render_only_count)
     repaired = _native(unreal.CodexClothToolsLibrary.repair_cloth_proxy_bindings(
         source_path, binding_path, str(ownership_path), True))
     _verify_render_only_binding(repaired, render_only_count)
+    _verify_curve_binding(repaired, curve_count, built=True)
     binding = unreal.load_asset(binding_path)
     if not binding or not unreal.EditorAssetLibrary.save_loaded_asset(binding):
         raise RuntimeError("Validated binding collection could not be saved")
@@ -2237,6 +2361,7 @@ def _build_in_editor(record, output_directory, created, committed):
                "sim_vertices": len(native["sim_positions"]), "render_vertices": len(native["render_positions"]),
                "guide_count": len(set(ownership["sim_guide_ids"])), "remesh": False,
                "render_only_vertices": render_only_count,
+               "source_curve_bound_vertices": curve_count,
                "weight_source": "simulation_source_own_g",
                "reference_skeletal_mesh_asset_path": record["body_mesh_asset_path"],
                "authored_weight_map_transfer": packet.get('weight_map_transfer'),
@@ -2534,7 +2659,7 @@ def _apply_response_only(unreal, record, packet, current):
 def _apply_hair_guide_cloth(record):
     """Ordinary Send2UE post-import entry. Require a completed verified receipt."""
     import unreal
-    record, packet = validate_record(record)
+    record, packet = validate_record(record, for_import=True)
     if not record["simulation_enabled"]:
         render = unreal.load_asset(record["render_asset_path"])
         if not render:
