@@ -100,7 +100,8 @@ class GuidePolicyTests(unittest.TestCase):
         render = Object('render', Object('export', kind='EMPTY'))
         objects = [SimpleNamespace(data=SimpleNamespace(vertices=[None] * count)) for count in (3, 6)]
         hair = SimpleNamespace(_evaluated_mesh_objects=Mock(return_value=objects))
-        package = SimpleNamespace(hair_tool_export=hair)
+        factors = Mock()
+        package = SimpleNamespace(hair_tool_export=hair, hair_guide_factors=factors)
         stamps = []
         self.api._int_attribute = lambda mesh, name, values: stamps.append((mesh, name, values))
         self.api.own_weights = Mock(side_effect=AssertionError('Render G is never simulation G'))
@@ -112,6 +113,8 @@ class GuidePolicyTests(unittest.TestCase):
         hair._evaluated_mesh_objects.assert_called_once_with(render, export_state,
             include_system_ao=True, ao_settings=ao_settings)
         self.assertEqual([row[2] for row in stamps], [[-1] * 3, [-1] * 6])
+        self.assertEqual([call.args for call in factors.store_render.call_args_list],
+                         [(obj.data, [-1.] * len(obj.data.vertices)) for obj in objects])
         for key in ('vertices', 'triangles', 'guide_ids', 'weights', 'authored_weights', 'parts'):
             self.assertEqual(packet[key], [])
         self.assertFalse(packet['simulation_enabled'])
@@ -148,7 +151,8 @@ class GuidePolicyTests(unittest.TestCase):
                 self.api._stamp_group = Mock(return_value=SimpleNamespace(users=1))
                 self.api._copy_mesh = Mock(return_value=gm)
                 render_only = self.api._capture_render_only = Mock(return_value='ordinary render')
-                with patch.dict(sys.modules, {'producer_fixture': SimpleNamespace(hair_tool_export=Mock())}):
+                producer = SimpleNamespace(hair_tool_export=Mock(), hair_guide_factors=Mock())
+                with patch.dict(sys.modules, {'producer_fixture': producer}):
                     self.assertEqual(self.api.capture_source(source, {}), 'ordinary render')
                 self.api._copy_mesh.assert_called_once_with(guide.copy.return_value)
                 receipt = render_only.call_args.args[2]
